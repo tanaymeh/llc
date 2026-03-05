@@ -60,18 +60,24 @@ def _run_turn(agent: Any, thread_id: str, user_input: str) -> None:
 
 def main() -> None:
     load_dotenv()
-    model_name = os.getenv("MODEL_NAME", "openai:gpt-4o-mini")
+    model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL")
 
     print(f"Starting LangGraph coding agent with model: {model_name}")
     print("Type 'exit' or 'quit' to end.\n")
 
     try:
-        agent = build_agent_graph(model_name=model_name)
+        agent = build_agent_graph(
+            model_name=model_name,
+            openai_api_key=openai_api_key,
+            openai_base_url=openai_base_url,
+        )
     except Exception as exc:  # noqa: BLE001
         print("\nFailed to initialize model.")
         print(
-            "Set MODEL_NAME and matching API key in your environment or .env file "
-            "(OPENAI_API_KEY or ANTHROPIC_API_KEY)."
+            "Set MODEL_NAME, OPENAI_API_KEY, and optionally OPENAI_BASE_URL in "
+            "your environment or .env file."
         )
         print(f"Details: {exc}")
         return

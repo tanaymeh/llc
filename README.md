@@ -10,7 +10,7 @@ Minimal LangGraph + LangChain skeleton for a local coding assistant that:
 
 - Python `>=3.13`
 - [`uv`](https://docs.astral.sh/uv/) installed
-- One model provider API key (OpenAI or Anthropic)
+- OpenAI-compatible API key (any provider exposing OpenAI-style inference API)
 
 ## Setup
 
@@ -20,8 +20,9 @@ cp .env.example .env
 ```
 
 Set values in `.env`:
-- `MODEL_NAME` (examples: `openai:gpt-4o-mini`, `anthropic:claude-sonnet-4-6`)
-- `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY` (matching `MODEL_NAME`)
+- `MODEL_NAME` (example: `gpt-4o-mini`, `deepseek/deepseek-r1`)
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` (optional for custom OpenAI-compatible endpoints)
 
 ## Run
 

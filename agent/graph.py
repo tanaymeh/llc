@@ -1,4 +1,4 @@
-from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -12,8 +12,18 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def build_agent_graph(model_name: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
-    model = init_chat_model(model_name, temperature=0)
+def build_agent_graph(
+    model_name: str,
+    openai_api_key: str | None = None,
+    openai_base_url: str | None = None,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+):
+    model = ChatOpenAI(
+        model=model_name,
+        temperature=0,
+        api_key=openai_api_key,
+        base_url=openai_base_url,
+    )
     model_with_tools = model.bind_tools(TOOLS)
     tools_by_name = {tool.name: tool for tool in TOOLS}
 
