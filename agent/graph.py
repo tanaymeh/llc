@@ -4,31 +4,23 @@ from langgraph.graph import END, START, StateGraph
 
 from agent.nodes import make_llm_node, make_tool_node, should_continue
 from agent.state import AgentState
-from agent.tools import TOOLS
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are a local coding assistant. Use tools only when needed, keep answers concise, "
-    "and show your final answer clearly."
-)
+from agent.tools import collect_tools
+from config import Settings
 
 
-def build_agent_graph(
-    model_name: str,
-    openai_api_key: str | None = None,
-    openai_base_url: str | None = None,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-):
+def build_agent_graph(settings: Settings):
     model = ChatOpenAI(
-        model=model_name,
+        model=settings.model_name,
         temperature=0,
-        api_key=openai_api_key,
-        base_url=openai_base_url,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
     )
-    model_with_tools = model.bind_tools(TOOLS)
-    tools_by_name = {tool.name: tool for tool in TOOLS}
+    tools = collect_tools(settings)
+    model_with_tools = model.bind_tools(tools)
+    tools_by_name = {t.name: t for t in tools}
 
     builder = StateGraph(AgentState)
-    builder.add_node("llm", make_llm_node(model_with_tools, system_prompt))
+    builder.add_node("llm", make_llm_node(model_with_tools, settings.system_prompt))
     builder.add_node("tools", make_tool_node(tools_by_name))
     builder.add_edge(START, "llm")
     builder.add_conditional_edges("llm", should_continue, ["tools", END])
