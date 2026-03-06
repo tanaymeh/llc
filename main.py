@@ -130,6 +130,7 @@ def _banner(model_name: str) -> None:
     print(f"  {_w(model_name, GRAY)}")
     print(f"{_w(line, GRAY)}")
     print(f"  {_w('Type', DIM)} {_w('exit', DIM, BOLD)} {_w('or', DIM)} {_w('quit', DIM, BOLD)} {_w('to end the session.', DIM)}")
+    print(f"  {_w('/model <name>', DIM, BOLD)} {_w('to switch models mid-session.', DIM)}")
     print()
 
 
@@ -169,6 +170,24 @@ def main() -> None:
             print(f"{_w('Goodbye.', DIM)}")
             break
         if not user_input:
+            continue
+
+        if user_input.startswith("/model "):
+            new_model = user_input[len("/model "):].strip()
+            if not new_model:
+                print(f"  {_w('Usage:', DIM)} {_w('/model <model_name>', BOLD)}\n")
+                continue
+            print(f"  {_w('Switching to', DIM)} {_w(new_model, CYAN, BOLD)}{_w('...', DIM)}")
+            try:
+                agent = build_agent_graph(
+                    model_name=new_model,
+                    openai_api_key=openai_api_key,
+                    openai_base_url=openai_base_url,
+                )
+                model_name = new_model
+                print(f"  {_w('✓', GREEN)} {_w(f'Now using {model_name}', GREEN)}\n")
+            except Exception as exc:  # noqa: BLE001
+                print(f"  {_w('✗', RED)} {_w(str(exc), RED)}\n")
             continue
 
         try:
