@@ -4,7 +4,7 @@ Minimal LangGraph + LangChain skeleton for a local coding assistant that:
 - runs in a loop (REPL),
 - accepts user commands,
 - calls tools when needed (`shell`, `read_file`, `write_file`, `list_directory`),
-- streams tool activity and final responses.
+- streams tokens, tool activity, and final responses.
 
 ## Requirements
 
@@ -34,6 +34,19 @@ Inside the CLI:
 - type your request normally,
 - type `exit` or `quit` to stop.
 
+## Docker
+
+Rebuild and launch the app in one command while mounting any host folder as the agent workspace:
+
+```bash
+./scripts/dev-docker.sh /path/to/folder
+```
+
+Notes:
+- the mounted folder is available inside the container as `/workspace`,
+- the app still reads credentials from the repo `.env`,
+- rerun the same command after code changes to rebuild and launch again.
+
 ## Project Layout
 
 ```text
@@ -42,4 +55,5 @@ agent/state.py     # LangGraph state schema
 agent/nodes.py     # LLM node, tool node, routing
 agent/graph.py     # StateGraph builder + MemorySaver
 agent/tools/       # Tool implementations
+scripts/           # helper scripts, including Docker launcher
 ```
