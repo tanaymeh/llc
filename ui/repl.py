@@ -8,7 +8,13 @@ from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
 from config import Settings
 from ui.colors import BOLD, CYAN, DIM, GREEN, RED, YELLOW, style
-from ui.display import message_text, print_banner, print_tool_calls
+from ui.display import (
+    ReasoningTracker,
+    extract_reasoning,
+    message_text,
+    print_banner,
+    print_tool_calls,
+)
 
 
 class Repl:
@@ -73,6 +79,7 @@ class Repl:
     ) -> None:
         assistant_line_open = False
         seen_tool_call_ids: set[str] = set()
+        reasoning_tracker = ReasoningTracker()
 
         async for mode, chunk in agent.astream(
             {"messages": [HumanMessage(content=user_input)]},
@@ -84,20 +91,35 @@ class Repl:
                 if metadata.get("langgraph_node") != "llm":
                     continue
 
+                reasoning_text = extract_reasoning(message_chunk)
+                if reasoning_text and not assistant_line_open:
+                    reasoning_tracker.feed(reasoning_text)
+                    continue
+
                 text = message_text(message_chunk.content)
                 if text:
+                    finished_reasoning = False
+                    if reasoning_tracker.is_active:
+                        reasoning_tracker.finish()
+                        finished_reasoning = True
+
                     if not assistant_line_open:
-                        print(f"\n{style('●', CYAN)} ", end="", flush=True)
+                        prefix = "" if finished_reasoning else "\n"
+                        print(f"{prefix}{style('●', CYAN)} ", end="", flush=True)
                         assistant_line_open = True
                     print(text, end="", flush=True)
 
             elif mode == "updates":
+                if reasoning_tracker.is_active:
+                    reasoning_tracker.finish()
                 assistant_line_open = print_tool_calls(
                     chunk=chunk,
                     assistant_line_open=assistant_line_open,
                     seen_tool_call_ids=seen_tool_call_ids,
                 )
 
+        if reasoning_tracker.is_active:
+            reasoning_tracker.finish()
         if assistant_line_open:
             print()
         print()

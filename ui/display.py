@@ -1,8 +1,192 @@
+import shutil
+import sys
+import time
 from typing import Any
 
 from langchain_core.messages import AIMessage
 
 from ui.colors import BOLD, CYAN, DIM, GRAY, ITALIC, style
+
+
+def _stringify_reasoning(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                for key in ("text", "content", "reasoning", "reasoning_content", "summary"):
+                    raw = item.get(key)
+                    if raw:
+                        parts.append(str(raw))
+                        break
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("text", "content", "reasoning", "reasoning_content", "summary"):
+            raw = value.get(key)
+            if raw:
+                return str(raw)
+        return ""
+    return str(value)
+
+
+def extract_reasoning(message_chunk: Any) -> str:
+    additional_kwargs = getattr(message_chunk, "additional_kwargs", {})
+    if isinstance(additional_kwargs, dict):
+        for key in (
+            "reasoning_content",
+            "reasoning_details",
+            "reasoning_summary_chunk",
+            "reasoning_summary",
+            "reasoning",
+        ):
+            reasoning_text = _stringify_reasoning(additional_kwargs.get(key))
+            if reasoning_text:
+                return reasoning_text
+
+    content_blocks = getattr(message_chunk, "content_blocks", None)
+    if isinstance(content_blocks, list):
+        parts: list[str] = []
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).lower()
+            if block_type not in {"thinking", "reasoning"}:
+                continue
+            raw = (
+                block.get("reasoning")
+                or block.get("thinking")
+                or block.get("reasoning_content")
+                or block.get("text")
+                or block.get("content")
+            )
+            reasoning_text = _stringify_reasoning(raw)
+            if reasoning_text:
+                parts.append(reasoning_text)
+        if parts:
+            return "\n".join(parts)
+
+    content = getattr(message_chunk, "content", None)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type", "")).lower()
+            if block_type not in {"thinking", "reasoning"}:
+                continue
+
+            raw = (
+                block.get("thinking")
+                or block.get("reasoning_content")
+                or block.get("reasoning")
+                or block.get("text")
+                or block.get("content")
+            )
+            reasoning_text = _stringify_reasoning(raw)
+            if reasoning_text:
+                parts.append(reasoning_text)
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return _format_duration_unit(seconds, "second")
+    if seconds < 3600:
+        return _format_duration_unit(seconds / 60, "minute")
+    return _format_duration_unit(seconds / 3600, "hour")
+
+
+def _format_duration_unit(value: float, unit: str) -> str:
+    if value >= 10:
+        text = f"{value:.0f}"
+    else:
+        text = f"{value:.1f}"
+    if text.endswith(".0"):
+        text = text[:-2]
+    suffix = unit if text == "1" else f"{unit}s"
+    return f"{text} {suffix}"
+
+
+def _truncate_to_terminal_width(text: str, prefix_width: int = 2) -> str:
+    columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+    max_width = max(columns - prefix_width, 20)
+    if len(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return text[:max_width]
+    return text[: max_width - 3] + "..."
+
+
+class ReasoningTracker:
+    def __init__(self) -> None:
+        self._started_at: float | None = None
+        self._buffer: str = ""
+        self._active = False
+        self._last_line: str = ""
+
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    def feed(self, text: str) -> None:
+        cleaned = text.strip()
+        if not cleaned:
+            return
+
+        if self._started_at is None:
+            self._started_at = time.monotonic()
+        self._active = True
+
+        if self._buffer:
+            self._buffer += "\n"
+        self._buffer += cleaned
+
+        latest = self._latest_line()
+        if not latest or latest == self._last_line:
+            return
+
+        self._last_line = latest
+        self._show_line(latest)
+
+    def finish(self) -> None:
+        if not self._active:
+            return
+
+        elapsed = 0.0
+        if self._started_at is not None:
+            elapsed = max(time.monotonic() - self._started_at, 0.0)
+
+        self._clear_line()
+        print(
+            f"  {style(f'Reasoned for {_format_duration(elapsed)}', GRAY, DIM)}",
+            flush=True,
+        )
+        self._started_at = None
+        self._buffer = ""
+        self._active = False
+        self._last_line = ""
+
+    def _latest_line(self) -> str:
+        lines = [line.strip() for line in self._buffer.splitlines() if line.strip()]
+        return lines[-1] if lines else self._buffer.strip()
+
+    def _show_line(self, text: str) -> None:
+        self._clear_line()
+        display_text = _truncate_to_terminal_width(text)
+        sys.stdout.write(f"  {style(display_text, GRAY)}")
+        sys.stdout.flush()
+
+    @staticmethod
+    def _clear_line() -> None:
+        sys.stdout.write("\033[2K\r")
+        sys.stdout.flush()
 
 
 def message_text(content: Any) -> str:

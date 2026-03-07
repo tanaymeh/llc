@@ -1,4 +1,5 @@
 from langchain_openai import ChatOpenAI
+from langchain_openrouter import ChatOpenRouter
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -8,13 +9,27 @@ from agent.tools import collect_tools
 from config import Settings
 
 
+def _is_openrouter_base_url(base_url: str | None) -> bool:
+    if not base_url:
+        return False
+    return "openrouter.ai" in base_url.lower()
+
+
 def build_agent_graph(settings: Settings):
-    model = ChatOpenAI(
-        model=settings.model_name,
-        temperature=0,
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-    )
+    if _is_openrouter_base_url(settings.openai_base_url):
+        model = ChatOpenRouter(
+            model=settings.model_name,
+            temperature=0,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+        )
+    else:
+        model = ChatOpenAI(
+            model=settings.model_name,
+            temperature=0,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url,
+        )
     tools = collect_tools(settings)
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
