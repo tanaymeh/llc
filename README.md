@@ -44,9 +44,21 @@ Rebuild and launch the app in one command while mounting any host folder as the 
 ./scripts/dev-docker.sh /path/to/folder
 ```
 
+The default mode keeps Docker build output quiet so you land directly in the app chat screen.
+Use debug mode only when you want full Docker logs:
+
+```bash
+./scripts/dev-docker.sh --debug /path/to/folder
+# or
+LOCAL_CLAUDE_DOCKER_DEBUG=1 ./scripts/dev-docker.sh /path/to/folder
+```
+
 Notes:
 - the mounted folder is available inside the container as `/workspace`,
 - the app still reads credentials from the repo `.env`,
+- `ripgrep` (`rg`) is available inside the container,
+- `ast-grep` (`ast-grep`) is available inside the container for `code_grep`,
+- the script still runs `docker build` on every launch (quiet mode only hides build logs),
 - rerun the same command after code changes to rebuild and launch again.
 
 ## Project Layout

@@ -109,7 +109,8 @@ YAML rules with `fix` key can also perform rewrites:
         if sg_bin is None:
             return (
                 "Error: ast-grep (sg) is not installed. "
-                "Install it with: brew install ast-grep (macOS) or cargo install ast-grep --locked"
+                "Install it with: pip install ast-grep-cli, brew install ast-grep, "
+                "or cargo install ast-grep --locked"
             )
 
         use_json = json_output or False
@@ -129,14 +130,17 @@ YAML rules with `fix` key can also perform rewrites:
 
 
 def _find_sg_binary() -> Optional[str]:
-    for name in ("sg", "ast-grep"):
+    for name in ("ast-grep", "sg"):
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 [name, "--version"],
                 capture_output=True,
+                text=True,
                 timeout=5,
             )
-            return name
+            version_output = f"{completed.stdout}\n{completed.stderr}".lower()
+            if completed.returncode == 0 and "ast-grep" in version_output:
+                return name
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
     return None
