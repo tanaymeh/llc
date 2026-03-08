@@ -23,8 +23,11 @@ class ModelCompleter(Completer):
 
         query = text[len("/model ") :]
         start_position = -len(query)
+        query_lower = query.lower()
 
         for model in self._get_models():
+            if query_lower and query_lower not in model.id.lower():
+                continue
             yield Completion(
                 text=model.id,
                 start_position=start_position,

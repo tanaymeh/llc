@@ -3,7 +3,6 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
-from prompt_toolkit.completion import FuzzyCompleter
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.shortcuts import CompleteStyle, PromptSession
 
@@ -28,7 +27,7 @@ class Repl:
         self._settings = settings
         self._available_models: list[AvailableModel] = []
         self._prompt_session = PromptSession(
-            completer=FuzzyCompleter(ModelCompleter(self._get_available_models)),
+            completer=ModelCompleter(self._get_available_models),
             complete_while_typing=True,
             complete_style=CompleteStyle.COLUMN,
             reserve_space_for_menu=8,

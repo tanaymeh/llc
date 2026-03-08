@@ -15,5 +15,6 @@ COPY main.py config.py models.py ./
 COPY agent ./agent
 COPY commands ./commands
 COPY ui ./ui
+COPY prompts ./prompts
 
 ENTRYPOINT ["python", "/app/main.py"]
