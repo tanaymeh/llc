@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
@@ -78,7 +78,9 @@ class Repl:
         self, agent: Any, thread_id: str, user_input: str
     ) -> None:
         assistant_line_open = False
+        displayed_assistant_text = False
         seen_tool_call_ids: set[str] = set()
+        fallback_assistant_text = ""
         reasoning_tracker = ReasoningTracker()
 
         async for mode, chunk in agent.astream(
@@ -108,10 +110,23 @@ class Repl:
                         print(f"{prefix}{style('●', CYAN)} ", end="", flush=True)
                         assistant_line_open = True
                     print(text, end="", flush=True)
+                    displayed_assistant_text = True
 
             elif mode == "updates":
                 if reasoning_tracker.is_active:
                     reasoning_tracker.finish()
+                if isinstance(chunk, dict):
+                    for node_update in chunk.values():
+                        if not isinstance(node_update, dict):
+                            continue
+                        for message in node_update.get("messages", []):
+                            if not isinstance(message, AIMessage):
+                                continue
+                            if getattr(message, "tool_calls", None):
+                                continue
+                            text = message_text(message.content)
+                            if text:
+                                fallback_assistant_text = text
                 assistant_line_open = print_tool_calls(
                     chunk=chunk,
                     assistant_line_open=assistant_line_open,
@@ -120,6 +135,11 @@ class Repl:
 
         if reasoning_tracker.is_active:
             reasoning_tracker.finish()
+        if not displayed_assistant_text and fallback_assistant_text:
+            if assistant_line_open:
+                print()
+                assistant_line_open = False
+            print(f"\n{style('●', CYAN)} {fallback_assistant_text}")
         if assistant_line_open:
             print()
         print()

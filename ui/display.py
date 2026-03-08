@@ -127,9 +127,10 @@ def _truncate_to_terminal_width(text: str, prefix_width: int = 2) -> str:
 class ReasoningTracker:
     def __init__(self) -> None:
         self._started_at: float | None = None
-        self._buffer: str = ""
         self._active = False
-        self._last_line: str = ""
+        self._line_interval_seconds = 1.0
+        self._pending_tokens: list[str] = []
+        self._last_emitted_at: float | None = None
 
     @property
     def is_active(self) -> bool:
@@ -144,16 +145,32 @@ class ReasoningTracker:
             self._started_at = time.monotonic()
         self._active = True
 
-        if self._buffer:
-            self._buffer += "\n"
-        self._buffer += cleaned
+        tokens = self._tokenize(cleaned)
+        if not tokens:
+            return
+        self._pending_tokens.extend(tokens)
+        self._emit_if_ready(now=time.monotonic())
 
-        latest = self._latest_line()
-        if not latest or latest == self._last_line:
+    def _tokenize(self, text: str) -> list[str]:
+        return [tok for tok in text.split() if tok]
+
+    def _tokens_per_line(self) -> int:
+        return 20
+
+    def _emit_if_ready(self, now: float) -> None:
+        tokens_per_line = self._tokens_per_line()
+        if len(self._pending_tokens) < tokens_per_line:
             return
 
-        self._last_line = latest
-        self._show_line(latest)
+        if self._last_emitted_at is not None:
+            elapsed_since_emit = now - self._last_emitted_at
+            if elapsed_since_emit < self._line_interval_seconds:
+                return
+
+        line_tokens = self._pending_tokens[:tokens_per_line]
+        self._pending_tokens = self._pending_tokens[tokens_per_line:]
+        self._show_line(" ".join(line_tokens))
+        self._last_emitted_at = now
 
     def finish(self) -> None:
         if not self._active:
@@ -165,17 +182,13 @@ class ReasoningTracker:
 
         self._clear_line()
         print(
-            f"  {style(f'Reasoned for {_format_duration(elapsed)}', GRAY, DIM)}",
+            f"  {style(f'Reasoned for {_format_duration(elapsed)}', GRAY)}",
             flush=True,
         )
         self._started_at = None
-        self._buffer = ""
         self._active = False
-        self._last_line = ""
-
-    def _latest_line(self) -> str:
-        lines = [line.strip() for line in self._buffer.splitlines() if line.strip()]
-        return lines[-1] if lines else self._buffer.strip()
+        self._pending_tokens = []
+        self._last_emitted_at = None
 
     def _show_line(self, text: str) -> None:
         self._clear_line()
@@ -195,8 +208,17 @@ def message_text(content: Any) -> str:
     if isinstance(content, list):
         text_parts: list[str] = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(str(block.get("text", "")))
+            if isinstance(block, dict):
+                block_type = str(block.get("type", "")).lower()
+                if block_type in {"thinking", "reasoning"}:
+                    continue
+                raw = (
+                    block.get("text")
+                    or block.get("content")
+                    or block.get("output_text")
+                )
+                if raw:
+                    text_parts.append(str(raw))
             elif isinstance(block, str):
                 text_parts.append(block)
         return "\n".join(part for part in text_parts if part)
