@@ -1,11 +1,46 @@
 import shutil
 import sys
 import time
+import os
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
 
-from ui.colors import BOLD, CYAN, DIM, GRAY, ITALIC, style
+from ui.colors import BLUE, CYAN, GRAY, LIGHT_GRAY, style
+from ui.token_tracker import TurnUsage
+
+console = Console()
+
+
+def _is_light_terminal() -> bool:
+    colorfgbg = os.getenv("COLORFGBG", "")
+    if not colorfgbg:
+        return False
+    parts = [part for part in colorfgbg.split(";") if part.isdigit()]
+    if not parts:
+        return False
+    return int(parts[-1]) >= 7
+
+
+IS_LIGHT_THEME = _is_light_terminal()
+ACCENT_STYLE = "blue" if IS_LIGHT_THEME else "cyan"
+MUTED_STYLE = "grey42" if IS_LIGHT_THEME else "grey70"
+TOOL_NAME_STYLE = "blue italic" if IS_LIGHT_THEME else "cyan italic"
+MARKDOWN_CODE_THEME = "ansi_light" if IS_LIGHT_THEME else "ansi_dark"
+HUD_COLOR = BLUE if IS_LIGHT_THEME else CYAN
+HUD_MUTED_COLOR = GRAY if IS_LIGHT_THEME else LIGHT_GRAY
+
+LLC_LOGO = r"""
+  ██╗     ██╗      ██████╗
+  ██║     ██║     ██╔════╝
+  ██║     ██║     ██║
+  ██║     ██║     ██║
+  ███████╗███████╗╚██████╗
+  ╚══════╝╚══════╝ ╚═════╝"""
 
 
 def _stringify_reasoning(value: Any) -> str:
@@ -80,7 +115,6 @@ def extract_reasoning(message_chunk: Any) -> str:
             block_type = str(block.get("type", "")).lower()
             if block_type not in {"thinking", "reasoning"}:
                 continue
-
             raw = (
                 block.get("thinking")
                 or block.get("reasoning_content")
@@ -181,9 +215,8 @@ class ReasoningTracker:
             elapsed = max(time.monotonic() - self._started_at, 0.0)
 
         self._clear_line()
-        print(
-            f"  {style(f'Reasoned for {_format_duration(elapsed)}', GRAY)}",
-            flush=True,
+        console.print(
+            f"  [dim italic]Reasoned for {_format_duration(elapsed)}[/dim italic]"
         )
         self._started_at = None
         self._active = False
@@ -237,53 +270,120 @@ def format_tool_args(args: dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
-def print_tool_calls(
+def collect_new_tool_calls(
     chunk: Any,
-    assistant_line_open: bool,
     seen_tool_call_ids: set[str],
-) -> bool:
+) -> list[dict[str, Any]]:
     if not isinstance(chunk, dict):
-        return assistant_line_open
-
+        return []
+    pending: list[dict[str, Any]] = []
     for node_update in chunk.values():
         if not isinstance(node_update, dict):
             continue
-
         for message in node_update.get("messages", []):
             if isinstance(message, AIMessage) and message.tool_calls:
-                pending = [
-                    tc
-                    for tc in message.tool_calls
-                    if tc.get("id") not in seen_tool_call_ids
-                ]
-                if not pending:
-                    continue
+                for tc in message.tool_calls:
+                    if tc.get("id") not in seen_tool_call_ids:
+                        seen_tool_call_ids.add(tc.get("id"))
+                        pending.append(tc)
+    return pending
 
-                if assistant_line_open:
-                    print()
-                    assistant_line_open = False
 
-                for tc in pending:
-                    seen_tool_call_ids.add(tc.get("id"))
-                    name = tc.get("name", "unknown_tool")
-                    args_str = format_tool_args(tc.get("args", {}))
-                    print(
-                        f"  {style('↳', GRAY)} {style(name, GRAY, ITALIC)}"
-                        f"{style('(', GRAY)}{style(args_str, GRAY)}{style(')', GRAY)}"
-                    )
+def render_assistant_markdown(text: str) -> None:
+    if not text.strip():
+        return
+    console.print(f"[bold {ACCENT_STYLE}]●[/bold {ACCENT_STYLE}] ", end="")
+    console.print(Markdown(text, code_theme=MARKDOWN_CODE_THEME))
 
-    return assistant_line_open
+
+def render_session_hud(
+    total_input: int,
+    total_output: int,
+    total_cost: float | None = None,
+) -> None:
+    hud = f"Σ {total_input:,} in / {total_output:,} out"
+    if total_cost is not None and total_cost > 0:
+        hud += f" | ${total_cost:.4f}"
+
+    cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    if len(hud) >= cols:
+        hud = hud[: max(cols - 1, 1)]
+    col = max(cols - len(hud) + 1, 1)
+    sys.stdout.write("\0337")
+    sys.stdout.write("\033[1;1H\033[2K")
+    sys.stdout.write(f"\033[1;{col}H")
+    parts = hud.split("|", maxsplit=1)
+    if len(parts) == 2:
+        left = parts[0].rstrip()
+        right = "| " + parts[1].strip()
+        sys.stdout.write(style(left, HUD_COLOR))
+        sys.stdout.write(" ")
+        sys.stdout.write(style(right, HUD_MUTED_COLOR))
+    else:
+        sys.stdout.write(style(hud, HUD_COLOR))
+    sys.stdout.write("\0338")
+    sys.stdout.flush()
+
+
+def print_usage(
+    turn: TurnUsage,
+    cost: float | None = None,
+) -> None:
+    parts = Text()
+    parts.append("  tokens: ", style="dim")
+    parts.append(f"{turn.input_tokens:,}", style="green")
+    parts.append(" in", style="dim")
+    parts.append(" / ", style="dim")
+    parts.append(f"{turn.output_tokens:,}", style="yellow")
+    parts.append(" out", style="dim")
+    if cost is not None:
+        parts.append("  │  ", style="dim")
+        parts.append("cost: ", style="dim")
+        parts.append(f"${cost:.4f}", style="dim italic")
+    console.print(parts)
+
+
+def print_session_summary(
+    total_input: int,
+    total_output: int,
+    total_cost: float | None = None,
+) -> None:
+    parts = Text()
+    parts.append("Session totals: ", style="bold dim")
+    parts.append(f"{total_input:,}", style="green")
+    parts.append(" in", style="dim")
+    parts.append(" / ", style="dim")
+    parts.append(f"{total_output:,}", style="yellow")
+    parts.append(" out", style="dim")
+    if total_cost is not None and total_cost > 0:
+        parts.append("  │  ", style="dim")
+        parts.append(f"${total_cost:.4f}", style="dim italic")
+    console.print(parts)
 
 
 def print_banner(model_name: str) -> None:
-    line = "─" * 48
-    print(f"\n{style(line, GRAY)}")
-    print(f"  {style('local-claude-code', CYAN, BOLD)}")
-    print(f"  {style(model_name, GRAY)}")
-    print(f"{style(line, GRAY)}")
-    print(
-        f"  {style('Type', DIM)} {style('exit', DIM, BOLD)} {style('or', DIM)} "
-        f"{style('quit', DIM, BOLD)} {style('to end the session.', DIM)}"
+    logo = Text(LLC_LOGO, style=f"bold {ACCENT_STYLE}")
+    subtitle = Text()
+    subtitle.append("\n  Model: ", style=MUTED_STYLE)
+    subtitle.append(model_name, style="bold")
+    subtitle.append("\n  Type ", style=MUTED_STYLE)
+    subtitle.append("exit", style=f"bold {MUTED_STYLE}")
+    subtitle.append(" or ", style=MUTED_STYLE)
+    subtitle.append("quit", style=f"bold {MUTED_STYLE}")
+    subtitle.append(" to end the session.", style=MUTED_STYLE)
+    subtitle.append("\n  ", style=MUTED_STYLE)
+    subtitle.append("/help", style=f"bold {MUTED_STYLE}")
+    subtitle.append(" to see available commands.", style=MUTED_STYLE)
+
+    content = Text()
+    content.append_text(logo)
+    content.append_text(subtitle)
+
+    panel = Panel(
+        content,
+        border_style=ACCENT_STYLE,
+        padding=(0, 2),
     )
-    print(f"  {style('/help', DIM, BOLD)} {style('to see available commands.', DIM)}")
-    print()
+    console.print()
+    console.print(panel)
+    console.print()

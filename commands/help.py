@@ -1,5 +1,4 @@
 from commands import Command, CommandRegistry, CommandResult, ReplContext
-from ui.colors import BOLD, DIM, style
 
 
 class HelpCommand(Command):
@@ -18,6 +17,6 @@ class HelpCommand(Command):
         lines = ["  Available commands:"]
         for cmd in self._registry.all_commands:
             names = [cmd.name, *cmd.aliases]
-            label = ", ".join(style(n, BOLD) for n in names)
-            lines.append(f"    {label}  {style(cmd.description, DIM)}")
+            label = ", ".join(f"[bold]{n}[/bold]" for n in names)
+            lines.append(f"    {label}  [dim]{cmd.description}[/dim]")
         return CommandResult(message="\n".join(lines))

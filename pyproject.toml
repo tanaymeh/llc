@@ -1,5 +1,5 @@
 [project]
-name = "local-claude-code"
+name = "llc"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -17,4 +17,5 @@ dependencies = [
     "prompt-toolkit>=3.0.0",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
+    "rich>=14.0.0",
 ]

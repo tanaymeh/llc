@@ -10,6 +10,8 @@ import httpx
 class AvailableModel:
     id: str
     name: str
+    prompt_price: float | None = None
+    completion_price: float | None = None
 
 
 _cache: dict[tuple[str, str | None], list[AvailableModel]] = {}
@@ -18,6 +20,20 @@ _cache_lock = asyncio.Lock()
 
 def _models_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/models"
+
+
+def _parse_pricing(pricing: object) -> tuple[float | None, float | None]:
+    if not isinstance(pricing, dict):
+        return None, None
+    try:
+        prompt = float(pricing["prompt"])
+    except (KeyError, TypeError, ValueError):
+        prompt = None
+    try:
+        completion = float(pricing["completion"])
+    except (KeyError, TypeError, ValueError):
+        completion = None
+    return prompt, completion
 
 
 def _parse_models(payload: object) -> list[AvailableModel]:
@@ -38,12 +54,27 @@ def _parse_models(payload: object) -> list[AvailableModel]:
         if not isinstance(model_id, str) or not model_id or model_id in seen:
             continue
         name = item.get("name")
+        prompt_price, completion_price = _parse_pricing(item.get("pricing"))
         models.append(
-            AvailableModel(id=model_id, name=name if isinstance(name, str) and name else model_id)
+            AvailableModel(
+                id=model_id,
+                name=name if isinstance(name, str) and name else model_id,
+                prompt_price=prompt_price,
+                completion_price=completion_price,
+            )
         )
         seen.add(model_id)
 
     return sorted(models, key=lambda model: model.id.lower())
+
+
+def get_model_pricing(
+    models: list[AvailableModel], model_id: str
+) -> tuple[float, float] | None:
+    for model in models:
+        if model.id == model_id and model.prompt_price is not None and model.completion_price is not None:
+            return (model.prompt_price, model.completion_price)
+    return None
 
 
 async def fetch_models(

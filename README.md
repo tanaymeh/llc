@@ -1,10 +1,11 @@
-# Local LangGraph Coding Agent
+# LLC
 
-Minimal LangGraph + LangChain skeleton for a local coding assistant that:
-- runs in a loop (REPL),
+Local LangGraph + LangChain coding agent that:
+- runs in a REPL with a rich terminal UI (ASCII banner, adaptive colors, syntax-highlighted markdown),
 - accepts user commands,
-- calls tools when needed (shell, read/write files, grep, edit, ShowDiff for colored session diffs, etc.),
-- streams tokens, tool activity, and final responses.
+- calls tools when needed (shell, read/write files, grep, edit, ShowDiff, etc.),
+- streams tokens with live markdown rendering and code syntax highlighting,
+- tracks token usage and estimates cost via OpenRouter pricing.
 
 ## Requirements
 
@@ -25,6 +26,7 @@ Set values in `.env`:
 - `OPENAI_BASE_URL` (optional for custom OpenAI-compatible endpoints)
 
 Edit the assistant system prompt in `prompts/system_prompt.yaml`.
+At runtime, LLC appends current environment metadata to the very end of the system prompt inside `<env>...</env>` tags.
 
 ## Run
 
@@ -35,6 +37,16 @@ uv run main.py
 Inside the CLI:
 - type your request normally,
 - type `exit` or `quit` to stop.
+
+## UI Features
+
+- **ASCII art banner** with model info on startup
+- **Inline markdown rendering** of assistant responses with syntax-highlighted code blocks
+- **Live streaming** with real-time markdown re-rendering as tokens arrive
+- **Persistent top-right usage HUD** with cumulative input/output tokens and total cost
+- **Cost estimation** from OpenRouter model pricing (when available)
+- **Session summary** showing total tokens and cost on exit
+- **Single rolling spinner line** for tool execution status
 
 ## Docker
 
@@ -69,5 +81,10 @@ agent/state.py     # LangGraph state schema
 agent/nodes.py     # LLM node, tool node, routing
 agent/graph.py     # StateGraph builder + MemorySaver
 agent/tools/       # Tool implementations
+ui/display.py      # Rich-based banner, panels, markdown rendering
+ui/repl.py         # REPL loop with streaming + token tracking
+ui/token_tracker.py # Token usage and cost tracking
+ui/colors.py       # ANSI escape codes (for prompt_toolkit prompt)
+models.py          # Model list fetching + pricing from OpenRouter
 scripts/           # helper scripts, including Docker launcher
 ```

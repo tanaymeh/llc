@@ -22,6 +22,7 @@ def build_agent_graph(settings: Settings):
             temperature=0,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            stream_usage=True,
         )
     else:
         model = ChatOpenAI(
@@ -29,6 +30,7 @@ def build_agent_graph(settings: Settings):
             temperature=0,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
+            stream_usage=True,
         )
     tools = collect_tools(settings)
     model_with_tools = model.bind_tools(tools)

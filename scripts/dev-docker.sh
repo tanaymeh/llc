@@ -60,9 +60,9 @@ if [[ ! -f "$REPO_ROOT/.env" ]]; then
 fi
 
 if [[ "$DEBUG" -eq 1 ]]; then
-  docker build -t local-claude-code-dev "$REPO_ROOT"
+  docker build -t llc-dev "$REPO_ROOT"
 else
-  if ! docker build -t local-claude-code-dev "$REPO_ROOT" >/dev/null 2>&1; then
+  if ! docker build -t llc-dev "$REPO_ROOT" >/dev/null 2>&1; then
     echo "Docker build failed. Re-run with --debug for full build output." >&2
     exit 1
   fi
@@ -72,4 +72,4 @@ exec docker run --rm -it --init \
   -w /workspace \
   --env-file "$REPO_ROOT/.env" \
   --mount "type=bind,src=$TARGET_DIR,dst=/workspace" \
-  local-claude-code-dev
+  llc-dev
