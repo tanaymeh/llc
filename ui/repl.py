@@ -3,11 +3,16 @@ import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
+from prompt_toolkit.completion import FuzzyCompleter
+from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.shortcuts import CompleteStyle, PromptSession
 
 from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
 from config import Settings
+from models import AvailableModel, fetch_models
 from ui.colors import BOLD, CYAN, DIM, GREEN, RED, YELLOW, style
+from ui.completer import ModelCompleter
 from ui.display import (
     ReasoningTracker,
     extract_reasoning,
@@ -21,9 +26,17 @@ class Repl:
     def __init__(self, settings: Settings, registry: CommandRegistry) -> None:
         self._registry = registry
         self._settings = settings
+        self._available_models: list[AvailableModel] = []
+        self._prompt_session = PromptSession(
+            completer=FuzzyCompleter(ModelCompleter(self._get_available_models)),
+            complete_while_typing=True,
+            complete_style=CompleteStyle.COLUMN,
+            reserve_space_for_menu=8,
+        )
 
     async def run(self) -> None:
         print_banner(self._settings.model_name)
+        asyncio.create_task(self._load_available_models())
 
         try:
             agent = build_agent_graph(self._settings)
@@ -44,8 +57,8 @@ class Repl:
 
         while True:
             try:
-                user_input = await asyncio.to_thread(
-                    input, f"{style('❯', GREEN, BOLD)} "
+                user_input = await self._prompt_session.prompt_async(
+                    ANSI(f"{style('❯', GREEN, BOLD)} ")
                 )
                 user_input = user_input.strip()
             except (EOFError, KeyboardInterrupt):
@@ -73,6 +86,15 @@ class Repl:
                 print(f"\n{style('Interrupted.', YELLOW)}\n")
             except Exception as exc:  # noqa: BLE001
                 print(f"\n{style('✗', RED)} {style(str(exc), RED)}\n")
+
+    def _get_available_models(self) -> list[AvailableModel]:
+        return self._available_models
+
+    async def _load_available_models(self) -> None:
+        self._available_models = await fetch_models(
+            base_url=self._settings.openai_base_url,
+            api_key=self._settings.openai_api_key,
+        )
 
     async def _run_turn(
         self, agent: Any, thread_id: str, user_input: str
