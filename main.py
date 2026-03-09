@@ -1,4 +1,5 @@
 from commands import CommandRegistry
+from commands.compact import CompactCommand
 from commands.exit import ExitCommand
 from commands.help import HelpCommand
 from commands.model import ModelCommand
@@ -8,6 +9,7 @@ from ui.repl import Repl
 
 def _build_registry() -> CommandRegistry:
     registry = CommandRegistry()
+    registry.register(CompactCommand())
     registry.register(ExitCommand())
     registry.register(ModelCommand())
     registry.register(HelpCommand(registry))

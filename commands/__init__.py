@@ -14,9 +14,10 @@ class CommandResult:
 
 
 class ReplContext:
-    def __init__(self, settings: Settings, agent: Any) -> None:
+    def __init__(self, settings: Settings, agent: Any, thread_id: str) -> None:
         self.settings = settings
         self.agent = agent
+        self.thread_id = thread_id
 
 
 class Command(ABC):

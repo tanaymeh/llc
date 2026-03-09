@@ -15,23 +15,27 @@ def _is_openrouter_base_url(base_url: str | None) -> bool:
     return "openrouter.ai" in base_url.lower()
 
 
-def build_agent_graph(settings: Settings):
+def build_chat_model(settings: Settings, model_name: str | None = None):
+    selected_model = model_name or settings.model_name
     if _is_openrouter_base_url(settings.openai_base_url):
-        model = ChatOpenRouter(
-            model=settings.model_name,
+        return ChatOpenRouter(
+            model=selected_model,
             temperature=0,
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url,
             stream_usage=True,
         )
-    else:
-        model = ChatOpenAI(
-            model=settings.model_name,
-            temperature=0,
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-            stream_usage=True,
-        )
+    return ChatOpenAI(
+        model=selected_model,
+        temperature=0,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        stream_usage=True,
+    )
+
+
+def build_agent_graph(settings: Settings):
+    model = build_chat_model(settings)
     tools = collect_tools(settings)
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}

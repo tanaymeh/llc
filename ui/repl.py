@@ -18,6 +18,7 @@ from textual.widgets import Button, Input, Markdown, OptionList, Static, TextAre
 from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
 from config import Settings
+from hooks import AutoCompactHook, Hook, HookContext
 from models import AvailableModel, fetch_models, get_model_pricing
 from ui.display import (
     collect_new_tool_calls,
@@ -266,6 +267,7 @@ class Repl(App[None]):
         self._command_registry = registry
         self._ctx: ReplContext | None = None
         self._thread_id = f"tui-{uuid.uuid4()}"
+        self._hooks: list[Hook] = [AutoCompactHook()]
         self._available_models: list[AvailableModel] = []
         self._token_tracker = TokenTracker()
         self._session_cost = 0.0
@@ -273,13 +275,14 @@ class Repl(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
+        with VerticalScroll(id="chat_scroll"):
+            yield Vertical(id="chat_column")
         with Horizontal(id="composer"):
             yield ComposerInput(id="composer_input")
             yield Button("Send", id="send_button", variant="primary")
-        with VerticalScroll(id="chat_scroll"):
-            yield Vertical(id="chat_column")
 
     async def on_mount(self) -> None:
+        self._configure_layout()
         self._chat_scroll().anchor()
         self._composer_input().focus()
         self._configure_composer()
@@ -296,7 +299,11 @@ class Repl(App[None]):
             )
             return
 
-        self._ctx = ReplContext(settings=self._settings, agent=agent)
+        self._ctx = ReplContext(
+            settings=self._settings,
+            agent=agent,
+            thread_id=self._thread_id,
+        )
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
@@ -308,6 +315,11 @@ class Repl(App[None]):
         composer = self._composer_input()
         composer.show_line_numbers = False
         composer.soft_wrap = True
+
+    def _configure_layout(self) -> None:
+        self.query_one("#banner", Static).styles.dock = "top"
+        self.query_one("#composer", Horizontal).styles.dock = "bottom"
+        self._chat_scroll().styles.height = "1fr"
 
     def _chat_scroll(self) -> VerticalScroll:
         return self.query_one("#chat_scroll", VerticalScroll)
@@ -535,9 +547,9 @@ class Repl(App[None]):
             await bubble.set_markdown(f"Request failed: `{exc!s}`")
         finally:
             bubble.clear_tool_status()
-            self._finish_turn()
+            await self._finish_turn()
 
-    def _finish_turn(self) -> None:
+    async def _finish_turn(self) -> None:
         turn = self._token_tracker.finish_turn()
         if turn.input_tokens > 0 or turn.output_tokens > 0:
             pricing = get_model_pricing(
@@ -548,6 +560,22 @@ class Repl(App[None]):
                 self._session_cost += TokenTracker.compute_cost(
                     turn, pricing[0], pricing[1]
                 )
+        if self._ctx is not None:
+            hook_ctx = HookContext(
+                agent=self._ctx.agent,
+                thread_id=self._ctx.thread_id,
+                settings=self._ctx.settings,
+                last_turn_input_tokens=turn.input_tokens,
+                available_models=self._available_models,
+                compact_prompt=self._ctx.settings.compact_prompt,
+            )
+            for hook in self._hooks:
+                try:
+                    message = await hook.after_turn(hook_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    message = f"Hook failed: `{exc!s}`"
+                if message:
+                    await self._append_system(message)
         self._refresh_banner()
 
     def _extract_usage(self, message_chunk: Any) -> None:

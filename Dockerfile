@@ -15,7 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ripgrep \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY main.py config.py models.py ./
+COPY main.py config.py models.py hooks.py ./
 COPY agent ./agent
 COPY commands ./commands
 COPY ui ./ui

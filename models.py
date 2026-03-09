@@ -12,6 +12,7 @@ class AvailableModel:
     name: str
     prompt_price: float | None = None
     completion_price: float | None = None
+    context_length: int | None = None
 
 
 _cache: dict[tuple[str, str | None], list[AvailableModel]] = {}
@@ -55,12 +56,19 @@ def _parse_models(payload: object) -> list[AvailableModel]:
             continue
         name = item.get("name")
         prompt_price, completion_price = _parse_pricing(item.get("pricing"))
+        raw_context_length = item.get("context_length")
+        context_length = (
+            int(raw_context_length)
+            if isinstance(raw_context_length, int | float)
+            else None
+        )
         models.append(
             AvailableModel(
                 id=model_id,
                 name=name if isinstance(name, str) and name else model_id,
                 prompt_price=prompt_price,
                 completion_price=completion_price,
+                context_length=context_length,
             )
         )
         seen.add(model_id)

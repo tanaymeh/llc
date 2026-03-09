@@ -22,6 +22,7 @@ cp .env.example .env
 
 Set values in `.env`:
 - `MODEL_NAME` (example: `gpt-4o-mini`, `deepseek/deepseek-r1`)
+- `COMPACT_MODEL_NAME` (optional; defaults to `MODEL_NAME` for `/compact` and auto-compaction summaries)
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL` (optional for custom OpenAI-compatible endpoints)
 
@@ -38,6 +39,7 @@ Inside the TUI:
 - type in the bottom composer,
 - press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
 - use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
+- use `/compact` to summarize and replace the oldest chat history once the model-visible history has more than 5 messages,
 - use `exit` or `quit` to stop, `Ctrl+Q` to quit immediately.
 
 ## UI Features
@@ -47,6 +49,7 @@ Inside the TUI:
 - **Fixed bottom composer** that stays visible like a chat app input
 - **Role-specific message panels** (User and Agent with model name)
 - **Tool call and reasoning traces** shown inline in agent messages
+- **Chat compaction** via `/compact`, plus automatic compaction when the last prompt reaches 90% of the active model context length
 - **Send lock while streaming** (typing remains enabled but sending is disabled)
 - **Markdown and code rendering** tuned for readability in dark and light themes
 - **Word-level editing**: `Ctrl+Backspace` delete word, `Ctrl+Left/Right` word navigation
@@ -54,6 +57,19 @@ Inside the TUI:
 ## Docker
 
 Rebuild and launch the app in one command while mounting any host folder as the agent workspace:
+
+```bash
+make run
+```
+
+`make run` uses the quiet Docker build mode and mounts the sibling `../llm-transpiler` project by default.
+Override the mounted workspace when needed:
+
+```bash
+make run WORKSPACE=/path/to/folder
+```
+
+You can still call the Docker helper directly:
 
 ```bash
 ./scripts/dev-docker.sh /path/to/folder
