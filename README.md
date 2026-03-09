@@ -36,9 +36,8 @@ uv run main.py
 
 Inside the TUI:
 - type in the bottom composer,
-- press `Enter` to insert a newline,
-- press `Ctrl+Enter` to submit (or `Ctrl+J` as a universal terminal fallback),
-- use `Ctrl+N` as an additional newline shortcut,
+- press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
+- use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
 - use `exit` or `quit` to stop, `Ctrl+Q` to quit immediately.
 
 ## UI Features

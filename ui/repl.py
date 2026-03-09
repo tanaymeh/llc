@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 from rich.text import Text
-from textual import events, on, work
+from textual import on, work
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -38,33 +36,6 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
-_DEBUG_LOG_PATH = Path("/home/tanay/Desktop/local-claude-code/.cursor/debug-d4cafa.log")
-_DEBUG_SESSION_ID = "d4cafa"
-_DEBUG_RUN_ID = "ctrl-enter-enter-newline"
-
-
-def _debug_log(
-    *,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: dict[str, Any],
-) -> None:
-    payload = {
-        "sessionId": _DEBUG_SESSION_ID,
-        "runId": _DEBUG_RUN_ID,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=True))
-            handle.write("\n")
-    except Exception:
-        return
 
 
 def _format_duration(seconds: float) -> str:
@@ -269,34 +240,18 @@ class ComposerInput(TextArea):
         ),
     ]
 
-    def on_key(self, event: events.Key) -> None:
-        #region agent log
-        _debug_log(
-            hypothesis_id="H1-H2",
-            location="ui/repl.py:ComposerInput.on_key",
-            message="Composer key event",
-            data={
-                "key": event.key,
-                "name": event.name,
-                "aliases": list(event.aliases),
-                "name_aliases": list(event.name_aliases),
-                "character": event.character,
-            },
-        )
-        #endregion
-
 
 class Repl(App[None]):
     CSS_PATH = "repl.tcss"
     BINDINGS = [
         Binding(
-            "ctrl+enter,ctrl+return,ctrl+j,ctrl+m",
+            "enter,return,ctrl+enter,ctrl+return,ctrl+j,ctrl+m",
             "send_message",
             "Send",
             priority=True,
         ),
         Binding(
-            "enter,return,shift+enter,shift+return,ctrl+n",
+            "shift+enter,shift+return,ctrl+n,ctrl+o,alt+enter,alt+return",
             "insert_newline",
             "New line",
             show=False,
@@ -325,7 +280,6 @@ class Repl(App[None]):
             yield Vertical(id="chat_column")
 
     async def on_mount(self) -> None:
-        self._enable_progressive_keyboard_mode()
         self._chat_scroll().anchor()
         self._composer_input().focus()
         self._configure_composer()
@@ -345,8 +299,8 @@ class Repl(App[None]):
         self._ctx = ReplContext(settings=self._settings, agent=agent)
         await self._append_system(
             "Connected. Type `/help` for commands. "
-            "`Enter` inserts newline. `Ctrl+Enter` sends. "
-            "`Ctrl+N` also inserts newline. `Ctrl+Q` to quit."
+            "`Ctrl+Enter` to send (`Enter` on many terminals). "
+            "`Ctrl+N`/`Ctrl+O` insert newline. `Ctrl+Q` to quit."
         )
         self._load_available_models()
 
@@ -420,50 +374,9 @@ class Repl(App[None]):
         focused = self.focused
         return focused is self._composer_input()
 
-    def _enable_progressive_keyboard_mode(self) -> None:
-        driver = getattr(self, "_driver", None)
-        if driver is None:
-            #region agent log
-            _debug_log(
-                hypothesis_id="H2",
-                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
-                message="Driver unavailable for progressive keyboard mode",
-                data={"enabled": False},
-            )
-            #endregion
-            return
-        try:
-            driver.write("\x1b[=8;u")
-            driver.flush()
-            #region agent log
-            _debug_log(
-                hypothesis_id="H2",
-                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
-                message="Requested progressive keyboard mode",
-                data={"enabled": True},
-            )
-            #endregion
-        except Exception as exc:  # noqa: BLE001
-            #region agent log
-            _debug_log(
-                hypothesis_id="H2",
-                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
-                message="Failed to request progressive keyboard mode",
-                data={"enabled": False, "error": str(exc)},
-            )
-            #endregion
-
     def action_insert_newline(self) -> None:
         if not self._composer_is_focused():
             raise SkipAction()
-        #region agent log
-        _debug_log(
-            hypothesis_id="H5",
-            location="ui/repl.py:Repl.action_insert_newline",
-            message="insert_newline action triggered",
-            data={},
-        )
-        #endregion
         composer = self._composer_input()
         composer.insert("\n")
         composer.focus()
@@ -471,46 +384,14 @@ class Repl(App[None]):
     def action_send_message(self) -> None:
         if not self._composer_is_focused():
             raise SkipAction()
-        #region agent log
-        _debug_log(
-            hypothesis_id="H3-H4",
-            location="ui/repl.py:Repl.action_send_message",
-            message="send_message action triggered",
-            data={"busy": self._busy, "ctx_ready": self._ctx is not None},
-        )
-        #endregion
         self._do_send()
 
     def _do_send(self) -> None:
         if self._busy or self._ctx is None:
-            #region agent log
-            _debug_log(
-                hypothesis_id="H4",
-                location="ui/repl.py:Repl._do_send",
-                message="send blocked by busy/context guard",
-                data={"busy": self._busy, "ctx_ready": self._ctx is not None},
-            )
-            #endregion
             return
         raw = self._composer_input().text.strip()
         if not raw:
-            #region agent log
-            _debug_log(
-                hypothesis_id="H4",
-                location="ui/repl.py:Repl._do_send",
-                message="send blocked by empty input",
-                data={},
-            )
-            #endregion
             return
-        #region agent log
-        _debug_log(
-            hypothesis_id="H4",
-            location="ui/repl.py:Repl._do_send",
-            message="send accepted",
-            data={"length": len(raw)},
-        )
-        #endregion
         self._composer_input().clear()
         self._composer_input().focus()
 
