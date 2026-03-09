@@ -14,9 +14,9 @@ class HelpCommand(Command):
         return "Show available commands"
 
     async def execute(self, args: str, ctx: ReplContext) -> CommandResult:
-        lines = ["  Available commands:"]
+        lines = ["### Available commands"]
         for cmd in self._registry.all_commands:
             names = [cmd.name, *cmd.aliases]
-            label = ", ".join(f"[bold]{n}[/bold]" for n in names)
-            lines.append(f"    {label}  [dim]{cmd.description}[/dim]")
+            label = ", ".join(f"`{name}`" for name in names)
+            lines.append(f"- {label}: {cmd.description}")
         return CommandResult(message="\n".join(lines))

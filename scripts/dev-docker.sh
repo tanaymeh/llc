@@ -68,8 +68,13 @@ else
   fi
 fi
 
+TERM_VALUE="${TERM:-xterm-256color}"
+COLORTERM_VALUE="${COLORTERM:-truecolor}"
+
 exec docker run --rm -it --init \
   -w /workspace \
   --env-file "$REPO_ROOT/.env" \
+  -e "TERM=$TERM_VALUE" \
+  -e "COLORTERM=$COLORTERM_VALUE" \
   --mount "type=bind,src=$TARGET_DIR,dst=/workspace" \
   llc-dev

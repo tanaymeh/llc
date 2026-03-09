@@ -1,5 +1,3 @@
-import asyncio
-
 from commands import CommandRegistry
 from commands.exit import ExitCommand
 from commands.help import HelpCommand
@@ -19,8 +17,8 @@ def _build_registry() -> CommandRegistry:
 def main() -> None:
     settings = Settings.from_env()
     registry = _build_registry()
-    repl = Repl(settings, registry)
-    asyncio.run(repl.run())
+    app = Repl(settings, registry)
+    app.run()
 
 
 if __name__ == "__main__":

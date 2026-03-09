@@ -1,0 +1,197 @@
+Screen {
+    background: $surface;
+    color: $text;
+}
+
+/* ── Banner (top, ASCII logo + model info) ── */
+
+#banner {
+    dock: top;
+    height: auto;
+    padding: 1 2;
+    border-bottom: solid $panel-lighten-1;
+    background: $panel;
+}
+
+/* ── Composer (bottom, slim input + send) ── */
+
+#composer {
+    dock: bottom;
+    height: auto;
+    max-height: 15%;
+    padding: 0 2 1 2;
+    background: $surface-darken-1;
+    border-top: solid $panel-lighten-1;
+}
+
+#composer_input {
+    width: 1fr;
+    min-height: 3;
+    max-height: 5;
+    border: round $primary 55%;
+}
+
+#composer_input:focus {
+    border: round $accent;
+}
+
+#send_button {
+    width: 12;
+    margin: 0 0 0 1;
+    height: 3;
+}
+
+/* ── Chat scroll area ── */
+
+#chat_scroll {
+    width: 1fr;
+    height: 1fr;
+    padding: 1 2;
+}
+
+#chat_column {
+    width: 1fr;
+    height: auto;
+}
+
+/* ── System messages ── */
+
+.system-message {
+    width: 1fr;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    color: $text-muted;
+    text-style: italic;
+}
+
+/* ── Chat bubbles ── */
+
+.chat-bubble {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1 0 1;
+    border: round;
+}
+
+.chat-title {
+    width: 1fr;
+    padding: 0 1;
+    text-style: bold;
+}
+
+.chat-markdown {
+    width: 1fr;
+    height: auto;
+    padding: 0 1;
+    background: transparent;
+}
+
+.chat-markdown MarkdownFence {
+    margin: 1 0;
+    border: round;
+}
+
+.chat-markdown MarkdownFence > Label {
+    text-style: none;
+    padding: 1 2;
+}
+
+.chat-markdown MarkdownBlock > .code_inline {
+    text-style: bold;
+}
+
+/* ── Tool status (inside agent bubble) ── */
+
+.tool-status {
+    width: 1fr;
+    padding: 0 1;
+    color: $text-muted;
+    text-style: italic;
+}
+
+/* ── Reasoning lines (inside agent bubble) ── */
+
+.reasoning-line {
+    width: 1fr;
+    padding: 0 1;
+    color: $text-muted;
+    text-style: dim italic;
+}
+
+.reasoning-summary {
+    width: 1fr;
+    padding: 0 1;
+    color: $text-muted;
+    text-style: dim italic;
+}
+
+/* ── User bubble: cool slate blue ── */
+
+.user-bubble:dark {
+    background: rgb(35, 42, 58);
+    border: round rgb(80, 100, 140);
+    color: rgb(220, 225, 240);
+}
+
+.user-bubble:light {
+    background: rgb(235, 240, 250);
+    border: round rgb(140, 160, 200);
+    color: rgb(30, 35, 50);
+}
+
+.user-bubble .chat-title:dark {
+    color: rgb(160, 180, 220);
+}
+
+.user-bubble .chat-title:light {
+    color: rgb(60, 80, 130);
+}
+
+/* ── Agent bubble: neutral warm gray ── */
+
+.agent-bubble:dark {
+    background: rgb(40, 40, 46);
+    border: round rgb(100, 100, 115);
+    color: rgb(225, 225, 230);
+}
+
+.agent-bubble:light {
+    background: rgb(245, 244, 242);
+    border: round rgb(180, 178, 172);
+    color: rgb(40, 38, 35);
+}
+
+.agent-bubble .chat-title:dark {
+    color: rgb(185, 185, 200);
+}
+
+.agent-bubble .chat-title:light {
+    color: rgb(90, 88, 80);
+}
+
+/* ── Code fences inside agent bubble ── */
+
+.agent-bubble .chat-markdown MarkdownFence:dark {
+    background: rgb(28, 28, 36);
+    border: round rgb(70, 72, 90);
+    color: rgb(220, 225, 240);
+}
+
+.agent-bubble .chat-markdown MarkdownFence:light {
+    background: rgb(248, 248, 252);
+    border: round rgb(180, 182, 200);
+    color: rgb(30, 32, 45);
+}
+
+/* ── Inline code inside agent bubble ── */
+
+.agent-bubble .chat-markdown MarkdownBlock > .code_inline:dark {
+    background: rgb(50, 52, 65);
+    color: rgb(210, 215, 235);
+}
+
+.agent-bubble .chat-markdown MarkdownBlock > .code_inline:light {
+    background: rgb(232, 234, 245);
+    color: rgb(40, 45, 70);
+}

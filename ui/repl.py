@@ -1,362 +1,688 @@
+from __future__ import annotations
+
 import asyncio
+import json
+import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
-from prompt_toolkit.formatted_text import ANSI
-from prompt_toolkit.shortcuts import CompleteStyle, PromptSession
-from rich.live import Live
-from rich.markdown import Markdown
-from rich.spinner import Spinner
 from rich.text import Text
+from textual import events, on, work
+from textual.actions import SkipAction
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widgets import Button, Input, Markdown, OptionList, Static, TextArea
 
 from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
 from config import Settings
 from models import AvailableModel, fetch_models, get_model_pricing
-from ui.colors import BOLD, GREEN, style
-from ui.completer import ModelCompleter
 from ui.display import (
-    MARKDOWN_CODE_THEME,
-    MUTED_STYLE,
-    ReasoningTracker,
-    TOOL_NAME_STYLE,
     collect_new_tool_calls,
-    console,
     extract_reasoning,
     format_tool_args,
     message_text,
-    print_banner,
-    print_session_summary,
-    render_session_hud,
-    render_assistant_markdown,
 )
 from ui.token_tracker import TokenTracker
 
+LLC_LOGO = r"""  ██╗     ██╗      ██████╗
+  ██║     ██║     ██╔════╝
+  ██║     ██║     ██║
+  ██║     ██║     ██║
+  ███████╗███████╗╚██████╗
+  ╚══════╝╚══════╝ ╚═════╝"""
 
-class Repl:
+_REASONING_TOKENS_PER_LINE = 20
+_REASONING_LINE_INTERVAL = 1.0
+_DEBUG_LOG_PATH = Path("/home/tanay/Desktop/local-claude-code/.cursor/debug-d4cafa.log")
+_DEBUG_SESSION_ID = "d4cafa"
+_DEBUG_RUN_ID = "ctrl-enter-enter-newline"
+
+
+def _debug_log(
+    *,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, Any],
+) -> None:
+    payload = {
+        "sessionId": _DEBUG_SESSION_ID,
+        "runId": _DEBUG_RUN_ID,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True))
+            handle.write("\n")
+    except Exception:
+        return
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 60:
+        v, u = seconds, "second"
+    elif seconds < 3600:
+        v, u = seconds / 60, "minute"
+    else:
+        v, u = seconds / 3600, "hour"
+    text = f"{v:.0f}" if v >= 10 else f"{v:.1f}"
+    if text.endswith(".0"):
+        text = text[:-2]
+    suffix = u if text == "1" else f"{u}s"
+    return f"{text} {suffix}"
+
+
+class _ReasoningTracker:
+    def __init__(self) -> None:
+        self.started_at: float | None = None
+        self._tokens: list[str] = []
+        self._last_emitted: float | None = None
+
+    def feed(self, text: str) -> str | None:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        if self.started_at is None:
+            self.started_at = time.monotonic()
+        words = cleaned.split()
+        if not words:
+            return None
+        self._tokens.extend(words)
+        now = time.monotonic()
+        if len(self._tokens) < _REASONING_TOKENS_PER_LINE:
+            return None
+        if (
+            self._last_emitted is not None
+            and now - self._last_emitted < _REASONING_LINE_INTERVAL
+        ):
+            return None
+        line_tokens = self._tokens[:_REASONING_TOKENS_PER_LINE]
+        self._tokens = self._tokens[_REASONING_TOKENS_PER_LINE:]
+        self._last_emitted = now
+        return " ".join(line_tokens)
+
+    @property
+    def active(self) -> bool:
+        return self.started_at is not None
+
+    def finish(self) -> str:
+        elapsed = 0.0
+        if self.started_at is not None:
+            elapsed = max(time.monotonic() - self.started_at, 0.0)
+        self.started_at = None
+        self._tokens.clear()
+        self._last_emitted = None
+        return f"  Reasoned for {_format_duration(elapsed)}"
+
+
+class ModelPickerScreen(ModalScreen[str | None]):
+    BINDINGS = [
+        Binding("up", "move_up", show=False, priority=True),
+        Binding("down", "move_down", show=False, priority=True),
+        Binding("enter,return", "accept", show=False, priority=True),
+        Binding("escape", "cancel", show=False, priority=True),
+    ]
+
+    CSS = """
+    ModelPickerScreen {
+        align: center middle;
+    }
+    #model_picker_box {
+        width: 80;
+        max-width: 90%;
+        height: 24;
+        max-height: 80%;
+        background: $surface;
+        border: round $primary;
+        padding: 1 2;
+    }
+    #model_search {
+        width: 1fr;
+        margin: 0 0 1 0;
+    }
+    #model_list {
+        width: 1fr;
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, models: list[AvailableModel]) -> None:
+        super().__init__()
+        self._models = models
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="model_picker_box"):
+            yield Input(placeholder="Search models…", id="model_search")
+            yield OptionList(id="model_list")
+
+    async def on_mount(self) -> None:
+        self._populate("")
+        self.query_one("#model_search", Input).focus()
+
+    @on(Input.Changed, "#model_search")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._populate(event.value.strip().lower())
+
+    def _populate(self, query: str) -> None:
+        option_list = self.query_one("#model_list", OptionList)
+        option_list.clear_options()
+        for m in self._models:
+            if query and query not in m.id.lower() and query not in m.name.lower():
+                continue
+            option_list.add_option(m.id)
+        if option_list.option_count > 0:
+            option_list.action_first()
+
+    @on(OptionList.OptionSelected, "#model_list")
+    def _on_select(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(str(event.option.prompt))
+
+    def action_move_up(self) -> None:
+        option_list = self.query_one("#model_list", OptionList)
+        if option_list.option_count > 0:
+            option_list.action_cursor_up()
+
+    def action_move_down(self) -> None:
+        option_list = self.query_one("#model_list", OptionList)
+        if option_list.option_count > 0:
+            option_list.action_cursor_down()
+
+    def action_accept(self) -> None:
+        option_list = self.query_one("#model_list", OptionList)
+        highlighted = option_list.highlighted_option
+        if highlighted is not None:
+            self.dismiss(str(highlighted.prompt))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ChatBubble(Vertical):
+    def __init__(
+        self,
+        role: str,
+        *,
+        model_name: str | None = None,
+        markdown: str = "",
+    ) -> None:
+        classes = (
+            "chat-bubble user-bubble"
+            if role == "user"
+            else "chat-bubble agent-bubble"
+        )
+        super().__init__(classes=classes)
+        self._role = role
+        self._model_name = model_name
+        self._markdown = markdown
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._title_renderable(), classes="chat-title")
+        yield Static("", classes="reasoning-line")
+        yield Static("", classes="tool-status")
+        yield Markdown(self._markdown, classes="chat-markdown")
+
+    def _title_renderable(self) -> Text:
+        if self._role == "user":
+            return Text("User", style="bold")
+        title = Text("Agent", style="bold")
+        if self._model_name:
+            title.append(" (", style="dim")
+            title.append(self._model_name, style="grey62")
+            title.append(")", style="dim")
+        return title
+
+    def markdown_widget(self) -> Markdown:
+        return self.query_one(Markdown)
+
+    async def set_markdown(self, markdown: str) -> None:
+        await self.markdown_widget().update(markdown)
+
+    def update_tool_status(self, text: str) -> None:
+        self.query_one(".tool-status", Static).update(text)
+
+    def clear_tool_status(self) -> None:
+        self.query_one(".tool-status", Static).update("")
+
+    def update_reasoning_line(self, text: str) -> None:
+        self.query_one(".reasoning-line", Static).update(text)
+
+    def set_reasoning_summary(self, text: str) -> None:
+        self.query_one(".reasoning-line", Static).update(text)
+
+
+class ComposerInput(TextArea):
+    BINDINGS = [
+        Binding(
+            "ctrl+backspace",
+            "delete_word_left",
+            "Delete word left",
+            show=False,
+        ),
+    ]
+
+    def on_key(self, event: events.Key) -> None:
+        #region agent log
+        _debug_log(
+            hypothesis_id="H1-H2",
+            location="ui/repl.py:ComposerInput.on_key",
+            message="Composer key event",
+            data={
+                "key": event.key,
+                "name": event.name,
+                "aliases": list(event.aliases),
+                "name_aliases": list(event.name_aliases),
+                "character": event.character,
+            },
+        )
+        #endregion
+
+
+class Repl(App[None]):
+    CSS_PATH = "repl.tcss"
+    BINDINGS = [
+        Binding(
+            "ctrl+enter,ctrl+return,ctrl+j,ctrl+m",
+            "send_message",
+            "Send",
+            priority=True,
+        ),
+        Binding(
+            "enter,return,shift+enter,shift+return,ctrl+n",
+            "insert_newline",
+            "New line",
+            show=False,
+            priority=True,
+        ),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+    ]
+
     def __init__(self, settings: Settings, registry: CommandRegistry) -> None:
-        self._registry = registry
+        super().__init__()
         self._settings = settings
+        self._command_registry = registry
+        self._ctx: ReplContext | None = None
+        self._thread_id = f"tui-{uuid.uuid4()}"
         self._available_models: list[AvailableModel] = []
         self._token_tracker = TokenTracker()
-        self._session_cost: float = 0.0
-        self._prompt_session = PromptSession(
-            completer=ModelCompleter(self._get_available_models),
-            complete_while_typing=True,
-            complete_style=CompleteStyle.COLUMN,
-            reserve_space_for_menu=8,
-        )
+        self._session_cost = 0.0
+        self._busy = False
 
-    async def run(self) -> None:
-        print_banner(self._settings.model_name)
-        render_session_hud(0, 0, None)
-        asyncio.create_task(self._load_available_models())
+    def compose(self) -> ComposeResult:
+        yield Static(id="banner")
+        with Horizontal(id="composer"):
+            yield ComposerInput(id="composer_input")
+            yield Button("Send", id="send_button", variant="primary")
+        with VerticalScroll(id="chat_scroll"):
+            yield Vertical(id="chat_column")
+
+    async def on_mount(self) -> None:
+        self._enable_progressive_keyboard_mode()
+        self._chat_scroll().anchor()
+        self._composer_input().focus()
+        self._configure_composer()
+        self._refresh_banner()
 
         try:
             agent = build_agent_graph(self._settings)
         except Exception as exc:  # noqa: BLE001
-            console.print(
-                f"\n[red bold]✗ Failed to initialize model.[/red bold]"
+            await self._append_system(
+                "Model initialization failed. "
+                "Set `MODEL_NAME`, `OPENAI_API_KEY`, and optionally "
+                "`OPENAI_BASE_URL` in your environment or `.env` file.\n\n"
+                f"Error: `{exc!s}`"
             )
-            console.print(
-                f"  [dim]Set MODEL_NAME, OPENAI_API_KEY, and optionally OPENAI_BASE_URL[/dim]"
-                f"\n  [dim]in your environment or .env file.[/dim]"
-            )
-            console.print(f"  [red]{exc!s}[/red]")
             return
 
-        ctx = ReplContext(settings=self._settings, agent=agent)
-        thread_id = f"cli-{uuid.uuid4()}"
+        self._ctx = ReplContext(settings=self._settings, agent=agent)
+        await self._append_system(
+            "Connected. Type `/help` for commands. "
+            "`Enter` inserts newline. `Ctrl+Enter` sends. "
+            "`Ctrl+N` also inserts newline. `Ctrl+Q` to quit."
+        )
+        self._load_available_models()
 
-        while True:
-            try:
-                render_session_hud(
-                    self._token_tracker.session_input_tokens,
-                    self._token_tracker.session_output_tokens,
-                    self._session_cost if self._session_cost > 0 else None,
-                )
-                user_input = await self._prompt_session.prompt_async(
-                    ANSI(f"{style('❯', GREEN, BOLD)} ")
-                )
-                user_input = user_input.strip()
-            except (EOFError, KeyboardInterrupt):
-                self._print_goodbye()
-                break
+    def _configure_composer(self) -> None:
+        composer = self._composer_input()
+        composer.show_line_numbers = False
+        composer.soft_wrap = True
 
-            if not user_input:
-                continue
+    def _chat_scroll(self) -> VerticalScroll:
+        return self.query_one("#chat_scroll", VerticalScroll)
 
-            match = self._registry.match(user_input)
-            if match:
-                cmd, args = match
-                result = await cmd.execute(args, ctx)
-                if result.message:
-                    console.print(result.message)
-                    console.print()
-                if result.should_exit:
-                    self._print_goodbye()
-                    break
-                continue
+    def _chat_column(self) -> Vertical:
+        return self.query_one("#chat_column", Vertical)
 
-            try:
-                await self._run_turn(ctx.agent, thread_id, user_input)
-            except KeyboardInterrupt:
-                console.print(f"\n[yellow]Interrupted.[/yellow]\n")
-            except Exception as exc:  # noqa: BLE001
-                console.print(f"\n[red]✗ {exc!s}[/red]\n")
+    def _composer_input(self) -> ComposerInput:
+        return self.query_one("#composer_input", ComposerInput)
 
-    def _print_goodbye(self) -> None:
-        console.print()
-        if (
-            self._token_tracker.session_input_tokens > 0
-            or self._token_tracker.session_output_tokens > 0
-        ):
-            cost = self._session_cost if self._session_cost > 0 else None
-            print_session_summary(
-                self._token_tracker.session_input_tokens,
-                self._token_tracker.session_output_tokens,
-                cost,
+    def _set_send_enabled(self, enabled: bool) -> None:
+        self.query_one("#send_button", Button).disabled = not enabled
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._set_send_enabled(not busy)
+
+    def _current_model_name(self) -> str:
+        if self._ctx is not None:
+            return self._ctx.settings.model_name
+        return self._settings.model_name
+
+    def _refresh_banner(self) -> None:
+        model_name = self._current_model_name()
+        inp = self._token_tracker.session_input_tokens
+        out = self._token_tracker.session_output_tokens
+        banner = Text()
+        banner.append(LLC_LOGO, style="bold cyan")
+        banner.append("\n  Model: ", style="dim")
+        banner.append(model_name, style="bold")
+        banner.append("   |   ", style="dim")
+        banner.append(f"Tokens: {inp:,} in / {out:,} out", style="dim")
+        if self._session_cost > 0:
+            banner.append(f"   |   ${self._session_cost:.4f}", style="dim")
+        banner.append("\n  Type ", style="dim")
+        banner.append("/help", style="bold")
+        banner.append(" for commands. ", style="dim")
+        banner.append("/model", style="bold")
+        banner.append(" to switch models.", style="dim")
+        self.query_one("#banner", Static).update(banner)
+
+    async def _append_message(
+        self,
+        role: str,
+        markdown: str,
+        *,
+        model_name: str | None = None,
+    ) -> ChatBubble:
+        bubble = ChatBubble(role, markdown=markdown, model_name=model_name)
+        await self._chat_column().mount(bubble)
+        self._chat_scroll().scroll_end(animate=False)
+        return bubble
+
+    async def _append_system(self, text: str) -> None:
+        label = Static(text, classes="system-message")
+        await self._chat_column().mount(label)
+        self._chat_scroll().scroll_end(animate=False)
+
+    @on(Button.Pressed, "#send_button")
+    def _on_send_button(self, _: Button.Pressed) -> None:
+        self._do_send()
+
+    def _composer_is_focused(self) -> bool:
+        focused = self.focused
+        return focused is self._composer_input()
+
+    def _enable_progressive_keyboard_mode(self) -> None:
+        driver = getattr(self, "_driver", None)
+        if driver is None:
+            #region agent log
+            _debug_log(
+                hypothesis_id="H2",
+                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
+                message="Driver unavailable for progressive keyboard mode",
+                data={"enabled": False},
             )
-        console.print("[dim]Goodbye.[/dim]")
+            #endregion
+            return
+        try:
+            driver.write("\x1b[=8;u")
+            driver.flush()
+            #region agent log
+            _debug_log(
+                hypothesis_id="H2",
+                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
+                message="Requested progressive keyboard mode",
+                data={"enabled": True},
+            )
+            #endregion
+        except Exception as exc:  # noqa: BLE001
+            #region agent log
+            _debug_log(
+                hypothesis_id="H2",
+                location="ui/repl.py:Repl._enable_progressive_keyboard_mode",
+                message="Failed to request progressive keyboard mode",
+                data={"enabled": False, "error": str(exc)},
+            )
+            #endregion
 
-    def _get_available_models(self) -> list[AvailableModel]:
-        return self._available_models
+    def action_insert_newline(self) -> None:
+        if not self._composer_is_focused():
+            raise SkipAction()
+        #region agent log
+        _debug_log(
+            hypothesis_id="H5",
+            location="ui/repl.py:Repl.action_insert_newline",
+            message="insert_newline action triggered",
+            data={},
+        )
+        #endregion
+        composer = self._composer_input()
+        composer.insert("\n")
+        composer.focus()
 
-    async def _load_available_models(self) -> None:
-        self._available_models = await fetch_models(
-            base_url=self._settings.openai_base_url,
-            api_key=self._settings.openai_api_key,
+    def action_send_message(self) -> None:
+        if not self._composer_is_focused():
+            raise SkipAction()
+        #region agent log
+        _debug_log(
+            hypothesis_id="H3-H4",
+            location="ui/repl.py:Repl.action_send_message",
+            message="send_message action triggered",
+            data={"busy": self._busy, "ctx_ready": self._ctx is not None},
+        )
+        #endregion
+        self._do_send()
+
+    def _do_send(self) -> None:
+        if self._busy or self._ctx is None:
+            #region agent log
+            _debug_log(
+                hypothesis_id="H4",
+                location="ui/repl.py:Repl._do_send",
+                message="send blocked by busy/context guard",
+                data={"busy": self._busy, "ctx_ready": self._ctx is not None},
+            )
+            #endregion
+            return
+        raw = self._composer_input().text.strip()
+        if not raw:
+            #region agent log
+            _debug_log(
+                hypothesis_id="H4",
+                location="ui/repl.py:Repl._do_send",
+                message="send blocked by empty input",
+                data={},
+            )
+            #endregion
+            return
+        #region agent log
+        _debug_log(
+            hypothesis_id="H4",
+            location="ui/repl.py:Repl._do_send",
+            message="send accepted",
+            data={"length": len(raw)},
+        )
+        #endregion
+        self._composer_input().clear()
+        self._composer_input().focus()
+
+        if raw == "/model" or raw.startswith("/model "):
+            arg = raw[6:].strip()
+            if not arg and self._available_models:
+                self._show_model_picker()
+                return
+        self._set_busy(True)
+        self._handle_user_turn(raw)
+
+    def _show_model_picker(self) -> None:
+        if not self._available_models:
+            return
+
+        def _on_result(selected: str | None) -> None:
+            if selected is None:
+                self._composer_input().focus()
+                return
+            self._set_busy(True)
+            self._handle_user_turn(f"/model {selected}")
+
+        self.push_screen(
+            ModelPickerScreen(self._available_models), callback=_on_result
         )
 
-    def _stop_live(self, live: Live | None) -> None:
-        if live is not None:
-            live.stop()
-
-    def _stop_spinner(self, spinner: Live | None) -> None:
-        if spinner is not None:
-            spinner.stop()
-
-    def _flush_buffer(self, buffer: str, live: Live | None) -> tuple[str, Live | None]:
-        """Stop live preview and render buffer as a bordered panel."""
-        self._stop_live(live)
-        if buffer.strip():
-            render_assistant_markdown(buffer)
-        return "", None
-
-    def _tool_spinner_renderable(
-        self,
-        name: str,
-        args: dict[str, Any],
-        position: int,
-        total: int,
-    ) -> Spinner:
-        args_str = format_tool_args(args)
-        spinner_text = Text()
-        spinner_text.append("  ↳ ", style=MUTED_STYLE)
-        spinner_text.append(f"[{position}/{total}] ", style=MUTED_STYLE)
-        spinner_text.append(name, style=TOOL_NAME_STYLE)
-        spinner_text.append("(", style=MUTED_STYLE)
-        spinner_text.append(args_str, style=MUTED_STYLE)
-        spinner_text.append(")", style=MUTED_STYLE)
-        return Spinner("dots", text=spinner_text)
-
-    def _start_spinner(
-        self,
-        name: str,
-        args: dict[str, Any],
-        position: int,
-        total: int,
-    ) -> Live:
-        sp = Live(
-            self._tool_spinner_renderable(name, args, position, total),
-            console=console,
-            refresh_per_second=12,
-            transient=True,
-        )
-        sp.start()
-        return sp
-
-    def _update_spinner(
-        self,
-        spinner: Live,
-        name: str,
-        args: dict[str, Any],
-        position: int,
-        total: int,
-    ) -> None:
-        spinner.update(self._tool_spinner_renderable(name, args, position, total))
-
-    @staticmethod
-    def _cancel_task(task: asyncio.Task[None] | None) -> None:
-        if task is not None and not task.done():
-            task.cancel()
-
-    async def _run_turn(
-        self, agent: Any, thread_id: str, user_input: str
-    ) -> None:
-        assistant_buffer = ""
-        fallback_text = ""
-        seen_tool_call_ids: set[str] = set()
-        reasoning_tracker = ReasoningTracker()
-        live: Live | None = None
-        tool_spinner: Live | None = None
-        tool_queue: list[tuple[str, dict[str, Any]]] = []
-        tool_roll_index = 0
-        tool_roll_task: asyncio.Task[None] | None = None
-        any_text_streamed = False
-
-        async def roll_tool_calls() -> None:
-            nonlocal tool_roll_index, tool_spinner
-            try:
-                while True:
-                    await asyncio.sleep(0.45)
-                    if tool_spinner is None or len(tool_queue) <= 1:
-                        continue
-                    tool_roll_index = (tool_roll_index + 1) % len(tool_queue)
-                    name, args = tool_queue[tool_roll_index]
-                    self._update_spinner(
-                        tool_spinner,
-                        name,
-                        args,
-                        tool_roll_index + 1,
-                        len(tool_queue),
-                    )
-            except asyncio.CancelledError:
+    @work(exclusive=False, exit_on_error=False)
+    async def _handle_user_turn(self, user_input: str) -> None:
+        try:
+            await self._append_message("user", user_input)
+            if self._ctx is None:
                 return
 
-        async for mode, chunk in agent.astream(
-            {"messages": [HumanMessage(content=user_input)]},
-            config={"configurable": {"thread_id": thread_id}},
-            stream_mode=["messages", "updates"],
-        ):
-            if mode == "messages":
-                message_chunk, metadata = chunk
-                if metadata.get("langgraph_node") != "llm":
+            match = self._command_registry.match(user_input)
+            if match:
+                command, args = match
+                await self._run_command(command, args)
+                return
+
+            bubble = await self._append_message(
+                "agent",
+                "",
+                model_name=self._ctx.settings.model_name,
+            )
+            await self._stream_agent_response(user_input, bubble)
+        finally:
+            self._set_busy(False)
+
+    async def _run_command(self, command: Any, args: str) -> None:
+        if self._ctx is None:
+            return
+        result = await command.execute(args, self._ctx)
+        if result.message:
+            await self._append_message(
+                "agent",
+                result.message,
+                model_name=self._ctx.settings.model_name,
+            )
+        self._refresh_banner()
+        if result.should_exit:
+            self.exit()
+
+    async def _stream_agent_response(
+        self, user_input: str, bubble: ChatBubble
+    ) -> None:
+        if self._ctx is None:
+            return
+
+        md_stream = Markdown.get_stream(bubble.markdown_widget())
+        fallback_text = ""
+        saw_text = False
+        seen_ids: set[str] = set()
+        reasoning = _ReasoningTracker()
+        tool_idx = 0
+
+        try:
+            async for mode, chunk in self._ctx.agent.astream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config={"configurable": {"thread_id": self._thread_id}},
+                stream_mode=["messages", "updates"],
+            ):
+                if mode == "messages":
+                    msg_chunk, meta = chunk
+                    if meta.get("langgraph_node") != "llm":
+                        continue
+                    self._extract_usage(msg_chunk)
+
+                    r_text = extract_reasoning(msg_chunk)
+                    if r_text:
+                        line = reasoning.feed(r_text)
+                        if line is not None:
+                            bubble.update_reasoning_line(f"  {line}")
+                        continue
+
+                    text = message_text(msg_chunk.content)
+                    if text:
+                        if reasoning.active:
+                            bubble.set_reasoning_summary(reasoning.finish())
+                        saw_text = True
+                        await md_stream.write(text)
+
+                if mode != "updates" or not isinstance(chunk, dict):
                     continue
 
-                self._extract_usage(message_chunk)
-
-                reasoning_text = extract_reasoning(message_chunk)
-                if reasoning_text and live is None:
-                    if tool_spinner is not None:
-                        self._stop_spinner(tool_spinner)
-                        tool_spinner = None
-                        self._cancel_task(tool_roll_task)
-                        tool_roll_task = None
-                    reasoning_tracker.feed(reasoning_text)
-                    continue
-
-                text = message_text(message_chunk.content)
-                if text:
-                    if tool_spinner is not None:
-                        self._stop_spinner(tool_spinner)
-                        tool_spinner = None
-                        self._cancel_task(tool_roll_task)
-                        tool_roll_task = None
-
-                    if reasoning_tracker.is_active:
-                        reasoning_tracker.finish()
-
-                    assistant_buffer += text
-                    any_text_streamed = True
-
-                    if live is None:
-                        live = Live(
-                            Markdown(assistant_buffer, code_theme=MARKDOWN_CODE_THEME),
-                            console=console,
-                            refresh_per_second=12,
-                            vertical_overflow="visible",
-                            transient=True,
-                        )
-                        live.start()
-                    else:
-                        live.update(
-                            Markdown(assistant_buffer, code_theme=MARKDOWN_CODE_THEME)
-                        )
-
-            elif mode == "updates":
-                if reasoning_tracker.is_active:
-                    reasoning_tracker.finish()
-
-                if isinstance(chunk, dict):
-                    for node_update in chunk.values():
-                        if not isinstance(node_update, dict):
+                for node_update in chunk.values():
+                    if not isinstance(node_update, dict):
+                        continue
+                    for msg in node_update.get("messages", []):
+                        if not isinstance(msg, AIMessage):
                             continue
-                        for message in node_update.get("messages", []):
-                            if not isinstance(message, AIMessage):
-                                continue
-                            self._extract_usage(message)
-                            if not getattr(message, "tool_calls", None):
-                                text = message_text(message.content)
-                                if text:
-                                    fallback_text = text
+                        self._extract_usage(msg)
+                        if getattr(msg, "tool_calls", None):
+                            continue
+                        t = message_text(msg.content)
+                        if t:
+                            fallback_text = t
 
-                new_tool_calls = collect_new_tool_calls(chunk, seen_tool_call_ids)
-                if new_tool_calls:
-                    assistant_buffer, live = self._flush_buffer(
-                        assistant_buffer, live
-                    )
+                new_tools = collect_new_tool_calls(chunk, seen_ids)
+                for tc in new_tools:
+                    tool_idx += 1
+                    name = tc.get("name", "tool")
+                    args = tc.get("args", {})
+                    args_str = format_tool_args(args)
+                    line = f"  ↳ [{tool_idx}] {name}"
+                    if args_str:
+                        line += f"({args_str})"
+                    bubble.update_tool_status(line)
 
-                    for tc in new_tool_calls:
-                        name = tc.get("name", "unknown_tool")
-                        args = tc.get("args", {})
-                        tool_queue.append((name, args))
+            await md_stream.stop()
 
-                    if tool_queue:
-                        tool_roll_index = len(tool_queue) - 1
-                        current_name, current_args = tool_queue[tool_roll_index]
-                        if tool_spinner is None:
-                            tool_spinner = self._start_spinner(
-                                current_name,
-                                current_args,
-                                tool_roll_index + 1,
-                                len(tool_queue),
-                            )
-                            if tool_roll_task is None:
-                                tool_roll_task = asyncio.create_task(roll_tool_calls())
-                        else:
-                            self._update_spinner(
-                                tool_spinner,
-                                current_name,
-                                current_args,
-                                tool_roll_index + 1,
-                                len(tool_queue),
-                            )
+            if reasoning.active:
+                bubble.set_reasoning_summary(reasoning.finish())
 
-        self._cancel_task(tool_roll_task)
-        self._stop_spinner(tool_spinner)
+            if not saw_text and fallback_text.strip():
+                await bubble.set_markdown(fallback_text)
+        except asyncio.CancelledError:
+            await md_stream.stop()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await md_stream.stop()
+            await bubble.set_markdown(f"Request failed: `{exc!s}`")
+        finally:
+            bubble.clear_tool_status()
+            self._finish_turn()
 
-        if reasoning_tracker.is_active:
-            reasoning_tracker.finish()
-
-        if live is not None or assistant_buffer.strip():
-            self._flush_buffer(assistant_buffer, live)
-        elif not any_text_streamed and fallback_text.strip():
-            render_assistant_markdown(fallback_text)
-
+    def _finish_turn(self) -> None:
         turn = self._token_tracker.finish_turn()
         if turn.input_tokens > 0 or turn.output_tokens > 0:
             pricing = get_model_pricing(
-                self._available_models, self._settings.model_name
+                self._available_models,
+                self._current_model_name(),
             )
-            if pricing:
+            if pricing is not None:
                 self._session_cost += TokenTracker.compute_cost(
                     turn, pricing[0], pricing[1]
                 )
-
-            render_session_hud(
-                self._token_tracker.session_input_tokens,
-                self._token_tracker.session_output_tokens,
-                self._session_cost if self._session_cost > 0 else None,
-            )
-
-        console.print()
+        self._refresh_banner()
 
     def _extract_usage(self, message_chunk: Any) -> None:
         usage = getattr(message_chunk, "usage_metadata", None)
-        if usage and isinstance(usage, dict):
-            in_tok = usage.get("input_tokens", 0)
-            out_tok = usage.get("output_tokens", 0)
-            if in_tok or out_tok:
-                self._token_tracker.add(in_tok, out_tok)
+        if not isinstance(usage, dict):
+            return
+        inp = usage.get("input_tokens", 0)
+        out = usage.get("output_tokens", 0)
+        if inp or out:
+            self._token_tracker.add(inp, out)
+
+    @work(exclusive=True, exit_on_error=False)
+    async def _load_available_models(self) -> None:
+        models = await fetch_models(
+            base_url=self._settings.openai_base_url,
+            api_key=self._settings.openai_api_key,
+        )
+        self._available_models = models
+        self._refresh_banner()
