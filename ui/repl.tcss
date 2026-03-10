@@ -140,6 +140,11 @@ Screen {
     text-style: italic;
 }
 
+.tool-output {
+    width: 1fr;
+    padding: 0 1 1 1;
+}
+
 /* ── Reasoning lines (inside agent bubble) ── */
 
 .reasoning-line {

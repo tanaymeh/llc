@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
+from rich import box
+from rich.console import Group, RenderableType
+from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 from textual import on, work
 from textual.actions import SkipAction
@@ -23,6 +26,7 @@ from config import Settings
 from hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
 from models import AvailableModel, fetch_models
 from ui.display import (
+    collect_new_user_facing_tool_results,
     collect_new_tool_calls,
     extract_reasoning,
     format_tool_args,
@@ -38,38 +42,151 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
-_DEBUG_LOG_PATH = Path("/home/tanay/Desktop/local-claude-code/.cursor/debug-eda7ca.log")
-_DEBUG_LOG_FALLBACK_PATH = Path("/workspace/.cursor/debug-eda7ca.log")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-# region debug token logs
-def _debug_log(
-    location: str,
-    message: str,
-    data: dict[str, Any],
-    hypothesis_id: str,
-    run_id: str,
-) -> None:
-    payload = {
-        "sessionId": "eda7ca",
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    for path in (_DEBUG_LOG_PATH, _DEBUG_LOG_FALLBACK_PATH):
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
-            break
-        except Exception:
+def _render_side_by_side_diff(diff_text: str) -> RenderableType:
+    table = Table(
+        box=box.SQUARE,
+        expand=True,
+        show_header=True,
+        header_style="bold",
+        border_style="grey50",
+        show_lines=True,
+        pad_edge=False,
+        collapse_padding=True,
+    )
+    old_header = Text()
+    old_header.append("--- ", style="bold red")
+    old_header.append("Old", style="bold")
+    new_header = Text()
+    new_header.append("+++ ", style="bold green")
+    new_header.append("New", style="bold")
+    table.add_column(old_header, ratio=1, overflow="fold")
+    table.add_column(new_header, ratio=1, overflow="fold")
+    has_diff_lines = False
+    pending_old_file = ""
+    pending_old_lines: list[str] = []
+    pending_new_lines: list[str] = []
+
+    def flush_change_block() -> None:
+        nonlocal has_diff_lines
+        if not pending_old_lines and not pending_new_lines:
+            return
+        has_diff_lines = True
+        for idx in range(max(len(pending_old_lines), len(pending_new_lines))):
+            old_line = pending_old_lines[idx] if idx < len(pending_old_lines) else ""
+            new_line = pending_new_lines[idx] if idx < len(pending_new_lines) else ""
+            old_cell: RenderableType = (
+                Text(f"- {old_line}", style="red")
+                if old_line
+                else Text("", style="dim")
+            )
+            new_cell: RenderableType = (
+                Text(f"+ {new_line}", style="green")
+                if new_line
+                else Text("", style="dim")
+            )
+            table.add_row(old_cell, new_cell)
+        pending_old_lines.clear()
+        pending_new_lines.clear()
+
+    for raw_line in diff_text.splitlines():
+        line = _ANSI_RE.sub("", raw_line)
+        if not line:
+            flush_change_block()
+            table.add_row(Text("", style="dim"), Text("", style="dim"))
             continue
 
+        if line.startswith("=== "):
+            flush_change_block()
+            title = Text(line, style="bold magenta")
+            table.add_row(title, title.copy())
+            continue
 
-# endregion debug token logs
+        if line.startswith("diff --git "):
+            flush_change_block()
+            has_diff_lines = True
+            header = Text(line, style="bold cyan")
+            table.add_row(header, header.copy())
+            continue
+
+        if line.startswith("index "):
+            flush_change_block()
+            has_diff_lines = True
+            meta = Text(line, style="cyan")
+            table.add_row(meta, meta.copy())
+            continue
+
+        if line.startswith("--- "):
+            flush_change_block()
+            pending_old_file = line
+            continue
+
+        if line.startswith("+++ "):
+            flush_change_block()
+            has_diff_lines = True
+            old_meta = Text(pending_old_file or "---", style="bold red")
+            new_meta = Text(line, style="bold green")
+            table.add_row(old_meta, new_meta)
+            pending_old_file = ""
+            continue
+
+        if line.startswith("@@ "):
+            flush_change_block()
+            has_diff_lines = True
+            hunk = Text(line, style="bold yellow")
+            table.add_row(hunk, hunk.copy())
+            continue
+
+        if line.startswith("-") and not line.startswith("--- "):
+            pending_old_lines.append(line[1:])
+            continue
+
+        if line.startswith("+") and not line.startswith("+++ "):
+            pending_new_lines.append(line[1:])
+            continue
+
+        if line.startswith(" "):
+            flush_change_block()
+            common = Text(f"  {line[1:]}", style="dim")
+            table.add_row(common, common.copy())
+            continue
+
+        flush_change_block()
+        plain = Text(line, style="dim")
+        table.add_row(plain, plain.copy())
+
+    flush_change_block()
+
+    if not has_diff_lines:
+        return Text(diff_text)
+
+    return table
+
+
+def _render_user_facing_tool_output(
+    tool_name: str,
+    render_mode: str,
+    content: str,
+) -> RenderableType:
+    if render_mode == "side_by_side_diff":
+        title = Text(f"{tool_name} ")
+        title.append("--- old", style="bold red")
+        title.append(" | ", style="dim")
+        title.append("+++ new", style="bold green")
+        body = _render_side_by_side_diff(content)
+        subtitle = Text("session baseline -> current state", style="dim")
+    else:
+        title = f"{tool_name} output"
+        body = Text(content)
+        subtitle = None
+    return Panel(
+        body,
+        title=title,
+        subtitle=subtitle,
+        border_style="grey62",
+    )
 
 
 def _format_duration(seconds: float) -> str:
@@ -228,12 +345,14 @@ class ChatBubble(Vertical):
         self._role = role
         self._model_name = model_name
         self._markdown = markdown
+        self._tool_outputs: list[RenderableType] = []
 
     def compose(self) -> ComposeResult:
         yield Static(self._title_renderable(), classes="chat-title")
         yield Static("", classes="reasoning-line")
         yield Static("", classes="tool-status")
         yield Markdown(self._markdown, classes="chat-markdown")
+        yield Static("", classes="tool-output")
 
     def _title_renderable(self) -> Text:
         if self._role == "user":
@@ -256,6 +375,10 @@ class ChatBubble(Vertical):
 
     def clear_tool_status(self) -> None:
         self.query_one(".tool-status", Static).update("")
+
+    def append_tool_output(self, renderable: RenderableType) -> None:
+        self._tool_outputs.append(renderable)
+        self.query_one(".tool-output", Static).update(Group(*self._tool_outputs))
 
     def update_reasoning_line(self, text: str) -> None:
         self.query_one(".reasoning-line", Static).update(text)
@@ -339,19 +462,6 @@ class Repl(App[None]):
             agent=agent,
             thread_id=self._agent_thread_id,
         )
-        # region debug token logs
-        _debug_log(
-            "ui/repl.py:on_mount",
-            "repl mounted",
-            {
-                "model_name": self._settings.model_name,
-                "has_api_key": bool(self._settings.openai_api_key),
-                "base_url": bool(self._settings.openai_base_url),
-            },
-            "H5",
-            self._agent_thread_id,
-        )
-        # endregion debug token logs
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
@@ -394,15 +504,6 @@ class Repl(App[None]):
         model_name = self._current_model_name()
         inp = self._token_hook.session_input
         out = self._token_hook.session_output
-        # region debug token logs
-        _debug_log(
-            "ui/repl.py:_refresh_banner",
-            "banner refreshed",
-            {"model_name": model_name, "session_input": inp, "session_output": out},
-            "H4",
-            self._agent_thread_id,
-        )
-        # endregion debug token logs
         banner = Text()
         banner.append(LLC_LOGO, style="bold cyan")
         banner.append("\n  Model: ", style="dim")
@@ -497,27 +598,9 @@ class Repl(App[None]):
             match = self._command_registry.match(user_input)
             if match:
                 command, args = match
-                # region debug token logs
-                _debug_log(
-                    "ui/repl.py:_handle_user_turn",
-                    "command matched",
-                    {"command": command.name, "args_len": len(args)},
-                    "H5",
-                    self._agent_thread_id,
-                )
-                # endregion debug token logs
                 await self._run_command(command, args)
                 return
 
-            # region debug token logs
-            _debug_log(
-                "ui/repl.py:_handle_user_turn",
-                "agent turn matched",
-                {"user_len": len(user_input)},
-                "H5",
-                self._agent_thread_id,
-            )
-            # endregion debug token logs
             bubble = await self._append_message(
                 "agent",
                 "",
@@ -547,19 +630,11 @@ class Repl(App[None]):
         if self._ctx is None:
             return
 
-        # region debug token logs
-        _debug_log(
-            "ui/repl.py:_stream_agent_response",
-            "turn started",
-            {"user_len": len(user_input), "model_name": self._current_model_name()},
-            "H5",
-            self._agent_thread_id,
-        )
-        # endregion debug token logs
         md_stream = Markdown.get_stream(bubble.markdown_widget())
         fallback_text = ""
         saw_text = False
         seen_ids: set[str] = set()
+        seen_tool_result_ids: set[str] = set()
         reasoning = _ReasoningTracker()
         tool_idx = 0
 
@@ -573,7 +648,6 @@ class Repl(App[None]):
                     msg_chunk, meta = chunk
                     if meta.get("langgraph_node") != "llm":
                         continue
-                    self._extract_usage(msg_chunk)
 
                     r_text = extract_reasoning(msg_chunk)
                     if r_text:
@@ -617,6 +691,18 @@ class Repl(App[None]):
                         line += f"({args_str})"
                     bubble.update_tool_status(line)
 
+                user_facing_results = collect_new_user_facing_tool_results(
+                    chunk, seen_tool_result_ids
+                )
+                for result in user_facing_results:
+                    bubble.append_tool_output(
+                        _render_user_facing_tool_output(
+                            result["tool_name"],
+                            result["render_mode"],
+                            result["content"],
+                        )
+                    )
+
             await md_stream.stop()
 
             if reasoning.active:
@@ -628,15 +714,6 @@ class Repl(App[None]):
             await md_stream.stop()
             raise
         except Exception as exc:  # noqa: BLE001
-            # region debug token logs
-            _debug_log(
-                "ui/repl.py:_stream_agent_response",
-                "stream failed",
-                {"error": str(exc)},
-                "H5",
-                self._agent_thread_id,
-            )
-            # endregion debug token logs
             await md_stream.stop()
             await bubble.set_markdown(f"Request failed: `{exc!s}`")
         finally:
@@ -647,134 +724,42 @@ class Repl(App[None]):
         turn_input = self._turn_input
         turn_output = self._turn_output
         text_len = self._turn_text_len
-        # region debug token logs
-        _debug_log(
-            "ui/repl.py:_finish_turn",
-            "finish turn entry",
-            {
-                "turn_input": turn_input,
-                "turn_output": turn_output,
-                "text_len": text_len,
-                "has_ctx": self._ctx is not None,
-            },
-            "H2",
-            self._agent_thread_id,
-        )
-        # endregion debug token logs
         self._turn_input = 0
         self._turn_output = 0
         self._turn_text_len = 0
 
-        try:
-            if turn_input == 0 and turn_output == 0 and text_len > 0:
-                turn_output = max(1, text_len // 4)
-                # region debug token logs
-                _debug_log(
-                    "ui/repl.py:_finish_turn",
-                    "fallback output estimate used",
-                    {"estimated_output": turn_output, "text_len": text_len},
-                    "H2",
-                    self._agent_thread_id,
-                )
-                # endregion debug token logs
+        if turn_input == 0 and turn_output == 0 and text_len > 0:
+            turn_output = max(1, text_len // 4)
 
-            # region debug token logs
-            raw_hooks = getattr(self, "_hooks", None)
-            _debug_log(
-                "ui/repl.py:_finish_turn",
-                "before hook loop",
-                {
-                    "internal_thread_id_type": type(
-                        getattr(self, "_thread_id", None)
-                    ).__name__,
-                    "agent_thread_id_type": type(self._agent_thread_id).__name__,
-                    "ctx_thread_id_type": (
-                        type(self._ctx.thread_id).__name__ if self._ctx is not None else None
-                    ),
-                    "hooks_type": type(raw_hooks).__name__,
-                    "hooks_len": len(raw_hooks) if isinstance(raw_hooks, list) else None,
-                    "hooks_items": (
-                        [type(h).__name__ for h in raw_hooks]
-                        if isinstance(raw_hooks, list)
-                        else None
-                    ),
-                },
-                "H6",
-                self._agent_thread_id,
+        if self._ctx is not None:
+            hook_ctx = HookContext(
+                agent=self._ctx.agent,
+                thread_id=self._ctx.thread_id,
+                settings=self._ctx.settings,
+                last_turn_input_tokens=turn_input,
+                last_turn_output_tokens=turn_output,
+                available_models=self._available_models,
+                compact_prompt=self._ctx.settings.compact_prompt,
             )
-            # endregion debug token logs
-
-            if self._ctx is not None:
-                hook_ctx = HookContext(
-                    agent=self._ctx.agent,
-                    thread_id=self._ctx.thread_id,
-                    settings=self._ctx.settings,
-                    last_turn_input_tokens=turn_input,
-                    last_turn_output_tokens=turn_output,
-                    available_models=self._available_models,
-                    compact_prompt=self._ctx.settings.compact_prompt,
-                )
-                # region debug token logs
-                _debug_log(
-                    "ui/repl.py:_finish_turn",
-                    "hook context created",
-                    {
-                        "turn_input": turn_input,
-                        "turn_output": turn_output,
-                        "model_count": len(self._available_models),
-                    },
-                    "H6",
-                    self._agent_thread_id,
-                )
-                # endregion debug token logs
-                for hook in self._hooks:
-                    try:
-                        message = await hook.after_turn(hook_ctx)
-                    except Exception as exc:  # noqa: BLE001
-                        message = f"Hook failed: `{exc!s}`"
-                    if message:
-                        await self._append_system(message)
-            self._refresh_banner()
-        except Exception as exc:
-            # region debug token logs
-            _debug_log(
-                "ui/repl.py:_finish_turn",
-                "finish turn failed",
-                {"error": str(exc), "error_type": type(exc).__name__},
-                "H6",
-                self._agent_thread_id,
-            )
-            # endregion debug token logs
-            raise
+            for hook in self._hooks:
+                try:
+                    message = await hook.after_turn(hook_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    message = f"Hook failed: `{exc!s}`"
+                if message:
+                    await self._append_system(message)
+        self._refresh_banner()
 
     def _extract_usage(self, msg: Any) -> None:
         usage = getattr(msg, "usage_metadata", None)
         if not usage:
             return
-        before_input = self._turn_input
-        before_output = self._turn_output
         if isinstance(usage, dict):
             self._turn_input += usage.get("input_tokens", 0) or 0
             self._turn_output += usage.get("output_tokens", 0) or 0
         else:
             self._turn_input += getattr(usage, "input_tokens", 0) or 0
             self._turn_output += getattr(usage, "output_tokens", 0) or 0
-        # region debug token logs
-        _debug_log(
-            "ui/repl.py:_extract_usage",
-            "usage extracted",
-            {
-                "msg_type": type(msg).__name__,
-                "before_input": before_input,
-                "before_output": before_output,
-                "after_input": self._turn_input,
-                "after_output": self._turn_output,
-                "usage_type": type(usage).__name__,
-            },
-            "H1",
-            self._agent_thread_id,
-        )
-        # endregion debug token logs
 
     @work(exclusive=True, exit_on_error=False)
     async def _load_available_models(self) -> None:

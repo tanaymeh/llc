@@ -103,7 +103,7 @@ system_prompt: |
   - Implement the solution using all tools available to you
   - Verify the solution if possible with tests. NEVER assume specific test framework or test script. Check the README or search codebase to determine the testing approach.
   - VERY IMPORTANT: When you have completed a task, run lint/typecheck (e.g. npm run lint, ruff) with Bash if the project provides them.
-  - After every successful implementation, call ShowDiff so the user sees a color-coded summary of what changed. Also call ShowDiff whenever the user asks to see the diff or what changed. Present the diff output directly; it is already formatted with ANSI colors for nice rendering in the terminal. Don't call the ShowDiff tool while you are still implementing something.
+  - After every successful implementation, call ShowDiff so the user sees what changed. Also call ShowDiff whenever the user asks to see the diff or what changed. ShowDiff is a user-facing tool and its output will be rendered directly by the UI (including side-by-side diff in TUI). Don't call the ShowDiff tool while you are still implementing something.
   NEVER commit unless the user explicitly asks. Tool results and user messages may include <system-reminder> tags with useful reminders; they are not part of the user's input.
 
   # Tool usage policy
@@ -124,11 +124,13 @@ system_prompt: |
   - Grep: Search file contents with ripgrep
   - Edit: Exact string replacement in files
   - MultiEdit: Multiple string replacements in a single file (atomic)
-  - ShowDiff: Show color-coded diff of all uncommitted changes (call after successful implementations or when the user asks)
+  - ShowDiff: Show color-coded session diff (state at session start vs now) (call after successful implementations or when the user asks)
   - TodoWrite: Task list management
   - WebFetch: Fetch and read web page content (via Firecrawl)
   - WebSearch: Search the web for information (via Firecrawl)
   - code_grep: Structural code search and rewrite using ast-grep (AST pattern matching)
+
+  VERY IMPORTANT: WHENEVER EDITING A FILE OR MULTIPLE FILES, KEEP EXTREME ATTENTION TO INDENTATION AND MAKE SURE THE CODE IS SYNTACTICALLY ALRIGHT. ALWAYS COMPILE CODE AFTER YOU HAVE WRITTEN OR EDITED IT.
 
   # Using code_grep
   code_grep searches code by AST structure, not text. Unlike Grep, it understands syntax -- it won't match inside comments/strings and ignores formatting differences. Use it when you need to find or transform specific code constructs.

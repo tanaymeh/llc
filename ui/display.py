@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 
 def _stringify_reasoning(value: Any) -> str:
@@ -151,4 +151,36 @@ def collect_new_tool_calls(
                     continue
                 seen_tool_call_ids.add(tool_id)
                 pending.append(tool_call)
+    return pending
+
+
+def collect_new_user_facing_tool_results(
+    chunk: Any,
+    seen_tool_result_ids: set[str],
+) -> list[dict[str, str]]:
+    if not isinstance(chunk, dict):
+        return []
+    pending: list[dict[str, str]] = []
+    for node_update in chunk.values():
+        if not isinstance(node_update, dict):
+            continue
+        for message in node_update.get("messages", []):
+            if not isinstance(message, ToolMessage):
+                continue
+            tool_call_id = getattr(message, "tool_call_id", "")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                continue
+            if tool_call_id in seen_tool_result_ids:
+                continue
+            seen_tool_result_ids.add(tool_call_id)
+            kwargs = getattr(message, "additional_kwargs", {}) or {}
+            if not bool(kwargs.get("user_facing")):
+                continue
+            pending.append(
+                {
+                    "tool_name": str(kwargs.get("tool_name", "tool")),
+                    "render_mode": str(kwargs.get("tool_render_mode", "") or ""),
+                    "content": message_text(message.content),
+                }
+            )
     return pending

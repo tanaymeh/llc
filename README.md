@@ -49,6 +49,8 @@ Inside the TUI:
 - **Fixed bottom composer** that stays visible like a chat app input
 - **Role-specific message panels** (User and Agent with model name)
 - **Tool call and reasoning traces** shown inline in agent messages
+- **User-facing tool outputs** rendered inline in chat bubbles
+- **ShowDiff visual rendering** with side-by-side colored old/new columns in TUI (session baseline vs current state)
 - **Chat compaction** via `/compact`, plus automatic compaction when the last prompt reaches 90% of the active model context length
 - **Send lock while streaming** (typing remains enabled but sending is disabled)
 - **Markdown and code rendering** tuned for readability in dark and light themes

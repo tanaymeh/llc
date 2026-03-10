@@ -27,9 +27,14 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
         for tool_call in getattr(last_message, "tool_calls", []):
             tool_name = tool_call["name"]
             tool = tools_by_name.get(tool_name)
+            user_facing = False
+            render_mode = ""
             if tool is None:
                 observation = f"Unknown tool: {tool_name}"
             else:
+                metadata = getattr(tool, "metadata", {}) or {}
+                user_facing = bool(metadata.get("user_facing"))
+                render_mode = str(metadata.get("render_mode", "") or "")
                 try:
                     observation = tool.invoke(tool_call["args"])
                 except Exception as exc:  # noqa: BLE001
@@ -39,6 +44,11 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                 ToolMessage(
                     content=str(observation),
                     tool_call_id=tool_call["id"],
+                    additional_kwargs={
+                        "tool_name": tool_name,
+                        "user_facing": user_facing,
+                        "tool_render_mode": render_mode,
+                    },
                 )
             )
 
