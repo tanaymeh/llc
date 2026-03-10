@@ -1,3 +1,3 @@
-from llc.agent.graph import build_agent_graph
+from llc.agent.graph import AgentRole, build_agent_graph
 
-__all__ = ["build_agent_graph"]
+__all__ = ["AgentRole", "build_agent_graph"]

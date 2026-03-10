@@ -140,6 +140,17 @@ Screen {
     text-style: italic;
 }
 
+.agent-status {
+    width: 1fr;
+    padding: 0 1;
+    color: rgb(122, 204, 208);
+    text-style: italic;
+}
+
+.agent-status:light {
+    color: rgb(39, 118, 126);
+}
+
 .tool-output {
     width: 1fr;
     padding: 0 1 1 1;

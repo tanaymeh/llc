@@ -64,6 +64,23 @@ def _with_env_details(system_prompt: str, workspace_root: Path) -> str:
     return f"{system_prompt.rstrip()}\n\n<env>\n{env_details}\n</env>"
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
 class Settings(BaseModel, frozen=True):
     model_name: str = "gpt-4o-mini"
     compact_model_name: str | None = None
@@ -73,12 +90,18 @@ class Settings(BaseModel, frozen=True):
     workspace_root: Path = Field(default_factory=lambda: Path.cwd().resolve())
     system_prompt: str = Field(default_factory=_load_system_prompt)
     compact_prompt: str = Field(default_factory=_load_compact_prompt)
+    sub_agent_mode_enabled: bool = False
+    max_sub_agents: int = Field(default=5, ge=1, le=5)
+    sub_agent_report_interval_s: int = Field(default=8, ge=1, le=300)
+    sub_agent_max_runtime_s: int = Field(default=900, ge=30, le=7200)
+    sub_agent_context_messages: int = Field(default=8, ge=1, le=20)
     shell_timeout: int = 120
 
     @classmethod
     def from_env(cls) -> "Settings":
         load_dotenv()
         workspace_root = Path.cwd().resolve()
+        system_prompt = _load_system_prompt()
         return cls(
             model_name=os.getenv("MODEL_NAME", "gpt-4o-mini"),
             compact_model_name=os.getenv("COMPACT_MODEL_NAME"),
@@ -87,7 +110,12 @@ class Settings(BaseModel, frozen=True):
             firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY"),
             workspace_root=workspace_root,
             system_prompt=_with_env_details(
-                _load_system_prompt(),
+                system_prompt,
                 workspace_root,
             ),
+            sub_agent_mode_enabled=_env_bool("SUB_AGENT_MODE_ENABLED", default=False),
+            max_sub_agents=_env_int("MAX_SUB_AGENTS", 5),
+            sub_agent_report_interval_s=_env_int("SUB_AGENT_REPORT_INTERVAL_S", 8),
+            sub_agent_max_runtime_s=_env_int("SUB_AGENT_MAX_RUNTIME_S", 900),
+            sub_agent_context_messages=_env_int("SUB_AGENT_CONTEXT_MESSAGES", 8),
         )

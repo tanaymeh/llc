@@ -13,6 +13,10 @@ Examples:
   ./scripts/dev-docker.sh
   ./scripts/dev-docker.sh /path/to/workspace
   ./scripts/dev-docker.sh --debug /path/to/workspace
+
+Notes:
+  Experimental sub-agent mode can be enabled at runtime via `/enable sub-agent-mode`.
+  To start with it enabled by default, set `SUB_AGENT_MODE_ENABLED=true` in .env.
 EOF
 }
 

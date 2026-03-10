@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 from typing import Any
@@ -18,6 +19,7 @@ from llc.agent import build_agent_graph
 from llc.commands import CommandRegistry, ReplContext
 from llc.config import Settings
 from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
+from llc.agent.subagents import SubAgentRuntime
 from llc.models import AvailableModel, fetch_models
 from llc.ui.display import (
     collect_new_user_facing_tool_results,
@@ -38,6 +40,53 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
+_AGENT_STATUS_POLL_INTERVAL_S = 0.8
+_MAX_AGENT_STATUS_LINES = 5
+_WORKER_TASK_PREVIEW_CHARS = 56
+_ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
+
+
+def _single_line_preview(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _format_agent_status(report: dict[str, Any]) -> str:
+    workers = report.get("workers", [])
+    if not isinstance(workers, list):
+        return ""
+
+    active_workers = [
+        worker
+        for worker in workers
+        if isinstance(worker, dict)
+        and str(worker.get("status", "")) in _ACTIVE_WORKER_STATUSES
+    ]
+    if not active_workers:
+        return ""
+
+    lines: list[str] = []
+    for index, worker in enumerate(active_workers[:_MAX_AGENT_STATUS_LINES], start=1):
+        raw_id = str(worker.get("id", f"agent-{index}"))
+        short_id = raw_id.removeprefix("subagent-")
+        status = str(worker.get("status", "running"))
+        task = _single_line_preview(
+            str(worker.get("task", "")),
+            _WORKER_TASK_PREVIEW_CHARS,
+        )
+        if not task:
+            task = _single_line_preview(
+                str(worker.get("latest_report", "working")),
+                _WORKER_TASK_PREVIEW_CHARS,
+            )
+        lines.append(f"  ↳ Agent #{index} ({short_id}) {status}: {task}")
+
+    remainder = len(active_workers) - _MAX_AGENT_STATUS_LINES
+    if remainder > 0:
+        lines.append(f"  ↳ +{remainder} more active agents")
+    return "\n".join(lines)
 
 
 class _ReasoningTracker:
@@ -115,6 +164,7 @@ class Repl(App[None]):
         self._turn_output = 0
         self._turn_text_len = 0
         self._busy = False
+        self._subagent_runtime: SubAgentRuntime | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -131,8 +181,20 @@ class Repl(App[None]):
         self._configure_composer()
         self._refresh_banner()
 
+        self._subagent_runtime = SubAgentRuntime(
+            self._settings,
+            build_subagent=lambda settings: build_agent_graph(
+                settings,
+                role="subagent",
+            ),
+        )
+        role = "orchestrator" if self._settings.sub_agent_mode_enabled else "default"
         try:
-            agent = build_agent_graph(self._settings)
+            agent = build_agent_graph(
+                self._settings,
+                role=role,
+                subagent_runtime=self._subagent_runtime,
+            )
         except Exception as exc:  # noqa: BLE001
             await self._append_system(
                 "Model initialization failed. "
@@ -146,6 +208,7 @@ class Repl(App[None]):
             settings=self._settings,
             agent=agent,
             thread_id=self._agent_thread_id,
+            subagent_runtime=self._subagent_runtime,
         )
         await self._append_system(
             "Connected. Type `/help` for commands. "
@@ -202,7 +265,15 @@ class Repl(App[None]):
         banner.append(" for commands. ", style="dim")
         banner.append("/model", style="bold")
         banner.append(" to switch models.", style="dim")
+        if self._ctx is not None and self._ctx.settings.sub_agent_mode_enabled:
+            banner.append("  ", style="dim")
+            banner.append("sub-agent mode: ", style="dim")
+            banner.append("ON", style="bold green")
         self.query_one("#banner", Static).update(banner)
+
+    def on_unmount(self) -> None:
+        if self._subagent_runtime is not None:
+            self._subagent_runtime.shutdown()
 
     async def _append_message(
         self,
@@ -322,6 +393,15 @@ class Repl(App[None]):
         seen_tool_result_ids: set[str] = set()
         reasoning = _ReasoningTracker()
         tool_idx = 0
+        agent_status_stop = asyncio.Event()
+        agent_status_task: asyncio.Task[None] | None = None
+        if (
+            self._ctx.settings.sub_agent_mode_enabled
+            and self._ctx.subagent_runtime is not None
+        ):
+            agent_status_task = asyncio.create_task(
+                self._poll_agent_status(bubble, agent_status_stop)
+            )
 
         try:
             async for mode, chunk in self._ctx.agent.astream(
@@ -402,8 +482,39 @@ class Repl(App[None]):
             await md_stream.stop()
             await bubble.set_markdown(f"Request failed: `{exc!s}`")
         finally:
+            agent_status_stop.set()
+            if agent_status_task is not None:
+                with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(agent_status_task, timeout=1.5)
+                if not agent_status_task.done():
+                    agent_status_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await agent_status_task
             bubble.clear_tool_status()
+            bubble.clear_agent_status()
             await self._finish_turn()
+
+    async def _poll_agent_status(
+        self,
+        bubble: ChatBubble,
+        stop_signal: asyncio.Event,
+    ) -> None:
+        while not stop_signal.is_set():
+            status_text = ""
+            try:
+                if self._ctx is not None and self._ctx.subagent_runtime is not None:
+                    report = self._ctx.subagent_runtime.get_subagent_report()
+                    status_text = _format_agent_status(report)
+            except Exception:  # noqa: BLE001
+                status_text = ""
+            bubble.update_agent_status(status_text)
+            try:
+                await asyncio.wait_for(
+                    stop_signal.wait(),
+                    timeout=_AGENT_STATUS_POLL_INTERVAL_S,
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def _finish_turn(self) -> None:
         turn_input = self._turn_input

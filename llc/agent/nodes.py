@@ -7,12 +7,22 @@ from llc.agent.state import AgentState
 
 LlmNode = Callable[[AgentState], dict[str, Any]]
 ToolNode = Callable[[AgentState], dict[str, Any]]
+RuntimeStatusProvider = Callable[[], str | None]
 
 
-def make_llm_node(model_with_tools: Any, system_prompt: str) -> LlmNode:
+def make_llm_node(
+    model_with_tools: Any,
+    system_prompt: str,
+    runtime_status_provider: RuntimeStatusProvider | None = None,
+) -> LlmNode:
     def llm_node(state: AgentState) -> dict[str, Any]:
+        prompt = system_prompt
+        if runtime_status_provider is not None:
+            runtime_status = runtime_status_provider()
+            if runtime_status:
+                prompt = f"{system_prompt.rstrip()}\n\n{runtime_status.strip()}"
         response = model_with_tools.invoke(
-            [SystemMessage(content=system_prompt), *state["messages"]]
+            [SystemMessage(content=prompt), *state["messages"]]
         )
         return {"messages": [response]}
 

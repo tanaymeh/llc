@@ -19,6 +19,7 @@ from llc.config import Settings
 
 _MIN_COMPACT_MESSAGES = 6
 _SUMMARY_PREFIX = "Summary of earlier conversation:\n\n"
+_OVERSIZED_MESSAGE_CHARS = 12000
 
 
 async def aget_history_messages(agent: Any, thread_id: str) -> list[AnyMessage]:
@@ -36,6 +37,7 @@ async def compact_history(agent: Any, thread_id: str, settings: Settings) -> int
         return 0
 
     split_index = _find_split_index(messages)
+    split_index = _adjust_split_for_oversized_messages(messages, split_index)
     if split_index <= 0 or split_index >= len(messages):
         return 0
 
@@ -70,6 +72,23 @@ def _find_split_index(messages: list[AnyMessage], fraction: float = 0.75) -> int
         if _is_boundary_message(messages[idx]):
             return idx
     return target
+
+
+def _adjust_split_for_oversized_messages(
+    messages: list[AnyMessage],
+    split_index: int,
+) -> int:
+    if split_index <= 0 or split_index >= len(messages):
+        return split_index
+
+    # If a very large message is in the retained tail, include it in the
+    # compacted slice when possible so compaction can actually reduce context.
+    for idx in range(split_index, len(messages) - 1):
+        content = message_text(messages[idx].content, include_reasoning=True).strip()
+        if len(content) <= _OVERSIZED_MESSAGE_CHARS:
+            continue
+        return max(split_index, min(idx + 1, len(messages) - 1))
+    return split_index
 
 
 def _is_boundary_message(message: AnyMessage) -> bool:

@@ -117,6 +117,7 @@ class ChatBubble(Vertical):
         yield Static(self._title_renderable(), classes="chat-title")
         yield Static("", classes="reasoning-line")
         yield Static("", classes="tool-status")
+        yield Static("", classes="agent-status")
         yield Markdown(self._markdown, classes="chat-markdown")
         yield Static("", classes="tool-output")
 
@@ -141,6 +142,12 @@ class ChatBubble(Vertical):
 
     def clear_tool_status(self) -> None:
         self.query_one(".tool-status", Static).update("")
+
+    def update_agent_status(self, text: str) -> None:
+        self.query_one(".agent-status", Static).update(text)
+
+    def clear_agent_status(self) -> None:
+        self.query_one(".agent-status", Static).update("")
 
     def append_tool_output(self, renderable: RenderableType) -> None:
         self._tool_outputs.append(renderable)
