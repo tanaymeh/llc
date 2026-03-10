@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -18,15 +20,14 @@ from textual.widgets import Button, Input, Markdown, OptionList, Static, TextAre
 from agent import build_agent_graph
 from commands import CommandRegistry, ReplContext
 from config import Settings
-from hooks import AutoCompactHook, Hook, HookContext
-from models import AvailableModel, fetch_models, get_model_pricing
+from hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
+from models import AvailableModel, fetch_models
 from ui.display import (
     collect_new_tool_calls,
     extract_reasoning,
     format_tool_args,
     message_text,
 )
-from ui.token_tracker import TokenTracker
 
 LLC_LOGO = r"""  ██╗     ██╗      ██████╗
   ██║     ██║     ██╔════╝
@@ -37,6 +38,38 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
+_DEBUG_LOG_PATH = Path("/home/tanay/Desktop/local-claude-code/.cursor/debug-eda7ca.log")
+_DEBUG_LOG_FALLBACK_PATH = Path("/workspace/.cursor/debug-eda7ca.log")
+
+
+# region debug token logs
+def _debug_log(
+    location: str,
+    message: str,
+    data: dict[str, Any],
+    hypothesis_id: str,
+    run_id: str,
+) -> None:
+    payload = {
+        "sessionId": "eda7ca",
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    for path in (_DEBUG_LOG_PATH, _DEBUG_LOG_FALLBACK_PATH):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, separators=(",", ":")) + "\n")
+            break
+        except Exception:
+            continue
+
+
+# endregion debug token logs
 
 
 def _format_duration(seconds: float) -> str:
@@ -266,11 +299,13 @@ class Repl(App[None]):
         self._settings = settings
         self._command_registry = registry
         self._ctx: ReplContext | None = None
-        self._thread_id = f"tui-{uuid.uuid4()}"
-        self._hooks: list[Hook] = [AutoCompactHook()]
+        self._agent_thread_id = f"tui-{uuid.uuid4()}"
+        self._token_hook = TokenCounterHook()
+        self._hooks: list[Hook] = [self._token_hook, AutoCompactHook()]
         self._available_models: list[AvailableModel] = []
-        self._token_tracker = TokenTracker()
-        self._session_cost = 0.0
+        self._turn_input = 0
+        self._turn_output = 0
+        self._turn_text_len = 0
         self._busy = False
 
     def compose(self) -> ComposeResult:
@@ -302,8 +337,21 @@ class Repl(App[None]):
         self._ctx = ReplContext(
             settings=self._settings,
             agent=agent,
-            thread_id=self._thread_id,
+            thread_id=self._agent_thread_id,
         )
+        # region debug token logs
+        _debug_log(
+            "ui/repl.py:on_mount",
+            "repl mounted",
+            {
+                "model_name": self._settings.model_name,
+                "has_api_key": bool(self._settings.openai_api_key),
+                "base_url": bool(self._settings.openai_base_url),
+            },
+            "H5",
+            self._agent_thread_id,
+        )
+        # endregion debug token logs
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
@@ -344,16 +392,25 @@ class Repl(App[None]):
 
     def _refresh_banner(self) -> None:
         model_name = self._current_model_name()
-        inp = self._token_tracker.session_input_tokens
-        out = self._token_tracker.session_output_tokens
+        inp = self._token_hook.session_input
+        out = self._token_hook.session_output
+        # region debug token logs
+        _debug_log(
+            "ui/repl.py:_refresh_banner",
+            "banner refreshed",
+            {"model_name": model_name, "session_input": inp, "session_output": out},
+            "H4",
+            self._agent_thread_id,
+        )
+        # endregion debug token logs
         banner = Text()
         banner.append(LLC_LOGO, style="bold cyan")
         banner.append("\n  Model: ", style="dim")
         banner.append(model_name, style="bold")
         banner.append("   |   ", style="dim")
         banner.append(f"Tokens: {inp:,} in / {out:,} out", style="dim")
-        if self._session_cost > 0:
-            banner.append(f"   |   ${self._session_cost:.4f}", style="dim")
+        if self._token_hook.session_cost > 0:
+            banner.append(f"   |   ${self._token_hook.session_cost:.4f}", style="dim")
         banner.append("\n  Type ", style="dim")
         banner.append("/help", style="bold")
         banner.append(" for commands. ", style="dim")
@@ -440,9 +497,27 @@ class Repl(App[None]):
             match = self._command_registry.match(user_input)
             if match:
                 command, args = match
+                # region debug token logs
+                _debug_log(
+                    "ui/repl.py:_handle_user_turn",
+                    "command matched",
+                    {"command": command.name, "args_len": len(args)},
+                    "H5",
+                    self._agent_thread_id,
+                )
+                # endregion debug token logs
                 await self._run_command(command, args)
                 return
 
+            # region debug token logs
+            _debug_log(
+                "ui/repl.py:_handle_user_turn",
+                "agent turn matched",
+                {"user_len": len(user_input)},
+                "H5",
+                self._agent_thread_id,
+            )
+            # endregion debug token logs
             bubble = await self._append_message(
                 "agent",
                 "",
@@ -472,6 +547,15 @@ class Repl(App[None]):
         if self._ctx is None:
             return
 
+        # region debug token logs
+        _debug_log(
+            "ui/repl.py:_stream_agent_response",
+            "turn started",
+            {"user_len": len(user_input), "model_name": self._current_model_name()},
+            "H5",
+            self._agent_thread_id,
+        )
+        # endregion debug token logs
         md_stream = Markdown.get_stream(bubble.markdown_widget())
         fallback_text = ""
         saw_text = False
@@ -482,7 +566,7 @@ class Repl(App[None]):
         try:
             async for mode, chunk in self._ctx.agent.astream(
                 {"messages": [HumanMessage(content=user_input)]},
-                config={"configurable": {"thread_id": self._thread_id}},
+                config={"configurable": {"thread_id": self._agent_thread_id}},
                 stream_mode=["messages", "updates"],
             ):
                 if mode == "messages":
@@ -503,6 +587,7 @@ class Repl(App[None]):
                         if reasoning.active:
                             bubble.set_reasoning_summary(reasoning.finish())
                         saw_text = True
+                        self._turn_text_len += len(text)
                         await md_stream.write(text)
 
                 if mode != "updates" or not isinstance(chunk, dict):
@@ -543,6 +628,15 @@ class Repl(App[None]):
             await md_stream.stop()
             raise
         except Exception as exc:  # noqa: BLE001
+            # region debug token logs
+            _debug_log(
+                "ui/repl.py:_stream_agent_response",
+                "stream failed",
+                {"error": str(exc)},
+                "H5",
+                self._agent_thread_id,
+            )
+            # endregion debug token logs
             await md_stream.stop()
             await bubble.set_markdown(f"Request failed: `{exc!s}`")
         finally:
@@ -550,42 +644,137 @@ class Repl(App[None]):
             await self._finish_turn()
 
     async def _finish_turn(self) -> None:
-        turn = self._token_tracker.finish_turn()
-        if turn.input_tokens > 0 or turn.output_tokens > 0:
-            pricing = get_model_pricing(
-                self._available_models,
-                self._current_model_name(),
-            )
-            if pricing is not None:
-                self._session_cost += TokenTracker.compute_cost(
-                    turn, pricing[0], pricing[1]
-                )
-        if self._ctx is not None:
-            hook_ctx = HookContext(
-                agent=self._ctx.agent,
-                thread_id=self._ctx.thread_id,
-                settings=self._ctx.settings,
-                last_turn_input_tokens=turn.input_tokens,
-                available_models=self._available_models,
-                compact_prompt=self._ctx.settings.compact_prompt,
-            )
-            for hook in self._hooks:
-                try:
-                    message = await hook.after_turn(hook_ctx)
-                except Exception as exc:  # noqa: BLE001
-                    message = f"Hook failed: `{exc!s}`"
-                if message:
-                    await self._append_system(message)
-        self._refresh_banner()
+        turn_input = self._turn_input
+        turn_output = self._turn_output
+        text_len = self._turn_text_len
+        # region debug token logs
+        _debug_log(
+            "ui/repl.py:_finish_turn",
+            "finish turn entry",
+            {
+                "turn_input": turn_input,
+                "turn_output": turn_output,
+                "text_len": text_len,
+                "has_ctx": self._ctx is not None,
+            },
+            "H2",
+            self._agent_thread_id,
+        )
+        # endregion debug token logs
+        self._turn_input = 0
+        self._turn_output = 0
+        self._turn_text_len = 0
 
-    def _extract_usage(self, message_chunk: Any) -> None:
-        usage = getattr(message_chunk, "usage_metadata", None)
-        if not isinstance(usage, dict):
+        try:
+            if turn_input == 0 and turn_output == 0 and text_len > 0:
+                turn_output = max(1, text_len // 4)
+                # region debug token logs
+                _debug_log(
+                    "ui/repl.py:_finish_turn",
+                    "fallback output estimate used",
+                    {"estimated_output": turn_output, "text_len": text_len},
+                    "H2",
+                    self._agent_thread_id,
+                )
+                # endregion debug token logs
+
+            # region debug token logs
+            raw_hooks = getattr(self, "_hooks", None)
+            _debug_log(
+                "ui/repl.py:_finish_turn",
+                "before hook loop",
+                {
+                    "internal_thread_id_type": type(
+                        getattr(self, "_thread_id", None)
+                    ).__name__,
+                    "agent_thread_id_type": type(self._agent_thread_id).__name__,
+                    "ctx_thread_id_type": (
+                        type(self._ctx.thread_id).__name__ if self._ctx is not None else None
+                    ),
+                    "hooks_type": type(raw_hooks).__name__,
+                    "hooks_len": len(raw_hooks) if isinstance(raw_hooks, list) else None,
+                    "hooks_items": (
+                        [type(h).__name__ for h in raw_hooks]
+                        if isinstance(raw_hooks, list)
+                        else None
+                    ),
+                },
+                "H6",
+                self._agent_thread_id,
+            )
+            # endregion debug token logs
+
+            if self._ctx is not None:
+                hook_ctx = HookContext(
+                    agent=self._ctx.agent,
+                    thread_id=self._ctx.thread_id,
+                    settings=self._ctx.settings,
+                    last_turn_input_tokens=turn_input,
+                    last_turn_output_tokens=turn_output,
+                    available_models=self._available_models,
+                    compact_prompt=self._ctx.settings.compact_prompt,
+                )
+                # region debug token logs
+                _debug_log(
+                    "ui/repl.py:_finish_turn",
+                    "hook context created",
+                    {
+                        "turn_input": turn_input,
+                        "turn_output": turn_output,
+                        "model_count": len(self._available_models),
+                    },
+                    "H6",
+                    self._agent_thread_id,
+                )
+                # endregion debug token logs
+                for hook in self._hooks:
+                    try:
+                        message = await hook.after_turn(hook_ctx)
+                    except Exception as exc:  # noqa: BLE001
+                        message = f"Hook failed: `{exc!s}`"
+                    if message:
+                        await self._append_system(message)
+            self._refresh_banner()
+        except Exception as exc:
+            # region debug token logs
+            _debug_log(
+                "ui/repl.py:_finish_turn",
+                "finish turn failed",
+                {"error": str(exc), "error_type": type(exc).__name__},
+                "H6",
+                self._agent_thread_id,
+            )
+            # endregion debug token logs
+            raise
+
+    def _extract_usage(self, msg: Any) -> None:
+        usage = getattr(msg, "usage_metadata", None)
+        if not usage:
             return
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
-        if inp or out:
-            self._token_tracker.add(inp, out)
+        before_input = self._turn_input
+        before_output = self._turn_output
+        if isinstance(usage, dict):
+            self._turn_input += usage.get("input_tokens", 0) or 0
+            self._turn_output += usage.get("output_tokens", 0) or 0
+        else:
+            self._turn_input += getattr(usage, "input_tokens", 0) or 0
+            self._turn_output += getattr(usage, "output_tokens", 0) or 0
+        # region debug token logs
+        _debug_log(
+            "ui/repl.py:_extract_usage",
+            "usage extracted",
+            {
+                "msg_type": type(msg).__name__,
+                "before_input": before_input,
+                "before_output": before_output,
+                "after_input": self._turn_input,
+                "after_output": self._turn_output,
+                "usage_type": type(usage).__name__,
+            },
+            "H1",
+            self._agent_thread_id,
+        )
+        # endregion debug token logs
 
     @work(exclusive=True, exit_on_error=False)
     async def _load_available_models(self) -> None:

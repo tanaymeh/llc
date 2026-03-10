@@ -104,7 +104,7 @@ agent/tools/       # Tool implementations
 ui/display.py      # Message / tool parsing helpers for streamed chunks
 ui/repl.py         # Textual app, chat workflow, streaming workers
 ui/repl.tcss       # Theme-aware styles for chat panels and composer
-ui/token_tracker.py # Token usage and cost tracking
+hooks.py           # Hook protocol, TokenCounterHook, AutoCompactHook
 models.py          # Model list fetching + pricing from OpenRouter
 scripts/           # helper scripts, including Docker launcher
 ```
