@@ -3,7 +3,7 @@ from typing import Any, Callable, Literal
 from langchain_core.messages import SystemMessage, ToolMessage
 from langgraph.graph import END
 
-from agent.state import AgentState
+from llc.agent.state import AgentState
 
 LlmNode = Callable[[AgentState], dict[str, Any]]
 ToolNode = Callable[[AgentState], dict[str, Any]]

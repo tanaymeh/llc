@@ -1,10 +1,10 @@
-from commands import CommandRegistry
-from commands.compact import CompactCommand
-from commands.exit import ExitCommand
-from commands.help import HelpCommand
-from commands.model import ModelCommand
-from config import Settings
-from ui.repl import Repl
+from llc.commands import CommandRegistry
+from llc.commands.compact import CompactCommand
+from llc.commands.exit import ExitCommand
+from llc.commands.help import HelpCommand
+from llc.commands.model import ModelCommand
+from llc.config import Settings
+from llc.ui.repl import Repl
 
 
 def _build_registry() -> CommandRegistry:

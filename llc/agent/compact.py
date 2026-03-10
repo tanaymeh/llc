@@ -13,8 +13,9 @@ from langchain_core.messages import (
 )
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
-from agent.graph import build_chat_model
-from config import Settings
+from llc.agent.llm import build_chat_model
+from llc.agent.message_utils import message_text
+from llc.config import Settings
 
 _MIN_COMPACT_MESSAGES = 6
 _SUMMARY_PREFIX = "Summary of earlier conversation:\n\n"
@@ -87,7 +88,7 @@ async def _summarize_messages(messages: list[AnyMessage], settings: Settings) ->
             HumanMessage(content=_render_messages(messages)),
         ]
     )
-    summary = _message_text(response.content).strip()
+    summary = message_text(response.content, include_reasoning=True).strip()
     if not summary:
         raise ValueError("Compaction summary model returned empty content")
     return summary
@@ -97,7 +98,7 @@ def _render_messages(messages: list[AnyMessage]) -> str:
     lines: list[str] = []
     for idx, message in enumerate(messages, start=1):
         lines.append(f"[{idx}] {_message_heading(message)}")
-        content = _message_text(message.content)
+        content = message_text(message.content, include_reasoning=True)
         if content:
             lines.append(content)
         tool_details = _tool_details(message)
@@ -138,28 +139,3 @@ def _tool_details(message: AnyMessage) -> str:
     return ""
 
 
-def _message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-                continue
-            if not isinstance(item, dict):
-                parts.append(str(item))
-                continue
-            raw = (
-                item.get("text")
-                or item.get("content")
-                or item.get("output_text")
-                or item.get("reasoning")
-                or item.get("thinking")
-            )
-            if raw:
-                parts.append(str(raw))
-        return "\n".join(part for part in parts if part)
-    if content is None:
-        return ""
-    return str(content)

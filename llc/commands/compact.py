@@ -1,5 +1,5 @@
-from agent.compact import aget_history_messages, compact_history
-from commands import Command, CommandResult, ReplContext
+from llc.agent.compact import aget_history_messages, compact_history
+from llc.commands import Command, CommandResult, ReplContext
 
 
 class CompactCommand(Command):

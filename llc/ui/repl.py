@@ -1,37 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 import uuid
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
-from rich import box
-from rich.console import Group, RenderableType
-from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from textual import on, work
 from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets import Button, Markdown, Static
 
-from agent import build_agent_graph
-from commands import CommandRegistry, ReplContext
-from config import Settings
-from hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
-from models import AvailableModel, fetch_models
-from ui.display import (
+from llc.agent import build_agent_graph
+from llc.commands import CommandRegistry, ReplContext
+from llc.config import Settings
+from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
+from llc.models import AvailableModel, fetch_models
+from llc.ui.display import (
     collect_new_user_facing_tool_results,
     collect_new_tool_calls,
     extract_reasoning,
     format_tool_args,
     message_text,
 )
+from llc.ui.rendering import format_duration, render_user_facing_tool_output
+from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen
 
 LLC_LOGO = r"""  ██╗     ██╗      ██████╗
   ██║     ██║     ██╔════╝
@@ -42,165 +38,6 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
-_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def _render_side_by_side_diff(diff_text: str) -> RenderableType:
-    table = Table(
-        box=box.SQUARE,
-        expand=True,
-        show_header=True,
-        header_style="bold",
-        border_style="grey50",
-        show_lines=True,
-        pad_edge=False,
-        collapse_padding=True,
-    )
-    old_header = Text()
-    old_header.append("--- ", style="bold red")
-    old_header.append("Old", style="bold")
-    new_header = Text()
-    new_header.append("+++ ", style="bold green")
-    new_header.append("New", style="bold")
-    table.add_column(old_header, ratio=1, overflow="fold")
-    table.add_column(new_header, ratio=1, overflow="fold")
-    has_diff_lines = False
-    pending_old_file = ""
-    pending_old_lines: list[str] = []
-    pending_new_lines: list[str] = []
-
-    def flush_change_block() -> None:
-        nonlocal has_diff_lines
-        if not pending_old_lines and not pending_new_lines:
-            return
-        has_diff_lines = True
-        for idx in range(max(len(pending_old_lines), len(pending_new_lines))):
-            old_line = pending_old_lines[idx] if idx < len(pending_old_lines) else ""
-            new_line = pending_new_lines[idx] if idx < len(pending_new_lines) else ""
-            old_cell: RenderableType = (
-                Text(f"- {old_line}", style="red")
-                if old_line
-                else Text("", style="dim")
-            )
-            new_cell: RenderableType = (
-                Text(f"+ {new_line}", style="green")
-                if new_line
-                else Text("", style="dim")
-            )
-            table.add_row(old_cell, new_cell)
-        pending_old_lines.clear()
-        pending_new_lines.clear()
-
-    for raw_line in diff_text.splitlines():
-        line = _ANSI_RE.sub("", raw_line)
-        if not line:
-            flush_change_block()
-            table.add_row(Text("", style="dim"), Text("", style="dim"))
-            continue
-
-        if line.startswith("=== "):
-            flush_change_block()
-            title = Text(line, style="bold magenta")
-            table.add_row(title, title.copy())
-            continue
-
-        if line.startswith("diff --git "):
-            flush_change_block()
-            has_diff_lines = True
-            header = Text(line, style="bold cyan")
-            table.add_row(header, header.copy())
-            continue
-
-        if line.startswith("index "):
-            flush_change_block()
-            has_diff_lines = True
-            meta = Text(line, style="cyan")
-            table.add_row(meta, meta.copy())
-            continue
-
-        if line.startswith("--- "):
-            flush_change_block()
-            pending_old_file = line
-            continue
-
-        if line.startswith("+++ "):
-            flush_change_block()
-            has_diff_lines = True
-            old_meta = Text(pending_old_file or "---", style="bold red")
-            new_meta = Text(line, style="bold green")
-            table.add_row(old_meta, new_meta)
-            pending_old_file = ""
-            continue
-
-        if line.startswith("@@ "):
-            flush_change_block()
-            has_diff_lines = True
-            hunk = Text(line, style="bold yellow")
-            table.add_row(hunk, hunk.copy())
-            continue
-
-        if line.startswith("-") and not line.startswith("--- "):
-            pending_old_lines.append(line[1:])
-            continue
-
-        if line.startswith("+") and not line.startswith("+++ "):
-            pending_new_lines.append(line[1:])
-            continue
-
-        if line.startswith(" "):
-            flush_change_block()
-            common = Text(f"  {line[1:]}", style="dim")
-            table.add_row(common, common.copy())
-            continue
-
-        flush_change_block()
-        plain = Text(line, style="dim")
-        table.add_row(plain, plain.copy())
-
-    flush_change_block()
-
-    if not has_diff_lines:
-        return Text(diff_text)
-
-    return table
-
-
-def _render_user_facing_tool_output(
-    tool_name: str,
-    render_mode: str,
-    content: str,
-) -> RenderableType:
-    if render_mode == "side_by_side_diff":
-        title = Text(f"{tool_name} ")
-        title.append("--- old", style="bold red")
-        title.append(" | ", style="dim")
-        title.append("+++ new", style="bold green")
-        body = _render_side_by_side_diff(content)
-        subtitle = Text("session baseline -> current state", style="dim")
-    else:
-        title = f"{tool_name} output"
-        body = Text(content)
-        subtitle = None
-    return Panel(
-        body,
-        title=title,
-        subtitle=subtitle,
-        border_style="grey62",
-    )
-
-
-def _format_duration(seconds: float) -> str:
-    if seconds < 60:
-        v, u = seconds, "second"
-    elif seconds < 3600:
-        v, u = seconds / 60, "minute"
-    else:
-        v, u = seconds / 3600, "hour"
-    text = f"{v:.0f}" if v >= 10 else f"{v:.1f}"
-    if text.endswith(".0"):
-        text = text[:-2]
-    suffix = u if text == "1" else f"{u}s"
-    return f"{text} {suffix}"
 
 
 class _ReasoningTracker:
@@ -243,159 +80,7 @@ class _ReasoningTracker:
         self.started_at = None
         self._tokens.clear()
         self._last_emitted = None
-        return f"  Reasoned for {_format_duration(elapsed)}"
-
-
-class ModelPickerScreen(ModalScreen[str | None]):
-    BINDINGS = [
-        Binding("up", "move_up", show=False, priority=True),
-        Binding("down", "move_down", show=False, priority=True),
-        Binding("enter,return", "accept", show=False, priority=True),
-        Binding("escape", "cancel", show=False, priority=True),
-    ]
-
-    CSS = """
-    ModelPickerScreen {
-        align: center middle;
-    }
-    #model_picker_box {
-        width: 80;
-        max-width: 90%;
-        height: 24;
-        max-height: 80%;
-        background: $surface;
-        border: round $primary;
-        padding: 1 2;
-    }
-    #model_search {
-        width: 1fr;
-        margin: 0 0 1 0;
-    }
-    #model_list {
-        width: 1fr;
-        height: 1fr;
-    }
-    """
-
-    def __init__(self, models: list[AvailableModel]) -> None:
-        super().__init__()
-        self._models = models
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="model_picker_box"):
-            yield Input(placeholder="Search models…", id="model_search")
-            yield OptionList(id="model_list")
-
-    async def on_mount(self) -> None:
-        self._populate("")
-        self.query_one("#model_search", Input).focus()
-
-    @on(Input.Changed, "#model_search")
-    def _on_search(self, event: Input.Changed) -> None:
-        self._populate(event.value.strip().lower())
-
-    def _populate(self, query: str) -> None:
-        option_list = self.query_one("#model_list", OptionList)
-        option_list.clear_options()
-        for m in self._models:
-            if query and query not in m.id.lower() and query not in m.name.lower():
-                continue
-            option_list.add_option(m.id)
-        if option_list.option_count > 0:
-            option_list.action_first()
-
-    @on(OptionList.OptionSelected, "#model_list")
-    def _on_select(self, event: OptionList.OptionSelected) -> None:
-        self.dismiss(str(event.option.prompt))
-
-    def action_move_up(self) -> None:
-        option_list = self.query_one("#model_list", OptionList)
-        if option_list.option_count > 0:
-            option_list.action_cursor_up()
-
-    def action_move_down(self) -> None:
-        option_list = self.query_one("#model_list", OptionList)
-        if option_list.option_count > 0:
-            option_list.action_cursor_down()
-
-    def action_accept(self) -> None:
-        option_list = self.query_one("#model_list", OptionList)
-        highlighted = option_list.highlighted_option
-        if highlighted is not None:
-            self.dismiss(str(highlighted.prompt))
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-
-class ChatBubble(Vertical):
-    def __init__(
-        self,
-        role: str,
-        *,
-        model_name: str | None = None,
-        markdown: str = "",
-    ) -> None:
-        classes = (
-            "chat-bubble user-bubble"
-            if role == "user"
-            else "chat-bubble agent-bubble"
-        )
-        super().__init__(classes=classes)
-        self._role = role
-        self._model_name = model_name
-        self._markdown = markdown
-        self._tool_outputs: list[RenderableType] = []
-
-    def compose(self) -> ComposeResult:
-        yield Static(self._title_renderable(), classes="chat-title")
-        yield Static("", classes="reasoning-line")
-        yield Static("", classes="tool-status")
-        yield Markdown(self._markdown, classes="chat-markdown")
-        yield Static("", classes="tool-output")
-
-    def _title_renderable(self) -> Text:
-        if self._role == "user":
-            return Text("User", style="bold")
-        title = Text("Agent", style="bold")
-        if self._model_name:
-            title.append(" (", style="dim")
-            title.append(self._model_name, style="grey62")
-            title.append(")", style="dim")
-        return title
-
-    def markdown_widget(self) -> Markdown:
-        return self.query_one(Markdown)
-
-    async def set_markdown(self, markdown: str) -> None:
-        await self.markdown_widget().update(markdown)
-
-    def update_tool_status(self, text: str) -> None:
-        self.query_one(".tool-status", Static).update(text)
-
-    def clear_tool_status(self) -> None:
-        self.query_one(".tool-status", Static).update("")
-
-    def append_tool_output(self, renderable: RenderableType) -> None:
-        self._tool_outputs.append(renderable)
-        self.query_one(".tool-output", Static).update(Group(*self._tool_outputs))
-
-    def update_reasoning_line(self, text: str) -> None:
-        self.query_one(".reasoning-line", Static).update(text)
-
-    def set_reasoning_summary(self, text: str) -> None:
-        self.query_one(".reasoning-line", Static).update(text)
-
-
-class ComposerInput(TextArea):
-    BINDINGS = [
-        Binding(
-            "ctrl+backspace",
-            "delete_word_left",
-            "Delete word left",
-            show=False,
-        ),
-    ]
+        return f"  Reasoned for {format_duration(elapsed)}"
 
 
 class Repl(App[None]):
@@ -696,7 +381,7 @@ class Repl(App[None]):
                 )
                 for result in user_facing_results:
                     bubble.append_tool_output(
-                        _render_user_facing_tool_output(
+                        render_user_facing_tool_output(
                             result["tool_name"],
                             result["render_mode"],
                             result["content"],

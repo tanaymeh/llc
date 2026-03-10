@@ -5,14 +5,7 @@ from typing import Optional
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
-
-def _resolve_path(workspace_root: Path, file_path: str) -> Path:
-    candidate = (workspace_root / file_path).resolve()
-    try:
-        candidate.relative_to(workspace_root)
-    except ValueError:
-        raise ValueError("Path is outside the workspace root and is not allowed.")
-    return candidate
+from llc.agent.tools._paths import resolve_workspace_path
 
 
 def make_filesystem_tools(workspace_root: Path) -> list[BaseTool]:
@@ -33,7 +26,7 @@ Usage:
 - You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
 - You will regularly be asked to read screenshots. If the user provides a path to a screenshot ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths like /var/folders/123/abc/T/TemporaryItems/NSIRD_screencaptureui_ZfB1tD/Screenshot.png
 - If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents."""
-        target = _resolve_path(workspace_root, file_path)
+        target = resolve_workspace_path(workspace_root, file_path)
         if not target.exists():
             return f"File does not exist: {file_path}"
         if target.is_dir():
@@ -67,7 +60,7 @@ Usage:
 - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
 - Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked."""
-        target = _resolve_path(workspace_root, file_path)
+        target = resolve_workspace_path(workspace_root, file_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} characters to {file_path}"
@@ -75,7 +68,7 @@ Usage:
     @tool
     def LS(path: str, ignore: Optional[list[str]] = None) -> str:
         """Lists files and directories in a given path. The path parameter must be an absolute path, not a relative path. You can optionally provide an array of glob patterns to ignore with the ignore parameter. You should generally prefer the Glob and Grep tools, if you know which directories to search."""
-        target = _resolve_path(workspace_root, path)
+        target = resolve_workspace_path(workspace_root, path)
         if not target.exists():
             return f"Path does not exist: {path}"
         if not target.is_dir():

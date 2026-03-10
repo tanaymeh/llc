@@ -12,13 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir ast-grep-cli
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY main.py config.py models.py hooks.py ./
-COPY agent ./agent
-COPY commands ./commands
-COPY ui ./ui
-COPY prompts ./prompts
+COPY llc ./llc
+RUN uv sync --frozen --no-dev
 
-ENTRYPOINT ["python", "/app/main.py"]
+ENTRYPOINT ["python", "-m", "llc"]

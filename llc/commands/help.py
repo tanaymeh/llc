@@ -1,4 +1,4 @@
-from commands import Command, CommandRegistry, CommandResult, ReplContext
+from llc.commands import Command, CommandRegistry, CommandResult, ReplContext
 
 
 class HelpCommand(Command):

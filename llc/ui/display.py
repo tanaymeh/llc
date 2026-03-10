@@ -4,6 +4,8 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
+from llc.agent.message_utils import message_text
+
 
 def _stringify_reasoning(value: Any) -> str:
     if value is None:
@@ -96,26 +98,6 @@ def extract_reasoning(message_chunk: Any) -> str:
         if reasoning_text:
             parts.append(reasoning_text)
     return "\n".join(part for part in parts if part)
-
-
-def message_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content)
-    text_parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict):
-            block_type = str(block.get("type", "")).lower()
-            if block_type in {"thinking", "reasoning"}:
-                continue
-            raw = block.get("text") or block.get("content") or block.get("output_text")
-            if raw:
-                text_parts.append(str(raw))
-            continue
-        if isinstance(block, str):
-            text_parts.append(block)
-    return "\n".join(part for part in text_parts if part)
 
 
 def format_tool_args(args: dict[str, Any]) -> str:

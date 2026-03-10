@@ -4,9 +4,11 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
-from agent.compact import compact_history
-from config import Settings
-from models import AvailableModel, get_model_pricing
+from llc.agent.compact import compact_history
+from llc.config import Settings
+from llc.models import AvailableModel, get_model_pricing
+
+__all__ = ["AutoCompactHook", "Hook", "HookContext", "TokenCounterHook"]
 
 
 class Hook(Protocol):

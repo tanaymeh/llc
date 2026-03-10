@@ -1,5 +1,5 @@
-from agent import build_agent_graph
-from commands import Command, CommandResult, ReplContext
+from llc.agent import build_agent_graph
+from llc.commands import Command, CommandResult, ReplContext
 
 
 class ModelCommand(Command):

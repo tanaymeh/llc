@@ -4,14 +4,7 @@ from typing import Optional
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
-
-def _resolve_path(workspace_root: Path, file_path: str) -> Path:
-    candidate = (workspace_root / file_path).resolve()
-    try:
-        candidate.relative_to(workspace_root)
-    except ValueError:
-        raise ValueError("Path is outside the workspace root and is not allowed.")
-    return candidate
+from llc.agent.tools._paths import resolve_workspace_path
 
 
 def _apply_edit(content: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
@@ -49,7 +42,7 @@ Usage:
 - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
 - The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.
 - Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance."""
-        target = _resolve_path(workspace_root, file_path)
+        target = resolve_workspace_path(workspace_root, file_path)
 
         if not target.exists():
             if old_string == "":
@@ -93,7 +86,7 @@ CRITICAL REQUIREMENTS:
 1. All edits follow the same requirements as the single Edit tool
 2. The edits are atomic - either all succeed or none are applied
 3. Plan your edits carefully to avoid conflicts between sequential operations"""
-        target = _resolve_path(workspace_root, file_path)
+        target = resolve_workspace_path(workspace_root, file_path)
 
         if not target.exists():
             return f"File does not exist: {file_path}"

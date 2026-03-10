@@ -26,13 +26,19 @@ Set values in `.env`:
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL` (optional for custom OpenAI-compatible endpoints)
 
-Edit the assistant system prompt in `prompts/system_prompt.yaml`.
+Edit the assistant system prompt in `llc/prompts/system_prompt.yaml`.
 At runtime, LLC appends current environment metadata to the very end of the system prompt inside `<env>...</env>` tags.
 
 ## Run
 
 ```bash
-uv run main.py
+uv run llc
+```
+
+Or equivalently:
+
+```bash
+python -m llc
 ```
 
 Inside the TUI:
@@ -98,15 +104,25 @@ Notes:
 ## Project Layout
 
 ```text
-main.py            # TUI entrypoint
-agent/state.py     # LangGraph state schema
-agent/nodes.py     # LLM node, tool node, routing
-agent/graph.py     # StateGraph builder + MemorySaver
-agent/tools/       # Tool implementations
-ui/display.py      # Message / tool parsing helpers for streamed chunks
-ui/repl.py         # Textual app, chat workflow, streaming workers
-ui/repl.tcss       # Theme-aware styles for chat panels and composer
-hooks.py           # Hook protocol, TokenCounterHook, AutoCompactHook
-models.py          # Model list fetching + pricing from OpenRouter
-scripts/           # helper scripts, including Docker launcher
+llc/                     # All source code
+├── main.py              # Entrypoint
+├── config.py            # Settings, prompt loading, env details
+├── models.py            # Model list fetching + pricing from OpenRouter
+├── agent/
+│   ├── graph.py         # StateGraph builder + MemorySaver
+│   ├── llm.py           # Chat model factory (OpenAI / OpenRouter)
+│   ├── nodes.py         # LLM node, tool node, routing
+│   ├── state.py         # LangGraph state schema
+│   ├── compact.py       # History compaction logic
+│   ├── hooks.py         # Hook protocol, TokenCounterHook, AutoCompactHook
+│   ├── message_utils.py # Shared message text extraction
+│   └── tools/           # Tool implementations (Read, Write, Edit, Bash, Grep, etc.)
+├── commands/            # REPL slash-commands (/model, /compact, /help, exit)
+├── ui/
+│   ├── repl.py          # Textual app, chat workflow, streaming
+│   ├── widgets.py       # ChatBubble, ComposerInput, ModelPickerScreen
+│   ├── rendering.py     # Diff rendering, tool output formatting
+│   ├── display.py       # Message / tool parsing helpers for streamed chunks
+│   └── repl.tcss        # Theme-aware styles for chat panels and composer
+└── prompts/             # System and compaction prompt YAML files
 ```
