@@ -13,6 +13,7 @@ from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.worker import Worker, WorkerState, get_current_worker
 from textual.widgets import Button, Markdown, Static
 
 from llc.agent import build_agent_graph
@@ -20,7 +21,7 @@ from llc.commands import CommandRegistry, ReplContext
 from llc.config import Settings
 from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
 from llc.agent.subagents import SubAgentRuntime
-from llc.models import AvailableModel, fetch_models
+from llc.models import AvailableModel, fetch_models, get_model_pricing
 from llc.ui.display import (
     collect_new_user_facing_tool_results,
     collect_new_tool_calls,
@@ -44,6 +45,8 @@ _AGENT_STATUS_POLL_INTERVAL_S = 0.8
 _MAX_AGENT_STATUS_LINES = 5
 _WORKER_TASK_PREVIEW_CHARS = 56
 _ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
+_DOUBLE_ESCAPE_WINDOW_S = 0.6
+_SESSION_INTERRUPT_MESSAGE = "Session Interrupted, what should be done differently?"
 _MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
     "A manual /subagent launch just occurred.\n"
     "Continue orchestration for all currently active workers.\n"
@@ -69,7 +72,7 @@ def _format_agent_status(report: dict[str, Any]) -> str:
     active_workers = [
         worker
         for worker in known_workers
-        and str(worker.get("status", "")) in _ACTIVE_WORKER_STATUSES
+        if str(worker.get("status", "")) in _ACTIVE_WORKER_STATUSES
     ]
     if not active_workers:
         return ""
@@ -158,6 +161,7 @@ class Repl(App[None]):
             show=False,
             priority=True,
         ),
+        Binding("escape", "register_escape_interrupt", show=False, priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
@@ -175,6 +179,9 @@ class Repl(App[None]):
         self._turn_text_len = 0
         self._busy = False
         self._subagent_runtime: SubAgentRuntime | None = None
+        self._active_turn_worker: Worker[None] | None = None
+        self._last_escape_pressed_at: float = 0.0
+        self._interrupt_in_progress = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
@@ -260,16 +267,18 @@ class Repl(App[None]):
 
     def _refresh_banner(self) -> None:
         model_name = self._current_model_name()
-        inp = self._token_hook.session_input
-        out = self._token_hook.session_output
+        subagent_in, subagent_out, subagent_cost = self._subagent_usage_snapshot()
+        inp = self._token_hook.session_input + subagent_in
+        out = self._token_hook.session_output + subagent_out
+        total_cost = self._token_hook.session_cost + subagent_cost
         banner = Text()
         banner.append(LLC_LOGO, style="bold cyan")
         banner.append("\n  Model: ", style="dim")
         banner.append(model_name, style="bold")
         banner.append("   |   ", style="dim")
         banner.append(f"Tokens: {inp:,} in / {out:,} out", style="dim")
-        if self._token_hook.session_cost > 0:
-            banner.append(f"   |   ${self._token_hook.session_cost:.4f}", style="dim")
+        if total_cost > 0:
+            banner.append(f"   |   ${total_cost:.4f}", style="dim")
         banner.append("\n  Type ", style="dim")
         banner.append("/help", style="bold")
         banner.append(" for commands. ", style="dim")
@@ -280,6 +289,39 @@ class Repl(App[None]):
             banner.append("sub-agent mode: ", style="dim")
             banner.append("ON", style="bold green")
         self.query_one("#banner", Static).update(banner)
+
+    def _subagent_usage_snapshot(self) -> tuple[int, int, float]:
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return 0, 0, 0.0
+        try:
+            usage = runtime.get_usage_totals()
+        except Exception:  # noqa: BLE001
+            return 0, 0, 0.0
+
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        input_tokens = max(input_tokens, 0)
+        output_tokens = max(output_tokens, 0)
+
+        by_model = usage.get("by_model", {})
+        if not isinstance(by_model, dict):
+            return input_tokens, output_tokens, 0.0
+
+        cost = 0.0
+        for raw_model_name, raw_bucket in by_model.items():
+            model_name = str(raw_model_name).strip()
+            if not model_name or not isinstance(raw_bucket, dict):
+                continue
+            model_input = max(int(raw_bucket.get("input_tokens", 0) or 0), 0)
+            model_output = max(int(raw_bucket.get("output_tokens", 0) or 0), 0)
+            if model_input == 0 and model_output == 0:
+                continue
+            pricing = get_model_pricing(self._available_models, model_name)
+            if pricing is None:
+                continue
+            cost += model_input * pricing[0] + model_output * pricing[1]
+        return input_tokens, output_tokens, cost
 
     def on_unmount(self) -> None:
         if self._subagent_runtime is not None:
@@ -322,6 +364,24 @@ class Repl(App[None]):
             raise SkipAction()
         self._do_send()
 
+    def action_register_escape_interrupt(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_escape_pressed_at
+        self._last_escape_pressed_at = now
+        if elapsed > _DOUBLE_ESCAPE_WINDOW_S:
+            return
+        self._last_escape_pressed_at = 0.0
+        self._start_interrupt()
+
+    def _start_interrupt(self) -> None:
+        if self._interrupt_in_progress:
+            return
+        self._interrupt_in_progress = True
+        self._interrupt_session()
+
+    def _start_user_turn(self, user_input: str) -> None:
+        self._active_turn_worker = self._handle_user_turn(user_input)
+
     def _do_send(self) -> None:
         if self._busy or self._ctx is None:
             return
@@ -337,7 +397,7 @@ class Repl(App[None]):
                 self._show_model_picker()
                 return
         self._set_busy(True)
-        self._handle_user_turn(raw)
+        self._start_user_turn(raw)
 
     def _show_model_picker(self) -> None:
         if not self._available_models:
@@ -348,7 +408,7 @@ class Repl(App[None]):
                 self._composer_input().focus()
                 return
             self._set_busy(True)
-            self._handle_user_turn(f"/model {selected}")
+            self._start_user_turn(f"/model {selected}")
 
         self.push_screen(
             ModelPickerScreen(self._available_models), callback=_on_result
@@ -356,6 +416,7 @@ class Repl(App[None]):
 
     @work(exclusive=False, exit_on_error=False)
     async def _handle_user_turn(self, user_input: str) -> None:
+        worker = get_current_worker()
         try:
             await self._append_message("user", user_input)
             if self._ctx is None:
@@ -374,7 +435,60 @@ class Repl(App[None]):
             )
             await self._stream_agent_response(user_input, bubble)
         finally:
+            if self._active_turn_worker is worker:
+                self._active_turn_worker = None
             self._set_busy(False)
+
+    @work(exclusive=False, exit_on_error=False)
+    async def _interrupt_session(self) -> None:
+        try:
+            await self._cancel_active_turn_worker()
+            self._terminate_active_subagents()
+            self._set_busy(False)
+            self._composer_input().focus()
+            await self._append_message(
+                "agent",
+                _SESSION_INTERRUPT_MESSAGE,
+                model_name=self._current_model_name(),
+            )
+        finally:
+            self._interrupt_in_progress = False
+
+    async def _cancel_active_turn_worker(self) -> None:
+        worker = self._active_turn_worker
+        if worker is None:
+            return
+        if worker.state in (WorkerState.PENDING, WorkerState.RUNNING):
+            worker.cancel()
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(worker.wait(), timeout=1.5)
+        self._active_turn_worker = None
+
+    def _terminate_active_subagents(self) -> None:
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return
+        try:
+            report = runtime.get_subagent_report()
+        except Exception:  # noqa: BLE001
+            return
+        workers = report.get("workers", [])
+        if not isinstance(workers, list):
+            return
+        for worker in workers:
+            if not isinstance(worker, dict):
+                continue
+            status = str(worker.get("status", ""))
+            if status not in _ACTIVE_WORKER_STATUSES:
+                continue
+            subagent_id = str(worker.get("id", "")).strip()
+            if not subagent_id:
+                continue
+            with contextlib.suppress(Exception):
+                runtime.terminate_subagent(
+                    subagent_id,
+                    reason="session_interrupted",
+                )
 
     async def _run_command(self, command: Any, args: str) -> None:
         if self._ctx is None:
@@ -539,6 +653,7 @@ class Repl(App[None]):
             except Exception:  # noqa: BLE001
                 status_text = ""
             bubble.update_agent_status(status_text)
+            self._refresh_banner()
             try:
                 await asyncio.wait_for(
                     stop_signal.wait(),

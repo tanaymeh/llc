@@ -90,6 +90,15 @@ Implemented safeguards:
 - Active worker lines are shown inside agent bubbles:
   - `↳ Agent #1 (...) running: ...`
   - styled distinctly from tool status lines
+- Banner token/cost totals include sub-agent token usage (worker execution plus completion-report calls), when pricing data is available.
+
+### Session Interrupt Hotkey
+
+- Pressing `Esc` twice in quick succession triggers a session interrupt.
+- The interrupt attempts to:
+  - cancel the active orchestrator turn worker,
+  - terminate all active sub-agents,
+  - append the prompt: `Session Interrupted, what should be done differently?`
 
 ### Turn Model
 

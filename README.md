@@ -5,7 +5,7 @@ Local LangGraph + LangChain coding agent that:
 - accepts user commands,
 - calls tools when needed (shell, read/write files, grep, edit, ShowDiff, etc.),
 - streams tokens with live markdown rendering and code block styling,
-- tracks token usage and estimates cost via OpenRouter pricing.
+- tracks token usage and estimates cost via OpenRouter pricing (including sub-agent usage).
 
 ## Requirements
 
@@ -50,6 +50,7 @@ Inside the TUI:
 - type in the bottom composer,
 - press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
 - use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
+- press `Esc` twice quickly to interrupt the active session flow (current turn + active sub-agents),
 - use `/compact` to summarize and replace the oldest chat history once the model-visible history has more than 5 messages,
 - use `/enable sub-agent-mode` to enable experimental orchestrator/worker behavior,
 - use `/subagent {TASK}` to manually spawn one worker with explicit braces (repeat as needed up to max active workers),
@@ -57,7 +58,7 @@ Inside the TUI:
 
 ## UI Features
 
-- **ASCII banner** with model info, token usage, and cost at the top
+- **ASCII banner** with model info, token usage, and cost at the top (includes orchestrator + sub-agent usage)
 - **Chat transcript** with scrollable conversation history
 - **Fixed bottom composer** that stays visible like a chat app input
 - **Role-specific message panels** (User and Agent with model name)

@@ -52,6 +52,9 @@ class SubAgentRuntime:
         self._records: dict[str, SubAgentRecord] = {}
         self._lock = RLock()
         self._closed = False
+        self._usage_input_tokens = 0
+        self._usage_output_tokens = 0
+        self._usage_by_model: dict[str, dict[str, int]] = {}
         self._executor = ThreadPoolExecutor(
             max_workers=settings.max_sub_agents,
             thread_name_prefix="llc-subagent",
@@ -129,6 +132,21 @@ class SubAgentRuntime:
                 "active_count": self._active_count_locked(),
                 "max_sub_agents": self._settings.max_sub_agents,
                 "workers": workers,
+            }
+
+    def get_usage_totals(self) -> dict[str, Any]:
+        with self._lock:
+            by_model = {
+                model_name: {
+                    "input_tokens": int(bucket.get("input_tokens", 0) or 0),
+                    "output_tokens": int(bucket.get("output_tokens", 0) or 0),
+                }
+                for model_name, bucket in self._usage_by_model.items()
+            }
+            return {
+                "input_tokens": self._usage_input_tokens,
+                "output_tokens": self._usage_output_tokens,
+                "by_model": by_model,
             }
 
     def wait_subagents(
@@ -286,6 +304,7 @@ class SubAgentRuntime:
                 task=task,
                 context=context,
                 thread_id=thread_id,
+                settings=settings,
             )
         )
 
@@ -298,15 +317,17 @@ class SubAgentRuntime:
         task: str,
         context: str,
         thread_id: str,
+        settings: Settings,
     ) -> dict[str, Any]:
         started_monotonic = time.monotonic()
-        report_interval = float(self._settings.sub_agent_report_interval_s)
-        max_runtime_s = float(self._settings.sub_agent_max_runtime_s)
+        report_interval = float(settings.sub_agent_report_interval_s)
+        max_runtime_s = float(settings.sub_agent_max_runtime_s)
         next_report_at = started_monotonic + report_interval
         tool_calls = 0
         output_chars = 0
         final_parts: list[str] = []
         fallback_text = ""
+        usage_by_model: dict[str, dict[str, int]] = {}
 
         try:
             async for mode, chunk in agent.astream(
@@ -335,6 +356,13 @@ class SubAgentRuntime:
                             if not isinstance(message, AIMessage):
                                 continue
                             tool_calls += len(getattr(message, "tool_calls", None) or [])
+                            usage_input, usage_output = _token_usage(message)
+                            _accumulate_usage_by_model(
+                                usage_by_model,
+                                settings.model_name,
+                                usage_input,
+                                usage_output,
+                            )
                             maybe_text = message_text(message.content)
                             if maybe_text:
                                 fallback_text = maybe_text
@@ -366,6 +394,7 @@ class SubAgentRuntime:
                 "stop_reason": exc.reason,
                 "tool_calls": tool_calls,
                 "output_chars": output_chars,
+                "usage_by_model": usage_by_model,
             }
         except Exception as exc:  # noqa: BLE001
             return {
@@ -373,6 +402,7 @@ class SubAgentRuntime:
                 "error": str(exc),
                 "tool_calls": tool_calls,
                 "output_chars": output_chars,
+                "usage_by_model": usage_by_model,
             }
 
         final_output = "".join(final_parts).strip()
@@ -382,12 +412,23 @@ class SubAgentRuntime:
             final_output = (
                 final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
             )
-        completion_report = await _build_completion_report(
+        (
+            completion_report,
+            report_input_tokens,
+            report_output_tokens,
+            report_model_name,
+        ) = await _build_completion_report(
             agent=agent,
             thread_id=thread_id,
-            settings=self._settings,
+            settings=settings,
             goal=task,
             final_output=final_output,
+        )
+        _accumulate_usage_by_model(
+            usage_by_model,
+            report_model_name,
+            report_input_tokens,
+            report_output_tokens,
         )
         return {
             "status": "completed",
@@ -395,6 +436,7 @@ class SubAgentRuntime:
             "completion_report": completion_report,
             "tool_calls": tool_calls,
             "output_chars": output_chars,
+            "usage_by_model": usage_by_model,
         }
 
     def _guard_stop(self, subagent_id: str, attempt: int) -> None:
@@ -454,6 +496,7 @@ class SubAgentRuntime:
             record.completion_report = result.get("completion_report", "")
             record.tool_calls = max(record.tool_calls, result.get("tool_calls", 0))
             record.output_chars = max(record.output_chars, result.get("output_chars", 0))
+            self._merge_usage_locked(_normalize_usage_by_model(result.get("usage_by_model")))
 
             if record.pending_feedback and not record.terminate_requested:
                 self._restart_with_feedback_locked(record)
@@ -548,6 +591,21 @@ class SubAgentRuntime:
     def _active_count_locked(self) -> int:
         return sum(1 for record in self._records.values() if record.status in ACTIVE_STATUSES)
 
+    def _merge_usage_locked(self, usage_by_model: dict[str, dict[str, int]]) -> None:
+        for model_name, usage in usage_by_model.items():
+            input_tokens = max(int(usage.get("input_tokens", 0) or 0), 0)
+            output_tokens = max(int(usage.get("output_tokens", 0) or 0), 0)
+            if input_tokens == 0 and output_tokens == 0:
+                continue
+            bucket = self._usage_by_model.setdefault(
+                model_name,
+                {"input_tokens": 0, "output_tokens": 0},
+            )
+            bucket["input_tokens"] += input_tokens
+            bucket["output_tokens"] += output_tokens
+            self._usage_input_tokens += input_tokens
+            self._usage_output_tokens += output_tokens
+
     def _select_records_locked(self, ids: list[str] | None) -> list[SubAgentRecord]:
         if not ids:
             return list(self._records.values())
@@ -612,7 +670,8 @@ async def _build_completion_report(
     settings: Settings,
     goal: str,
     final_output: str,
-) -> str:
+) -> tuple[str, int, int, str]:
+    report_model_name = settings.compact_model_name or settings.model_name
     fallback = _preview_text(final_output.strip(), _MAX_COMPLETION_REPORT_CHARS)
     if not fallback:
         fallback = "Task completed."
@@ -620,7 +679,7 @@ async def _build_completion_report(
         messages = await _aget_worker_messages(agent, thread_id)
         transcript = _render_history_for_report(messages)
         if not transcript:
-            return fallback
+            return fallback, 0, 0, report_model_name
 
         model = build_chat_model(settings, settings.compact_model_name)
         response = await asyncio.wait_for(
@@ -641,12 +700,18 @@ async def _build_completion_report(
             ),
             timeout=_REPORT_LLM_TIMEOUT_S,
         )
+        usage_input, usage_output = _token_usage(response)
         report = message_text(response.content, include_reasoning=False).strip()
         if not report:
-            return fallback
-        return _preview_text(report, _MAX_COMPLETION_REPORT_CHARS)
+            return fallback, usage_input, usage_output, report_model_name
+        return (
+            _preview_text(report, _MAX_COMPLETION_REPORT_CHARS),
+            usage_input,
+            usage_output,
+            report_model_name,
+        )
     except Exception:  # noqa: BLE001
-        return fallback
+        return fallback, 0, 0, report_model_name
 
 
 async def _aget_worker_messages(agent: Any, thread_id: str) -> list[Any]:
@@ -711,4 +776,54 @@ def _preview_text(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
+
+
+def _token_usage(message: Any) -> tuple[int, int]:
+    usage = getattr(message, "usage_metadata", None)
+    if not usage:
+        return 0, 0
+    if isinstance(usage, dict):
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        return max(input_tokens, 0), max(output_tokens, 0)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    return max(input_tokens, 0), max(output_tokens, 0)
+
+
+def _accumulate_usage_by_model(
+    usage_by_model: dict[str, dict[str, int]],
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    in_tokens = max(int(input_tokens or 0), 0)
+    out_tokens = max(int(output_tokens or 0), 0)
+    if not model_name or (in_tokens == 0 and out_tokens == 0):
+        return
+    bucket = usage_by_model.setdefault(
+        model_name,
+        {"input_tokens": 0, "output_tokens": 0},
+    )
+    bucket["input_tokens"] += in_tokens
+    bucket["output_tokens"] += out_tokens
+
+
+def _normalize_usage_by_model(raw_usage: Any) -> dict[str, dict[str, int]]:
+    if not isinstance(raw_usage, dict):
+        return {}
+    normalized: dict[str, dict[str, int]] = {}
+    for raw_model_name, raw_bucket in raw_usage.items():
+        model_name = str(raw_model_name).strip()
+        if not model_name or not isinstance(raw_bucket, dict):
+            continue
+        input_tokens = max(int(raw_bucket.get("input_tokens", 0) or 0), 0)
+        output_tokens = max(int(raw_bucket.get("output_tokens", 0) or 0), 0)
+        if input_tokens == 0 and output_tokens == 0:
+            continue
+        normalized[model_name] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+    return normalized
 
