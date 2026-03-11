@@ -50,6 +50,7 @@ Inside the TUI:
 - type in the bottom composer,
 - press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
 - use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
+- use `Ctrl+G` (or the `Agents` button) to toggle the Sub-Agents side panel,
 - press `Esc` twice quickly to interrupt the active session flow (current turn + active sub-agents),
 - use `/compact` to summarize and replace the oldest chat history once the model-visible history has more than 5 messages,
 - use `/enable sub-agent-mode` to enable experimental orchestrator/worker behavior,
@@ -70,6 +71,7 @@ Inside the TUI:
 - **Markdown and code rendering** tuned for readability in dark and light themes
 - **Word-level editing**: `Ctrl+Backspace` delete word, `Ctrl+Left/Right` word navigation
 - **Experimental sub-agent mode**: orchestrator can spawn up to 5 parallel workers, request revisions, interrupt, and terminate workers
+- **Sub-Agents side panel**: toggleable Active/Past worker cards with live activity previews and expandable details
 
 ## Experimental Sub-Agent Mode
 
@@ -81,7 +83,10 @@ Sub-agent mode is experimental and opt-in.
 - Successful `/subagent` launches automatically trigger an orchestrator follow-up response that stays open until active workers finish.
 - Workers run in isolation and do not communicate with each other.
 - Max active workers is enforced by `MAX_SUB_AGENTS` and capped at `5`.
-- Active worker progress is shown inline in agent bubbles as `Agent #...` status lines.
+- Use `Ctrl+G` or the `Agents` button to open/close the side panel.
+- `Active Sub-Agents` always shows currently running workers (or an explicit empty state).
+- `Past Sub-Agents` retains completed/failed/terminated/stuck workers until dismissed.
+- Worker cards show goal + current activity in compact form, support expansion for details, and display `Agent de-spawned` after terminal states.
 - Orchestrator receives a live worker snapshot on each model turn (no explicit status-tool call required).
 - Worker report payloads are bounded to reduce context growth.
 
@@ -104,7 +109,7 @@ Sub-agent mode is experimental and opt-in.
 
 - The app is turn-based for normal chat.
 - If the orchestrator has active workers during a response, that same response stays open until all workers are done.
-- Live worker status lines continue updating in the bubble while the orchestrator is waiting.
+- Live worker status updates are continuously reflected in the Sub-Agents side panel.
 - Once workers finish, the orchestrator continues and emits the completion update without requiring a manual poll message.
 
 ### Detailed Report

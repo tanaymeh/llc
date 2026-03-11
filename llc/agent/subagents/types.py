@@ -36,6 +36,9 @@ class SubAgentRecord:
     completion_report: str = ""
     error: str = ""
     latest_report: str = ""
+    current_activity: str = "Queued"
+    activity_detail: str = ""
+    last_tool_name: str = ""
     tool_calls: int = 0
     output_chars: int = 0
     started_at: float = 0.0

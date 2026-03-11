@@ -5,11 +5,19 @@ from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Input, Markdown, OptionList, Static, TextArea
+from textual.widgets import Button, Collapsible, Input, Markdown, OptionList, Static, TextArea
 
 from llc.models import AvailableModel
+
+
+def _single_line_preview(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 3, 0)] + "..."
 
 
 class ModelPickerScreen(ModalScreen[str | None]):
@@ -169,3 +177,118 @@ class ComposerInput(TextArea):
             show=False,
         ),
     ]
+
+
+class SubAgentCard(Vertical):
+    _ACTIVE_STATUSES = {"running", "restarting", "terminating"}
+    class Dismissed(Message):
+        def __init__(self, subagent_id: str) -> None:
+            super().__init__()
+            self.subagent_id = subagent_id
+
+    _STATUS_CLASSES = {
+        "status-running",
+        "status-restarting",
+        "status-terminating",
+        "status-completed",
+        "status-failed",
+        "status-terminated",
+        "status-stuck",
+    }
+    _ACCENT_CLASSES = {
+        "accent-a",
+        "accent-b",
+        "accent-c",
+        "accent-d",
+        "accent-e",
+        "accent-f",
+    }
+
+    def __init__(self, subagent_id: str, snapshot: dict[str, object]) -> None:
+        super().__init__(classes="subagent-card")
+        self.subagent_id = subagent_id
+        self._snapshot = dict(snapshot)
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="subagent-card-topbar"):
+            yield Static("", classes="subagent-card-summary")
+            yield Button("Close", classes="subagent-card-dismiss", variant="default")
+        with Collapsible(
+            title="Details",
+            collapsed=True,
+            classes="subagent-card-details-collapsible",
+        ):
+            yield Static("", classes="subagent-card-details")
+
+    def on_mount(self) -> None:
+        self.update_from_snapshot(self._snapshot)
+
+    @on(Button.Pressed, ".subagent-card-dismiss")
+    def _on_dismiss(self, _: Button.Pressed) -> None:
+        self.post_message(self.Dismissed(self.subagent_id))
+
+    def update_from_snapshot(self, snapshot: dict[str, object]) -> None:
+        self._snapshot = dict(snapshot)
+        status = str(snapshot.get("status", "unknown")).strip().lower() or "unknown"
+        goal = str(snapshot.get("goal", "")).strip()
+        current_activity = str(snapshot.get("current_activity", "")).strip()
+        activity_detail = str(snapshot.get("activity_detail", "")).strip()
+        latest_report = str(snapshot.get("latest_report", "")).strip()
+        final_result = str(snapshot.get("final_result", "")).strip()
+        error = str(snapshot.get("error", "")).strip()
+        stop_reason = str(snapshot.get("stop_reason", "")).strip()
+        tool_calls = int(snapshot.get("tool_calls", 0) or 0)
+        output_chars = int(snapshot.get("output_chars", 0) or 0)
+        attempt = int(snapshot.get("attempt", 1) or 1)
+        short_id = self.subagent_id.removeprefix("subagent-")
+
+        activity_text = current_activity or latest_report or status
+        summary_goal = _single_line_preview(goal or "No goal provided.", 52)
+        summary_activity = _single_line_preview(activity_text, 42)
+        summary_text = (
+            f"Agent {short_id}\n"
+            f"Goal: {summary_goal}\n"
+            f"Now: {summary_activity}"
+        )
+        self.query_one(".subagent-card-summary", Static).update(summary_text)
+
+        details_lines = [
+            f"ID: {self.subagent_id}",
+            f"Status: {status}",
+            f"Attempt: {attempt}",
+            f"Goal: {goal or 'No goal provided.'}",
+            f"Now: {activity_text or 'Working'}",
+        ]
+        if activity_detail:
+            details_lines.append(f"Detail: {activity_detail}")
+        details_lines.append(f"Tool calls: {tool_calls}")
+        details_lines.append(f"Output chars: {output_chars}")
+        if latest_report:
+            details_lines.append(f"Latest report: {latest_report}")
+        if final_result:
+            details_lines.append(f"Final result: {final_result}")
+        if error:
+            details_lines.append(f"Error: {error}")
+        if stop_reason:
+            details_lines.append(f"Stop reason: {stop_reason}")
+        self.query_one(".subagent-card-details", Static).update("\n".join(details_lines))
+
+        card_title = f"{short_id} | {summary_activity or 'Working'}"
+        self.query_one(Collapsible).title = card_title
+        self.query_one(".subagent-card-dismiss", Button).disabled = (
+            status in self._ACTIVE_STATUSES
+        )
+
+        self._apply_status_class(status)
+        self._apply_accent_class()
+
+    def _apply_status_class(self, status: str) -> None:
+        for class_name in self._STATUS_CLASSES:
+            self.remove_class(class_name)
+        self.add_class(f"status-{status}")
+
+    def _apply_accent_class(self) -> None:
+        for class_name in self._ACCENT_CLASSES:
+            self.remove_class(class_name)
+        idx = sum(ord(ch) for ch in self.subagent_id) % 6
+        self.add_class(("accent-a", "accent-b", "accent-c", "accent-d", "accent-e", "accent-f")[idx])

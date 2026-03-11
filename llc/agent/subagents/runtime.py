@@ -27,6 +27,7 @@ _MAX_REPORT_INPUT_FINAL_CHARS = 2400
 _MAX_COMPLETION_REPORT_CHARS = 900
 _REPORT_LLM_TIMEOUT_S = 8.0
 _MAX_REPORT_WORKERS = 8
+_MAX_ACTIVITY_PREVIEW_CHARS = 80
 _SUBAGENT_REPORT_PROMPT = (
     "You are writing a concise, information-rich execution report for a completed coding task.\n"
     "Return 4 short sections using plain text headings:\n"
@@ -122,10 +123,18 @@ class SubAgentRuntime:
             snapshot["ok"] = True
             return snapshot
 
-    def get_subagent_report(self, ids: list[str] | None = None) -> dict[str, Any]:
+    def get_subagent_report(
+        self,
+        ids: list[str] | None = None,
+        *,
+        include_all: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             self._refresh_stuck_locked()
-            selected = self._select_records_for_report_locked(ids)
+            selected = self._select_records_for_report_locked(
+                ids,
+                include_all=include_all,
+            )
             workers = [self._record_snapshot_locked(record) for record in selected]
             return {
                 "ok": True,
@@ -205,6 +214,11 @@ class SubAgentRuntime:
                 record.status = "restarting"
                 record.stop_reason = "revision_requested"
                 record.latest_report = "Revision requested. Restarting with new guidance."
+                record.current_activity = "Restarting with feedback"
+                record.activity_detail = _preview_text(
+                    clean_feedback,
+                    _MAX_REPORT_PREVIEW_CHARS,
+                )
                 record.updated_at = time.time()
                 record.stop_event.set()
             else:
@@ -249,6 +263,12 @@ class SubAgentRuntime:
                     f"terminated:{reason.strip()}" if reason.strip() else "terminated"
                 )
                 record.latest_report = "Termination requested."
+                record.current_activity = "Terminating"
+                if reason.strip():
+                    record.activity_detail = _preview_text(
+                        reason.strip(),
+                        _MAX_REPORT_PREVIEW_CHARS,
+                    )
                 record.updated_at = time.time()
                 record.stop_event.set()
             else:
@@ -258,6 +278,8 @@ class SubAgentRuntime:
                     f"terminated:{reason.strip()}" if reason.strip() else "terminated"
                 )
                 record.latest_report = "Terminated."
+                record.current_activity = "Agent de-spawned"
+                record.activity_detail = "Terminated."
                 record.updated_at = time.time()
 
             snapshot = self._record_snapshot_locked(record)
@@ -271,6 +293,9 @@ class SubAgentRuntime:
         record.status = "running"
         record.completion_report = ""
         record.latest_report = "Running."
+        record.current_activity = "Running"
+        record.activity_detail = "Worker started."
+        record.last_tool_name = ""
         now = time.time()
         record.started_at = now
         record.last_activity_at = now
@@ -328,6 +353,9 @@ class SubAgentRuntime:
         final_parts: list[str] = []
         fallback_text = ""
         usage_by_model: dict[str, dict[str, int]] = {}
+        last_tool_name = ""
+        current_activity = "Running"
+        activity_detail = "Worker started."
 
         try:
             async for mode, chunk in agent.astream(
@@ -355,7 +383,14 @@ class SubAgentRuntime:
                         for message in node_update.get("messages", []):
                             if not isinstance(message, AIMessage):
                                 continue
-                            tool_calls += len(getattr(message, "tool_calls", None) or [])
+                            tool_calls_batch = getattr(message, "tool_calls", None) or []
+                            tool_calls += len(tool_calls_batch)
+                            if tool_calls_batch:
+                                raw_tool_name = tool_calls_batch[-1].get("name", "")
+                                if isinstance(raw_tool_name, str) and raw_tool_name.strip():
+                                    last_tool_name = raw_tool_name.strip()
+                                    current_activity = _activity_from_tool_name(last_tool_name)
+                                    activity_detail = f"Using {last_tool_name}."
                             usage_input, usage_output = _token_usage(message)
                             _accumulate_usage_by_model(
                                 usage_by_model,
@@ -366,6 +401,12 @@ class SubAgentRuntime:
                             maybe_text = message_text(message.content)
                             if maybe_text:
                                 fallback_text = maybe_text
+                                if not tool_calls_batch:
+                                    current_activity = "Analyzing task"
+                                    activity_detail = _preview_text(
+                                        maybe_text,
+                                        _MAX_REPORT_PREVIEW_CHARS,
+                                    )
 
                 now_monotonic = time.monotonic()
                 if now_monotonic >= next_report_at:
@@ -378,6 +419,9 @@ class SubAgentRuntime:
                             f"Running attempt {attempt}: "
                             f"tool_calls={tool_calls}, output_chars={output_chars}."
                         ),
+                        activity=current_activity,
+                        activity_detail=activity_detail,
+                        last_tool_name=last_tool_name,
                     )
                     next_report_at = now_monotonic + report_interval
                 else:
@@ -386,6 +430,9 @@ class SubAgentRuntime:
                         attempt,
                         tool_calls,
                         output_chars,
+                        activity=current_activity,
+                        activity_detail=activity_detail,
+                        last_tool_name=last_tool_name,
                     )
         except _StopRequested as exc:
             status = "stuck" if exc.reason == "max_runtime_exceeded" else "terminated"
@@ -412,6 +459,16 @@ class SubAgentRuntime:
             final_output = (
                 final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
             )
+        self._update_progress(
+            subagent_id,
+            attempt,
+            tool_calls,
+            output_chars,
+            report="Generating completion report.",
+            activity="Generating report",
+            activity_detail="Summarizing sub-agent output.",
+            last_tool_name=last_tool_name,
+        )
         (
             completion_report,
             report_input_tokens,
@@ -456,6 +513,9 @@ class SubAgentRuntime:
         output_chars: int,
         *,
         report: str = "",
+        activity: str = "",
+        activity_detail: str = "",
+        last_tool_name: str = "",
     ) -> None:
         with self._lock:
             record = self._records.get(subagent_id)
@@ -468,6 +528,21 @@ class SubAgentRuntime:
             record.output_chars = output_chars
             if report:
                 record.latest_report = report
+            if activity:
+                record.current_activity = _preview_text(
+                    activity,
+                    _MAX_ACTIVITY_PREVIEW_CHARS,
+                )
+            if activity_detail:
+                record.activity_detail = _preview_text(
+                    activity_detail,
+                    _MAX_REPORT_PREVIEW_CHARS,
+                )
+            if last_tool_name:
+                record.last_tool_name = _preview_text(
+                    last_tool_name,
+                    _MAX_ACTIVITY_PREVIEW_CHARS,
+                )
 
     def _on_worker_done(
         self,
@@ -504,12 +579,20 @@ class SubAgentRuntime:
 
             if record.status == "completed":
                 record.latest_report = "Completed."
+                record.activity_detail = "Completed successfully."
             elif record.status == "failed":
                 record.latest_report = f"Failed: {record.error or 'unknown error'}"
+                record.activity_detail = _preview_text(
+                    record.error or "unknown error",
+                    _MAX_REPORT_PREVIEW_CHARS,
+                )
             elif record.status == "stuck":
                 record.latest_report = "Marked stuck and stopped due to runtime limit."
+                record.activity_detail = "Stopped after runtime limit."
             else:
                 record.latest_report = "Stopped."
+                record.activity_detail = "Stopped before completion."
+            record.current_activity = "Agent de-spawned"
 
     def _restart_with_feedback_locked(self, record: SubAgentRecord) -> None:
         feedback = "\n".join(item.strip() for item in record.pending_feedback if item.strip())
@@ -523,6 +606,10 @@ class SubAgentRuntime:
         record.completion_report = ""
         record.finished_at = 0.0
         record.latest_report = "Restarting with feedback."
+        record.current_activity = "Restarting with feedback"
+        if feedback:
+            record.activity_detail = _preview_text(feedback, _MAX_REPORT_PREVIEW_CHARS)
+        record.last_tool_name = ""
         self._submit_locked(record)
 
     def _refresh_stuck_locked(self) -> None:
@@ -538,24 +625,55 @@ class SubAgentRuntime:
             record.status = "terminating"
             record.stop_reason = "max_runtime_exceeded"
             record.latest_report = "Runtime limit exceeded. Stopping."
+            record.current_activity = "Terminating"
+            record.activity_detail = "Runtime limit exceeded."
             record.updated_at = now
             record.stop_event.set()
 
     def _record_snapshot_locked(self, record: SubAgentRecord) -> dict[str, Any]:
         goal = _preview_text(record.base_task, _MAX_TASK_PREVIEW_CHARS)
+        current_task = _preview_text(record.task, _MAX_TASK_PREVIEW_CHARS)
+        if record.status in ACTIVE_STATUSES:
+            current_activity = record.current_activity or "Running"
+        else:
+            current_activity = "Agent de-spawned"
+        activity_detail = record.activity_detail or record.latest_report
         snapshot: dict[str, Any] = {
             "id": record.id,
             "status": record.status,
             "attempt": record.attempt,
+            "name": record.name,
+            "source": record.source,
             "goal": goal,
             "task": goal,
+            "current_task": current_task,
+            "current_activity": _preview_text(
+                current_activity,
+                _MAX_ACTIVITY_PREVIEW_CHARS,
+            ),
+            "activity_detail": _preview_text(
+                activity_detail,
+                _MAX_REPORT_PREVIEW_CHARS,
+            ),
+            "last_tool_name": _preview_text(
+                record.last_tool_name,
+                _MAX_ACTIVITY_PREVIEW_CHARS,
+            ),
+            "tool_calls": max(int(record.tool_calls or 0), 0),
+            "output_chars": max(int(record.output_chars or 0), 0),
+            "created_at": float(record.created_at or 0),
+            "updated_at": float(record.updated_at or 0),
+            "started_at": float(record.started_at or 0),
+            "finished_at": float(record.finished_at or 0),
         }
 
+        latest_report = _preview_text(record.latest_report, _MAX_REPORT_PREVIEW_CHARS)
+        if latest_report:
+            snapshot["latest_report"] = latest_report
+
         if record.status in ACTIVE_STATUSES:
-            progress = _preview_text(record.latest_report, _MAX_REPORT_PREVIEW_CHARS)
-            if progress:
-                snapshot["progress"] = progress
-                snapshot["latest_report"] = progress
+            if latest_report:
+                snapshot["progress"] = latest_report
             return snapshot
 
         if record.status == "completed":
@@ -582,10 +700,8 @@ class SubAgentRuntime:
                 record.stop_reason,
                 _MAX_ERROR_PREVIEW_CHARS,
             )
-        progress = _preview_text(record.latest_report, _MAX_REPORT_PREVIEW_CHARS)
-        if progress:
-            snapshot["progress"] = progress
-            snapshot["latest_report"] = progress
+        if latest_report:
+            snapshot["progress"] = latest_report
         return snapshot
 
     def _active_count_locked(self) -> int:
@@ -619,9 +735,14 @@ class SubAgentRuntime:
     def _select_records_for_report_locked(
         self,
         ids: list[str] | None,
+        *,
+        include_all: bool = False,
     ) -> list[SubAgentRecord]:
         selected = self._select_records_locked(ids)
         if ids is not None:
+            return selected
+        if include_all:
+            selected.sort(key=lambda record: record.created_at)
             return selected
 
         active = [record for record in selected if record.status in ACTIVE_STATUSES]
@@ -776,6 +897,25 @@ def _preview_text(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
+
+
+def _activity_from_tool_name(tool_name: str) -> str:
+    normalized = tool_name.strip().lower()
+    if not normalized:
+        return "Working"
+    if normalized in {"edit", "multiedit", "write"}:
+        return "Writing code"
+    if normalized in {"websearch", "webfetch"}:
+        return "Searching web"
+    if normalized in {"grep", "glob", "code_grep", "read", "ls"}:
+        return "Searching codebase"
+    if normalized == "bash":
+        return "Running shell commands"
+    if normalized == "showdiff":
+        return "Reviewing diffs"
+    if normalized == "todowrite":
+        return "Updating plan"
+    return "Working"
 
 
 def _token_usage(message: Any) -> tuple[int, int]:

@@ -11,7 +11,7 @@ The feature set is experimental and currently opt-in via `/enable sub-agent-mode
 - Add orchestrator-managed worker execution with parallel worker tasks.
 - Keep workers isolated and independent.
 - Support manual worker spawn with strict command syntax.
-- Provide worker progress visibility in the TUI.
+- Provide worker progress visibility in a dedicated TUI side panel.
 - Bound worker reporting payloads to protect context length.
 - Preserve orchestrator ability to work directly (delegation is optional).
 
@@ -36,7 +36,7 @@ Core components:
 - `llc/ui/repl.py`
   - initializes session runtime
   - builds orchestrator/worker graphs
-  - renders live worker status lines in bubble UI
+  - renders a toggleable side panel with active/past worker cards
 - `llc/agent/graph.py`
   - role-aware graph construction (`default`, `orchestrator`, `subagent`)
   - injects live worker snapshot into orchestrator system prompt per turn
@@ -87,9 +87,10 @@ Implemented safeguards:
 
 ### TUI Progress Rendering
 
-- Active worker lines are shown inside agent bubbles:
-  - `↳ Agent #1 (...) running: ...`
-  - styled distinctly from tool status lines
+- Side panel is toggled with `Ctrl+G` or the `Agents` button.
+- `Active Sub-Agents` lists running/restarting/terminating workers, or an explicit empty-state line when none are active.
+- `Past Sub-Agents` retains terminal workers (`completed`, `failed`, `terminated`, `stuck`) until user dismissal.
+- Each worker card shows concise goal/activity preview, supports expand-for-details, and marks terminal states as `Agent de-spawned`.
 - Banner token/cost totals include sub-agent token usage (worker execution plus completion-report calls), when pricing data is available.
 
 ### Session Interrupt Hotkey
@@ -104,7 +105,7 @@ Implemented safeguards:
 
 - The app remains turn-based for normal chat.
 - If the orchestrator has active workers during a response, the same orchestrator response is kept open until workers complete.
-- Live worker status lines continue updating in the TUI while the orchestrator is waiting.
+- Live worker status cards continue updating in the side panel while the orchestrator is waiting.
 - The orchestrator resumes and emits completion output without requiring a manual poll turn.
 
 ## Sub-Agent Runtime Lifecycle

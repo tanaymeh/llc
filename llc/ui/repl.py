@@ -30,7 +30,7 @@ from llc.ui.display import (
     message_text,
 )
 from llc.ui.rendering import format_duration, render_user_facing_tool_output
-from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen
+from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen, SubAgentCard
 
 LLC_LOGO = r"""  ██╗     ██╗      ██████╗
   ██║     ██║     ██╔════╝
@@ -46,6 +46,8 @@ _MAX_AGENT_STATUS_LINES = 5
 _WORKER_TASK_PREVIEW_CHARS = 56
 _ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
 _DOUBLE_ESCAPE_WINDOW_S = 0.6
+_SUBAGENT_PANEL_EMPTY_ACTIVE = "No sub-agents are currently running."
+_SUBAGENT_PANEL_EMPTY_PAST = "No past sub-agents yet."
 _SESSION_INTERRUPT_MESSAGE = "Session Interrupted, what should be done differently?"
 _MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
     "A manual /subagent launch just occurred.\n"
@@ -161,6 +163,7 @@ class Repl(App[None]):
             show=False,
             priority=True,
         ),
+        Binding("ctrl+g", "toggle_agents_panel", "Agents", priority=True),
         Binding("escape", "register_escape_interrupt", show=False, priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
@@ -182,13 +185,28 @@ class Repl(App[None]):
         self._active_turn_worker: Worker[None] | None = None
         self._last_escape_pressed_at: float = 0.0
         self._interrupt_in_progress = False
+        self._subagent_cards: dict[str, SubAgentCard] = {}
+        self._dismissed_subagent_ids: set[str] = set()
+        self._agents_panel_visible = False
+        self._subagent_panel_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
+        with Vertical(id="agents_panel"):
+            yield Static("Sub-Agents", id="agents_panel_title")
+            with VerticalScroll(id="agents_panel_scroll"):
+                with Vertical(id="agents_panel_column"):
+                    yield Static("Active Sub-Agents", classes="agents-section-title")
+                    yield Static(_SUBAGENT_PANEL_EMPTY_ACTIVE, id="agents_active_empty")
+                    yield Vertical(id="agents_active_column")
+                    yield Static("Past Sub-Agents", classes="agents-section-title")
+                    yield Static(_SUBAGENT_PANEL_EMPTY_PAST, id="agents_past_empty")
+                    yield Vertical(id="agents_past_column")
         with VerticalScroll(id="chat_scroll"):
             yield Vertical(id="chat_column")
         with Horizontal(id="composer"):
             yield ComposerInput(id="composer_input")
+            yield Button("Agents", id="agents_button")
             yield Button("Send", id="send_button", variant="primary")
 
     async def on_mount(self) -> None:
@@ -196,6 +214,7 @@ class Repl(App[None]):
         self._chat_scroll().anchor()
         self._composer_input().focus()
         self._configure_composer()
+        self._set_agents_panel_visible(False)
         self._refresh_banner()
 
         self._subagent_runtime = SubAgentRuntime(
@@ -227,6 +246,7 @@ class Repl(App[None]):
             thread_id=self._agent_thread_id,
             subagent_runtime=self._subagent_runtime,
         )
+        self._start_subagent_panel_polling()
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
@@ -241,6 +261,7 @@ class Repl(App[None]):
 
     def _configure_layout(self) -> None:
         self.query_one("#banner", Static).styles.dock = "top"
+        self.query_one("#agents_panel", Vertical).styles.dock = "right"
         self.query_one("#composer", Horizontal).styles.dock = "bottom"
         self._chat_scroll().styles.height = "1fr"
 
@@ -253,8 +274,102 @@ class Repl(App[None]):
     def _composer_input(self) -> ComposerInput:
         return self.query_one("#composer_input", ComposerInput)
 
+    def _agents_panel(self) -> Vertical:
+        return self.query_one("#agents_panel", Vertical)
+
+    def _agents_active_column(self) -> Vertical:
+        return self.query_one("#agents_active_column", Vertical)
+
+    def _agents_past_column(self) -> Vertical:
+        return self.query_one("#agents_past_column", Vertical)
+
+    def _agents_active_empty(self) -> Static:
+        return self.query_one("#agents_active_empty", Static)
+
+    def _agents_past_empty(self) -> Static:
+        return self.query_one("#agents_past_empty", Static)
+
     def _set_send_enabled(self, enabled: bool) -> None:
         self.query_one("#send_button", Button).disabled = not enabled
+
+    def _set_agents_panel_visible(self, visible: bool) -> None:
+        self._agents_panel_visible = visible
+        panel = self._agents_panel()
+        panel.display = visible
+        button = self.query_one("#agents_button", Button)
+        button.variant = "primary" if visible else "default"
+
+    def _start_subagent_panel_polling(self) -> None:
+        task = self._subagent_panel_task
+        if task is not None and not task.done():
+            return
+        self._subagent_panel_task = asyncio.create_task(self._poll_subagent_panel())
+
+    async def _poll_subagent_panel(self) -> None:
+        try:
+            while True:
+                report: dict[str, Any] = {"workers": []}
+                try:
+                    if self._ctx is not None and self._ctx.subagent_runtime is not None:
+                        report = self._ctx.subagent_runtime.get_subagent_report(
+                            include_all=True,
+                        )
+                except Exception:  # noqa: BLE001
+                    report = {"workers": []}
+                await self._sync_subagent_panel(report)
+                await asyncio.sleep(_AGENT_STATUS_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+
+    async def _sync_subagent_panel(self, report: dict[str, Any]) -> None:
+        workers_raw = report.get("workers", [])
+        workers = [worker for worker in workers_raw if isinstance(worker, dict)]
+        seen_ids: set[str] = set()
+        active_count = 0
+        past_count = 0
+
+        for worker in workers:
+            subagent_id = str(worker.get("id", "")).strip()
+            if not subagent_id:
+                continue
+            if subagent_id in self._dismissed_subagent_ids:
+                continue
+            seen_ids.add(subagent_id)
+            status = str(worker.get("status", "")).strip()
+            is_active = status in _ACTIVE_WORKER_STATUSES
+            target_column = (
+                self._agents_active_column() if is_active else self._agents_past_column()
+            )
+            if is_active:
+                active_count += 1
+            else:
+                past_count += 1
+
+            card = self._subagent_cards.get(subagent_id)
+            if card is None:
+                card = SubAgentCard(subagent_id, worker)
+                self._subagent_cards[subagent_id] = card
+                await target_column.mount(card)
+                continue
+
+            card.update_from_snapshot(worker)
+            if card.parent is not target_column:
+                if card.parent is not None:
+                    await card.remove()
+                await target_column.mount(card)
+
+        stale_ids = [
+            subagent_id
+            for subagent_id in self._subagent_cards
+            if subagent_id not in seen_ids
+        ]
+        for subagent_id in stale_ids:
+            card = self._subagent_cards.pop(subagent_id)
+            if card.parent is not None:
+                await card.remove()
+
+        self._agents_active_empty().display = active_count == 0
+        self._agents_past_empty().display = past_count == 0
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -324,6 +439,10 @@ class Repl(App[None]):
         return input_tokens, output_tokens, cost
 
     def on_unmount(self) -> None:
+        task = self._subagent_panel_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._subagent_panel_task = None
         if self._subagent_runtime is not None:
             self._subagent_runtime.shutdown()
 
@@ -348,6 +467,23 @@ class Repl(App[None]):
     def _on_send_button(self, _: Button.Pressed) -> None:
         self._do_send()
 
+    @on(Button.Pressed, "#agents_button")
+    def _on_agents_button(self, _: Button.Pressed) -> None:
+        self.action_toggle_agents_panel()
+
+    @on(SubAgentCard.Dismissed)
+    async def _on_subagent_card_dismissed(
+        self,
+        event: SubAgentCard.Dismissed,
+    ) -> None:
+        subagent_id = event.subagent_id
+        self._dismissed_subagent_ids.add(subagent_id)
+        card = self._subagent_cards.pop(subagent_id, None)
+        if card is not None and card.parent is not None:
+            await card.remove()
+        self._agents_active_empty().display = len(self._agents_active_column().children) == 0
+        self._agents_past_empty().display = len(self._agents_past_column().children) == 0
+
     def _composer_is_focused(self) -> bool:
         focused = self.focused
         return focused is self._composer_input()
@@ -363,6 +499,9 @@ class Repl(App[None]):
         if not self._composer_is_focused():
             raise SkipAction()
         self._do_send()
+
+    def action_toggle_agents_panel(self) -> None:
+        self._set_agents_panel_visible(not self._agents_panel_visible)
 
     def action_register_escape_interrupt(self) -> None:
         now = time.monotonic()
