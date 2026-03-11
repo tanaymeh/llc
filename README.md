@@ -77,6 +77,7 @@ Sub-agent mode is experimental and opt-in.
 - Enable with `/enable sub-agent-mode` (or set `SUB_AGENT_MODE_ENABLED=true` before launch).
 - The orchestrator can still execute tasks directly; delegation is advised only for complex, cleanly separable work.
 - Manual worker spawn syntax is strict: `/subagent {TASK}`.
+- Successful `/subagent` launches automatically trigger an orchestrator follow-up response that stays open until active workers finish.
 - Workers run in isolation and do not communicate with each other.
 - Max active workers is enforced by `MAX_SUB_AGENTS` and capped at `5`.
 - Active worker progress is shown inline in agent bubbles as `Agent #...` status lines.
@@ -100,9 +101,10 @@ Sub-agent mode is experimental and opt-in.
 
 ### Current Interaction Model
 
-- The app is still turn-based.
-- If the orchestrator says it will report back later, you still need to send another user message to trigger the next response.
-- There is no autonomous push/notification message after workers complete (yet).
+- The app is turn-based for normal chat.
+- If the orchestrator has active workers during a response, that same response stays open until all workers are done.
+- Live worker status lines continue updating in the bubble while the orchestrator is waiting.
+- Once workers finish, the orchestrator continues and emits the completion update without requiring a manual poll message.
 
 ### Detailed Report
 

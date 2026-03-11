@@ -17,6 +17,8 @@ _ORCHESTRATOR_MODE_APPEND = (
     "You may complete work yourself.\n"
     "Prefer delegation only when work is complex and cleanly divisible.\n"
     "Use running worker reports before intervening.\n"
+    "If active workers exist, keep this response open until they finish.\n"
+    "Do not ask the user to poll for worker updates.\n"
     "Always use the live worker snapshot in the system prompt for worker status.\n"
     "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck."
 )
@@ -85,6 +87,26 @@ def _runtime_status_provider(
     return provider
 
 
+def _active_workers_provider(role: AgentRole, subagent_runtime: object | None):
+    if role != "orchestrator" or subagent_runtime is None:
+        return None
+    get_report = getattr(subagent_runtime, "get_subagent_report", None)
+    if not callable(get_report):
+        return None
+
+    def provider() -> bool:
+        try:
+            report = get_report()
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            return int(report.get("active_count", 0) or 0) > 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    return provider
+
+
 def build_agent_graph(
     settings: Settings,
     *,
@@ -105,6 +127,7 @@ def build_agent_graph(
         subagent_runtime,
         settings.max_sub_agents,
     )
+    active_workers_provider = _active_workers_provider(role, subagent_runtime)
 
     builder = StateGraph(AgentState)
     builder.add_node(
@@ -113,6 +136,8 @@ def build_agent_graph(
             model_with_tools,
             system_prompt,
             runtime_status_provider=runtime_status_provider,
+            auto_wait_provider=active_workers_provider,
+            auto_wait_tool_name="WaitSubagents",
         ),
     )
     builder.add_node("tools", make_tool_node(tools_by_name))

@@ -58,7 +58,8 @@ class SubagentCommand(Command):
             message=(
                 f"Spawned `{subagent_id}` (`{status}`). "
                 f"Active workers: {active}/{max_workers}."
-            )
+            ),
+            data={"spawned_subagent_id": subagent_id},
         )
 
 

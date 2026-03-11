@@ -83,6 +83,7 @@ Implemented safeguards:
   - validates non-empty payload
   - launches one worker per command
   - enforces max active workers
+  - auto-starts an orchestrator follow-up response after successful launch, so worker completion does not require a manual poll turn
 
 ### TUI Progress Rendering
 
@@ -92,9 +93,10 @@ Implemented safeguards:
 
 ### Turn Model
 
-- The app remains turn-based.
-- Worker completion does not currently auto-push a new message.
-- User must send another turn to receive updated orchestrator output.
+- The app remains turn-based for normal chat.
+- If the orchestrator has active workers during a response, the same orchestrator response is kept open until workers complete.
+- Live worker status lines continue updating in the TUI while the orchestrator is waiting.
+- The orchestrator resumes and emits completion output without requiring a manual poll turn.
 
 ## Sub-Agent Runtime Lifecycle
 
@@ -171,7 +173,6 @@ From `.env`:
 
 ## Current Limitations
 
-- No autonomous background push message to user when workers finish.
 - No persistent worker state across app restarts.
 - No worker-to-worker collaboration layer yet.
 - Completion report hook adds one extra model call per successful worker completion.

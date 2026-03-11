@@ -9,9 +9,15 @@ if TYPE_CHECKING:
 
 
 class CommandResult:
-    def __init__(self, should_exit: bool = False, message: str | None = None) -> None:
+    def __init__(
+        self,
+        should_exit: bool = False,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         self.should_exit = should_exit
         self.message = message
+        self.data = data or {}
 
 
 class ReplContext:

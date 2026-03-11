@@ -44,6 +44,13 @@ _AGENT_STATUS_POLL_INTERVAL_S = 0.8
 _MAX_AGENT_STATUS_LINES = 5
 _WORKER_TASK_PREVIEW_CHARS = 56
 _ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
+_MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
+    "A manual /subagent launch just occurred.\n"
+    "Continue orchestration for all currently active workers.\n"
+    "Do not launch new workers unless explicitly required for safety.\n"
+    "Keep this response open until all workers complete.\n"
+    "Provide concise progress updates and then a final combined outcome."
+)
 
 
 def _single_line_preview(text: str, limit: int) -> str:
@@ -58,16 +65,19 @@ def _format_agent_status(report: dict[str, Any]) -> str:
     if not isinstance(workers, list):
         return ""
 
+    known_workers = [worker for worker in workers if isinstance(worker, dict)]
     active_workers = [
         worker
-        for worker in workers
-        if isinstance(worker, dict)
+        for worker in known_workers
         and str(worker.get("status", "")) in _ACTIVE_WORKER_STATUSES
     ]
     if not active_workers:
         return ""
 
-    lines: list[str] = []
+    inactive_count = max(len(known_workers) - len(active_workers), 0)
+    lines: list[str] = [
+        f"  ↳ Workers: {len(active_workers)} active, {inactive_count} done/stopped"
+    ]
     for index, worker in enumerate(active_workers[:_MAX_AGENT_STATUS_LINES], start=1):
         raw_id = str(worker.get("id", f"agent-{index}"))
         short_id = raw_id.removeprefix("subagent-")
@@ -376,6 +386,27 @@ class Repl(App[None]):
                 result.message,
                 model_name=self._ctx.settings.model_name,
             )
+        spawned_subagent_id = str(result.data.get("spawned_subagent_id", "")).strip()
+        if (
+            spawned_subagent_id
+            and self._ctx.settings.sub_agent_mode_enabled
+            and self._ctx.subagent_runtime is not None
+        ):
+            report = self._ctx.subagent_runtime.get_subagent_report()
+            try:
+                active_count = int(report.get("active_count", 0) or 0)
+            except Exception:  # noqa: BLE001
+                active_count = 0
+            if active_count > 0:
+                followup_bubble = await self._append_message(
+                    "agent",
+                    "",
+                    model_name=self._ctx.settings.model_name,
+                )
+                await self._stream_agent_response(
+                    _MANUAL_SUBAGENT_FOLLOWUP_PROMPT,
+                    followup_bubble,
+                )
         self._refresh_banner()
         if result.should_exit:
             self.exit()
