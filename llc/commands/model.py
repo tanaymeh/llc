@@ -20,7 +20,14 @@ class ModelCommand(Command):
 
         try:
             new_settings = ctx.settings.model_copy(update={"model_name": model_name})
-            ctx.agent = build_agent_graph(new_settings)
+            role = "orchestrator" if new_settings.sub_agent_mode_enabled else "default"
+            if ctx.subagent_runtime is not None:
+                ctx.subagent_runtime.update_settings(new_settings)
+            ctx.agent = build_agent_graph(
+                new_settings,
+                role=role,
+                subagent_runtime=ctx.subagent_runtime,
+            )
             ctx.settings = new_settings
             return CommandResult(
                 message=f"Now using `{model_name}`."

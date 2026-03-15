@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 from typing import Any
@@ -12,13 +13,15 @@ from textual.actions import SkipAction
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.worker import Worker, WorkerState, get_current_worker
 from textual.widgets import Button, Markdown, Static
 
 from llc.agent import build_agent_graph
 from llc.commands import CommandRegistry, ReplContext
 from llc.config import Settings
 from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
-from llc.models import AvailableModel, fetch_models
+from llc.agent.subagents import SubAgentRuntime
+from llc.models import AvailableModel, fetch_models, get_model_pricing
 from llc.ui.display import (
     collect_new_user_facing_tool_results,
     collect_new_tool_calls,
@@ -27,7 +30,7 @@ from llc.ui.display import (
     message_text,
 )
 from llc.ui.rendering import format_duration, render_user_facing_tool_output
-from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen
+from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen, SubAgentCard
 
 LLC_LOGO = r"""  ██╗     ██╗      ██████╗
   ██║     ██║     ██╔════╝
@@ -38,6 +41,67 @@ LLC_LOGO = r"""  ██╗     ██╗      ██████╗
 
 _REASONING_TOKENS_PER_LINE = 20
 _REASONING_LINE_INTERVAL = 1.0
+_AGENT_STATUS_POLL_INTERVAL_S = 0.8
+_MAX_AGENT_STATUS_LINES = 5
+_WORKER_TASK_PREVIEW_CHARS = 56
+_ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
+_DOUBLE_ESCAPE_WINDOW_S = 0.6
+_SUBAGENT_PANEL_EMPTY_ACTIVE = "No sub-agents are currently running."
+_SUBAGENT_PANEL_EMPTY_PAST = "No past sub-agents yet."
+_SESSION_INTERRUPT_MESSAGE = "Session Interrupted, what should be done differently?"
+_MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
+    "A manual /subagent launch just occurred.\n"
+    "Continue orchestration for all currently active workers.\n"
+    "Do not launch new workers unless explicitly required for safety.\n"
+    "Keep this response open until all workers complete.\n"
+    "Provide concise progress updates and then a final combined outcome."
+)
+
+
+def _single_line_preview(text: str, limit: int) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _format_agent_status(report: dict[str, Any]) -> str:
+    workers = report.get("workers", [])
+    if not isinstance(workers, list):
+        return ""
+
+    known_workers = [worker for worker in workers if isinstance(worker, dict)]
+    active_workers = [
+        worker
+        for worker in known_workers
+        if str(worker.get("status", "")) in _ACTIVE_WORKER_STATUSES
+    ]
+    if not active_workers:
+        return ""
+
+    inactive_count = max(len(known_workers) - len(active_workers), 0)
+    lines: list[str] = [
+        f"  ↳ Workers: {len(active_workers)} active, {inactive_count} done/stopped"
+    ]
+    for index, worker in enumerate(active_workers[:_MAX_AGENT_STATUS_LINES], start=1):
+        raw_id = str(worker.get("id", f"agent-{index}"))
+        short_id = raw_id.removeprefix("subagent-")
+        status = str(worker.get("status", "running"))
+        task = _single_line_preview(
+            str(worker.get("task", "")),
+            _WORKER_TASK_PREVIEW_CHARS,
+        )
+        if not task:
+            task = _single_line_preview(
+                str(worker.get("latest_report", "working")),
+                _WORKER_TASK_PREVIEW_CHARS,
+            )
+        lines.append(f"  ↳ Agent #{index} ({short_id}) {status}: {task}")
+
+    remainder = len(active_workers) - _MAX_AGENT_STATUS_LINES
+    if remainder > 0:
+        lines.append(f"  ↳ +{remainder} more active agents")
+    return "\n".join(lines)
 
 
 class _ReasoningTracker:
@@ -99,6 +163,8 @@ class Repl(App[None]):
             show=False,
             priority=True,
         ),
+        Binding("ctrl+g", "toggle_agents_panel", "Agents", priority=True),
+        Binding("escape", "register_escape_interrupt", show=False, priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
@@ -115,13 +181,32 @@ class Repl(App[None]):
         self._turn_output = 0
         self._turn_text_len = 0
         self._busy = False
+        self._subagent_runtime: SubAgentRuntime | None = None
+        self._active_turn_worker: Worker[None] | None = None
+        self._last_escape_pressed_at: float = 0.0
+        self._interrupt_in_progress = False
+        self._subagent_cards: dict[str, SubAgentCard] = {}
+        self._dismissed_subagent_ids: set[str] = set()
+        self._agents_panel_visible = False
+        self._subagent_panel_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Static(id="banner")
+        with Vertical(id="agents_panel"):
+            yield Static("Sub-Agents", id="agents_panel_title")
+            with VerticalScroll(id="agents_panel_scroll"):
+                with Vertical(id="agents_panel_column"):
+                    yield Static("Active Sub-Agents", classes="agents-section-title")
+                    yield Static(_SUBAGENT_PANEL_EMPTY_ACTIVE, id="agents_active_empty")
+                    yield Vertical(id="agents_active_column")
+                    yield Static("Past Sub-Agents", classes="agents-section-title")
+                    yield Static(_SUBAGENT_PANEL_EMPTY_PAST, id="agents_past_empty")
+                    yield Vertical(id="agents_past_column")
         with VerticalScroll(id="chat_scroll"):
             yield Vertical(id="chat_column")
         with Horizontal(id="composer"):
             yield ComposerInput(id="composer_input")
+            yield Button("Agents", id="agents_button")
             yield Button("Send", id="send_button", variant="primary")
 
     async def on_mount(self) -> None:
@@ -129,10 +214,23 @@ class Repl(App[None]):
         self._chat_scroll().anchor()
         self._composer_input().focus()
         self._configure_composer()
+        self._set_agents_panel_visible(False)
         self._refresh_banner()
 
+        self._subagent_runtime = SubAgentRuntime(
+            self._settings,
+            build_subagent=lambda settings: build_agent_graph(
+                settings,
+                role="subagent",
+            ),
+        )
+        role = "orchestrator" if self._settings.sub_agent_mode_enabled else "default"
         try:
-            agent = build_agent_graph(self._settings)
+            agent = build_agent_graph(
+                self._settings,
+                role=role,
+                subagent_runtime=self._subagent_runtime,
+            )
         except Exception as exc:  # noqa: BLE001
             await self._append_system(
                 "Model initialization failed. "
@@ -146,7 +244,9 @@ class Repl(App[None]):
             settings=self._settings,
             agent=agent,
             thread_id=self._agent_thread_id,
+            subagent_runtime=self._subagent_runtime,
         )
+        self._start_subagent_panel_polling()
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
@@ -161,6 +261,7 @@ class Repl(App[None]):
 
     def _configure_layout(self) -> None:
         self.query_one("#banner", Static).styles.dock = "top"
+        self.query_one("#agents_panel", Vertical).styles.dock = "right"
         self.query_one("#composer", Horizontal).styles.dock = "bottom"
         self._chat_scroll().styles.height = "1fr"
 
@@ -173,8 +274,102 @@ class Repl(App[None]):
     def _composer_input(self) -> ComposerInput:
         return self.query_one("#composer_input", ComposerInput)
 
+    def _agents_panel(self) -> Vertical:
+        return self.query_one("#agents_panel", Vertical)
+
+    def _agents_active_column(self) -> Vertical:
+        return self.query_one("#agents_active_column", Vertical)
+
+    def _agents_past_column(self) -> Vertical:
+        return self.query_one("#agents_past_column", Vertical)
+
+    def _agents_active_empty(self) -> Static:
+        return self.query_one("#agents_active_empty", Static)
+
+    def _agents_past_empty(self) -> Static:
+        return self.query_one("#agents_past_empty", Static)
+
     def _set_send_enabled(self, enabled: bool) -> None:
         self.query_one("#send_button", Button).disabled = not enabled
+
+    def _set_agents_panel_visible(self, visible: bool) -> None:
+        self._agents_panel_visible = visible
+        panel = self._agents_panel()
+        panel.display = visible
+        button = self.query_one("#agents_button", Button)
+        button.variant = "primary" if visible else "default"
+
+    def _start_subagent_panel_polling(self) -> None:
+        task = self._subagent_panel_task
+        if task is not None and not task.done():
+            return
+        self._subagent_panel_task = asyncio.create_task(self._poll_subagent_panel())
+
+    async def _poll_subagent_panel(self) -> None:
+        try:
+            while True:
+                report: dict[str, Any] = {"workers": []}
+                try:
+                    if self._ctx is not None and self._ctx.subagent_runtime is not None:
+                        report = self._ctx.subagent_runtime.get_subagent_report(
+                            include_all=True,
+                        )
+                except Exception:  # noqa: BLE001
+                    report = {"workers": []}
+                await self._sync_subagent_panel(report)
+                await asyncio.sleep(_AGENT_STATUS_POLL_INTERVAL_S)
+        except asyncio.CancelledError:
+            return
+
+    async def _sync_subagent_panel(self, report: dict[str, Any]) -> None:
+        workers_raw = report.get("workers", [])
+        workers = [worker for worker in workers_raw if isinstance(worker, dict)]
+        seen_ids: set[str] = set()
+        active_count = 0
+        past_count = 0
+
+        for worker in workers:
+            subagent_id = str(worker.get("id", "")).strip()
+            if not subagent_id:
+                continue
+            if subagent_id in self._dismissed_subagent_ids:
+                continue
+            seen_ids.add(subagent_id)
+            status = str(worker.get("status", "")).strip()
+            is_active = status in _ACTIVE_WORKER_STATUSES
+            target_column = (
+                self._agents_active_column() if is_active else self._agents_past_column()
+            )
+            if is_active:
+                active_count += 1
+            else:
+                past_count += 1
+
+            card = self._subagent_cards.get(subagent_id)
+            if card is None:
+                card = SubAgentCard(subagent_id, worker)
+                self._subagent_cards[subagent_id] = card
+                await target_column.mount(card)
+                continue
+
+            card.update_from_snapshot(worker)
+            if card.parent is not target_column:
+                if card.parent is not None:
+                    await card.remove()
+                await target_column.mount(card)
+
+        stale_ids = [
+            subagent_id
+            for subagent_id in self._subagent_cards
+            if subagent_id not in seen_ids
+        ]
+        for subagent_id in stale_ids:
+            card = self._subagent_cards.pop(subagent_id)
+            if card.parent is not None:
+                await card.remove()
+
+        self._agents_active_empty().display = active_count == 0
+        self._agents_past_empty().display = past_count == 0
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
@@ -187,22 +382,69 @@ class Repl(App[None]):
 
     def _refresh_banner(self) -> None:
         model_name = self._current_model_name()
-        inp = self._token_hook.session_input
-        out = self._token_hook.session_output
+        subagent_in, subagent_out, subagent_cost = self._subagent_usage_snapshot()
+        inp = self._token_hook.session_input + subagent_in
+        out = self._token_hook.session_output + subagent_out
+        total_cost = self._token_hook.session_cost + subagent_cost
         banner = Text()
         banner.append(LLC_LOGO, style="bold cyan")
         banner.append("\n  Model: ", style="dim")
         banner.append(model_name, style="bold")
         banner.append("   |   ", style="dim")
         banner.append(f"Tokens: {inp:,} in / {out:,} out", style="dim")
-        if self._token_hook.session_cost > 0:
-            banner.append(f"   |   ${self._token_hook.session_cost:.4f}", style="dim")
+        if total_cost > 0:
+            banner.append(f"   |   ${total_cost:.4f}", style="dim")
         banner.append("\n  Type ", style="dim")
         banner.append("/help", style="bold")
         banner.append(" for commands. ", style="dim")
         banner.append("/model", style="bold")
         banner.append(" to switch models.", style="dim")
+        if self._ctx is not None and self._ctx.settings.sub_agent_mode_enabled:
+            banner.append("  ", style="dim")
+            banner.append("sub-agent mode: ", style="dim")
+            banner.append("ON", style="bold green")
         self.query_one("#banner", Static).update(banner)
+
+    def _subagent_usage_snapshot(self) -> tuple[int, int, float]:
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return 0, 0, 0.0
+        try:
+            usage = runtime.get_usage_totals()
+        except Exception:  # noqa: BLE001
+            return 0, 0, 0.0
+
+        input_tokens = int(usage.get("input_tokens", 0) or 0)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        input_tokens = max(input_tokens, 0)
+        output_tokens = max(output_tokens, 0)
+
+        by_model = usage.get("by_model", {})
+        if not isinstance(by_model, dict):
+            return input_tokens, output_tokens, 0.0
+
+        cost = 0.0
+        for raw_model_name, raw_bucket in by_model.items():
+            model_name = str(raw_model_name).strip()
+            if not model_name or not isinstance(raw_bucket, dict):
+                continue
+            model_input = max(int(raw_bucket.get("input_tokens", 0) or 0), 0)
+            model_output = max(int(raw_bucket.get("output_tokens", 0) or 0), 0)
+            if model_input == 0 and model_output == 0:
+                continue
+            pricing = get_model_pricing(self._available_models, model_name)
+            if pricing is None:
+                continue
+            cost += model_input * pricing[0] + model_output * pricing[1]
+        return input_tokens, output_tokens, cost
+
+    def on_unmount(self) -> None:
+        task = self._subagent_panel_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._subagent_panel_task = None
+        if self._subagent_runtime is not None:
+            self._subagent_runtime.shutdown()
 
     async def _append_message(
         self,
@@ -225,6 +467,23 @@ class Repl(App[None]):
     def _on_send_button(self, _: Button.Pressed) -> None:
         self._do_send()
 
+    @on(Button.Pressed, "#agents_button")
+    def _on_agents_button(self, _: Button.Pressed) -> None:
+        self.action_toggle_agents_panel()
+
+    @on(SubAgentCard.Dismissed)
+    async def _on_subagent_card_dismissed(
+        self,
+        event: SubAgentCard.Dismissed,
+    ) -> None:
+        subagent_id = event.subagent_id
+        self._dismissed_subagent_ids.add(subagent_id)
+        card = self._subagent_cards.pop(subagent_id, None)
+        if card is not None and card.parent is not None:
+            await card.remove()
+        self._agents_active_empty().display = len(self._agents_active_column().children) == 0
+        self._agents_past_empty().display = len(self._agents_past_column().children) == 0
+
     def _composer_is_focused(self) -> bool:
         focused = self.focused
         return focused is self._composer_input()
@@ -241,6 +500,27 @@ class Repl(App[None]):
             raise SkipAction()
         self._do_send()
 
+    def action_toggle_agents_panel(self) -> None:
+        self._set_agents_panel_visible(not self._agents_panel_visible)
+
+    def action_register_escape_interrupt(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_escape_pressed_at
+        self._last_escape_pressed_at = now
+        if elapsed > _DOUBLE_ESCAPE_WINDOW_S:
+            return
+        self._last_escape_pressed_at = 0.0
+        self._start_interrupt()
+
+    def _start_interrupt(self) -> None:
+        if self._interrupt_in_progress:
+            return
+        self._interrupt_in_progress = True
+        self._interrupt_session()
+
+    def _start_user_turn(self, user_input: str) -> None:
+        self._active_turn_worker = self._handle_user_turn(user_input)
+
     def _do_send(self) -> None:
         if self._busy or self._ctx is None:
             return
@@ -256,7 +536,7 @@ class Repl(App[None]):
                 self._show_model_picker()
                 return
         self._set_busy(True)
-        self._handle_user_turn(raw)
+        self._start_user_turn(raw)
 
     def _show_model_picker(self) -> None:
         if not self._available_models:
@@ -267,7 +547,7 @@ class Repl(App[None]):
                 self._composer_input().focus()
                 return
             self._set_busy(True)
-            self._handle_user_turn(f"/model {selected}")
+            self._start_user_turn(f"/model {selected}")
 
         self.push_screen(
             ModelPickerScreen(self._available_models), callback=_on_result
@@ -275,6 +555,7 @@ class Repl(App[None]):
 
     @work(exclusive=False, exit_on_error=False)
     async def _handle_user_turn(self, user_input: str) -> None:
+        worker = get_current_worker()
         try:
             await self._append_message("user", user_input)
             if self._ctx is None:
@@ -293,7 +574,60 @@ class Repl(App[None]):
             )
             await self._stream_agent_response(user_input, bubble)
         finally:
+            if self._active_turn_worker is worker:
+                self._active_turn_worker = None
             self._set_busy(False)
+
+    @work(exclusive=False, exit_on_error=False)
+    async def _interrupt_session(self) -> None:
+        try:
+            await self._cancel_active_turn_worker()
+            self._terminate_active_subagents()
+            self._set_busy(False)
+            self._composer_input().focus()
+            await self._append_message(
+                "agent",
+                _SESSION_INTERRUPT_MESSAGE,
+                model_name=self._current_model_name(),
+            )
+        finally:
+            self._interrupt_in_progress = False
+
+    async def _cancel_active_turn_worker(self) -> None:
+        worker = self._active_turn_worker
+        if worker is None:
+            return
+        if worker.state in (WorkerState.PENDING, WorkerState.RUNNING):
+            worker.cancel()
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(worker.wait(), timeout=1.5)
+        self._active_turn_worker = None
+
+    def _terminate_active_subagents(self) -> None:
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return
+        try:
+            report = runtime.get_subagent_report()
+        except Exception:  # noqa: BLE001
+            return
+        workers = report.get("workers", [])
+        if not isinstance(workers, list):
+            return
+        for worker in workers:
+            if not isinstance(worker, dict):
+                continue
+            status = str(worker.get("status", ""))
+            if status not in _ACTIVE_WORKER_STATUSES:
+                continue
+            subagent_id = str(worker.get("id", "")).strip()
+            if not subagent_id:
+                continue
+            with contextlib.suppress(Exception):
+                runtime.terminate_subagent(
+                    subagent_id,
+                    reason="session_interrupted",
+                )
 
     async def _run_command(self, command: Any, args: str) -> None:
         if self._ctx is None:
@@ -305,6 +639,27 @@ class Repl(App[None]):
                 result.message,
                 model_name=self._ctx.settings.model_name,
             )
+        spawned_subagent_id = str(result.data.get("spawned_subagent_id", "")).strip()
+        if (
+            spawned_subagent_id
+            and self._ctx.settings.sub_agent_mode_enabled
+            and self._ctx.subagent_runtime is not None
+        ):
+            report = self._ctx.subagent_runtime.get_subagent_report()
+            try:
+                active_count = int(report.get("active_count", 0) or 0)
+            except Exception:  # noqa: BLE001
+                active_count = 0
+            if active_count > 0:
+                followup_bubble = await self._append_message(
+                    "agent",
+                    "",
+                    model_name=self._ctx.settings.model_name,
+                )
+                await self._stream_agent_response(
+                    _MANUAL_SUBAGENT_FOLLOWUP_PROMPT,
+                    followup_bubble,
+                )
         self._refresh_banner()
         if result.should_exit:
             self.exit()
@@ -322,6 +677,15 @@ class Repl(App[None]):
         seen_tool_result_ids: set[str] = set()
         reasoning = _ReasoningTracker()
         tool_idx = 0
+        agent_status_stop = asyncio.Event()
+        agent_status_task: asyncio.Task[None] | None = None
+        if (
+            self._ctx.settings.sub_agent_mode_enabled
+            and self._ctx.subagent_runtime is not None
+        ):
+            agent_status_task = asyncio.create_task(
+                self._poll_agent_status(bubble, agent_status_stop)
+            )
 
         try:
             async for mode, chunk in self._ctx.agent.astream(
@@ -402,8 +766,40 @@ class Repl(App[None]):
             await md_stream.stop()
             await bubble.set_markdown(f"Request failed: `{exc!s}`")
         finally:
+            agent_status_stop.set()
+            if agent_status_task is not None:
+                with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(agent_status_task, timeout=1.5)
+                if not agent_status_task.done():
+                    agent_status_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await agent_status_task
             bubble.clear_tool_status()
+            bubble.clear_agent_status()
             await self._finish_turn()
+
+    async def _poll_agent_status(
+        self,
+        bubble: ChatBubble,
+        stop_signal: asyncio.Event,
+    ) -> None:
+        while not stop_signal.is_set():
+            status_text = ""
+            try:
+                if self._ctx is not None and self._ctx.subagent_runtime is not None:
+                    report = self._ctx.subagent_runtime.get_subagent_report()
+                    status_text = _format_agent_status(report)
+            except Exception:  # noqa: BLE001
+                status_text = ""
+            bubble.update_agent_status(status_text)
+            self._refresh_banner()
+            try:
+                await asyncio.wait_for(
+                    stop_signal.wait(),
+                    timeout=_AGENT_STATUS_POLL_INTERVAL_S,
+                )
+            except asyncio.TimeoutError:
+                continue
 
     async def _finish_turn(self) -> None:
         turn_input = self._turn_input

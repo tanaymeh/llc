@@ -5,7 +5,7 @@ Local LangGraph + LangChain coding agent that:
 - accepts user commands,
 - calls tools when needed (shell, read/write files, grep, edit, ShowDiff, etc.),
 - streams tokens with live markdown rendering and code block styling,
-- tracks token usage and estimates cost via OpenRouter pricing.
+- tracks token usage and estimates cost via OpenRouter pricing (including sub-agent usage).
 
 ## Requirements
 
@@ -25,6 +25,11 @@ Set values in `.env`:
 - `COMPACT_MODEL_NAME` (optional; defaults to `MODEL_NAME` for `/compact` and auto-compaction summaries)
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL` (optional for custom OpenAI-compatible endpoints)
+- `SUB_AGENT_MODE_ENABLED` (optional; `true` to boot directly in experimental sub-agent mode)
+- `MAX_SUB_AGENTS` (optional; hard-capped at `5`)
+- `SUB_AGENT_REPORT_INTERVAL_S` (optional; progress heartbeat interval in seconds)
+- `SUB_AGENT_MAX_RUNTIME_S` (optional; max runtime per sub-agent attempt in seconds)
+- `SUB_AGENT_CONTEXT_MESSAGES` (optional; number of recent messages to include as sub-agent context)
 
 Edit the assistant system prompt in `llc/prompts/system_prompt.yaml`.
 At runtime, LLC appends current environment metadata to the very end of the system prompt inside `<env>...</env>` tags.
@@ -45,12 +50,16 @@ Inside the TUI:
 - type in the bottom composer,
 - press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
 - use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
+- use `Ctrl+G` (or the `Agents` button) to toggle the Sub-Agents side panel,
+- press `Esc` twice quickly to interrupt the active session flow (current turn + active sub-agents),
 - use `/compact` to summarize and replace the oldest chat history once the model-visible history has more than 5 messages,
+- use `/enable sub-agent-mode` to enable experimental orchestrator/worker behavior,
+- use `/subagent {TASK}` to manually spawn one worker with explicit braces (repeat as needed up to max active workers),
 - use `exit` or `quit` to stop, `Ctrl+Q` to quit immediately.
 
 ## UI Features
 
-- **ASCII banner** with model info, token usage, and cost at the top
+- **ASCII banner** with model info, token usage, and cost at the top (includes orchestrator + sub-agent usage)
 - **Chat transcript** with scrollable conversation history
 - **Fixed bottom composer** that stays visible like a chat app input
 - **Role-specific message panels** (User and Agent with model name)
@@ -61,6 +70,51 @@ Inside the TUI:
 - **Send lock while streaming** (typing remains enabled but sending is disabled)
 - **Markdown and code rendering** tuned for readability in dark and light themes
 - **Word-level editing**: `Ctrl+Backspace` delete word, `Ctrl+Left/Right` word navigation
+- **Experimental sub-agent mode**: orchestrator can spawn up to 5 parallel workers, request revisions, interrupt, and terminate workers
+- **Sub-Agents side panel**: toggleable Active/Past worker cards with live activity previews and expandable details
+
+## Experimental Sub-Agent Mode
+
+Sub-agent mode is experimental and opt-in.
+
+- Enable with `/enable sub-agent-mode` (or set `SUB_AGENT_MODE_ENABLED=true` before launch).
+- The orchestrator can still execute tasks directly; delegation is advised only for complex, cleanly separable work.
+- Manual worker spawn syntax is strict: `/subagent {TASK}`.
+- Successful `/subagent` launches automatically trigger an orchestrator follow-up response that stays open until active workers finish.
+- Workers run in isolation and do not communicate with each other.
+- Max active workers is enforced by `MAX_SUB_AGENTS` and capped at `5`.
+- Use `Ctrl+G` or the `Agents` button to open/close the side panel.
+- `Active Sub-Agents` always shows currently running workers (or an explicit empty state).
+- `Past Sub-Agents` retains completed/failed/terminated/stuck workers until dismissed.
+- Worker cards show goal + current activity in compact form, support expansion for details, and display `Agent de-spawned` after terminal states.
+- Orchestrator receives a live worker snapshot on each model turn (no explicit status-tool call required).
+- Worker report payloads are bounded to reduce context growth.
+
+### Current Status (Implemented)
+
+- Session-scoped `SubAgentRuntime` with spawn/revise/interrupt/terminate/wait/report lifecycle.
+- Role-aware graph behavior using the main `system_prompt` with inline mode modifiers.
+- Strict worker isolation:
+  - worker graphs do not receive sub-agent control tools,
+  - worker context is sanitized to avoid orchestration chatter.
+- Completion normalization:
+  - successful workers are represented as compact goal + final result snapshots,
+  - optional completion report generation is bounded and timeout-protected.
+- Context protection:
+  - report payload size caps,
+  - revision input truncation,
+  - compaction adjustment for oversized retained messages.
+
+### Current Interaction Model
+
+- The app is turn-based for normal chat.
+- If the orchestrator has active workers during a response, that same response stays open until all workers are done.
+- Live worker status updates are continuously reflected in the Sub-Agents side panel.
+- Once workers finish, the orchestrator continues and emits the completion update without requiring a manual poll message.
+
+### Detailed Report
+
+- See [Parallel Sub-Agent Implementation Report](PARALLEL_SUBAGENT_IMPLEMENTATION_REPORT.md) for architecture, lifecycle, safeguards, and known limitations.
 
 ## Docker
 
@@ -113,11 +167,12 @@ llc/                     # All source code
 │   ├── llm.py           # Chat model factory (OpenAI / OpenRouter)
 │   ├── nodes.py         # LLM node, tool node, routing
 │   ├── state.py         # LangGraph state schema
+│   ├── subagents/       # Runtime manager + worker state models
 │   ├── compact.py       # History compaction logic
 │   ├── hooks.py         # Hook protocol, TokenCounterHook, AutoCompactHook
 │   ├── message_utils.py # Shared message text extraction
 │   └── tools/           # Tool implementations (Read, Write, Edit, Bash, Grep, etc.)
-├── commands/            # REPL slash-commands (/model, /compact, /help, exit)
+├── commands/            # REPL slash-commands (/model, /compact, /enable, /subagent, /help, exit)
 ├── ui/
 │   ├── repl.py          # Textual app, chat workflow, streaming
 │   ├── widgets.py       # ChatBubble, ComposerInput, ModelPickerScreen

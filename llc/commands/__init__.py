@@ -4,20 +4,34 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from llc.agent.subagents import SubAgentRuntime
     from llc.config import Settings
 
 
 class CommandResult:
-    def __init__(self, should_exit: bool = False, message: str | None = None) -> None:
+    def __init__(
+        self,
+        should_exit: bool = False,
+        message: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         self.should_exit = should_exit
         self.message = message
+        self.data = data or {}
 
 
 class ReplContext:
-    def __init__(self, settings: Settings, agent: Any, thread_id: str) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        agent: Any,
+        thread_id: str,
+        subagent_runtime: "SubAgentRuntime | None" = None,
+    ) -> None:
         self.settings = settings
         self.agent = agent
         self.thread_id = thread_id
+        self.subagent_runtime = subagent_runtime
 
 
 class Command(ABC):

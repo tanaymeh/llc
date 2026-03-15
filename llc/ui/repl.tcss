@@ -54,6 +54,36 @@ Screen {
     margin: 0 0 0 1;
 }
 
+#agents_button {
+    width: 10;
+    height: 5;
+    min-height: 5;
+    max-height: 5;
+    padding: 0 0;
+    content-align: center middle;
+    text-style: bold;
+    color: rgb(222, 228, 242);
+    border: round rgb(86, 100, 122);
+    background: rgb(55, 63, 78);
+    margin: 0 0 0 1;
+}
+
+#agents_button:hover {
+    border: round rgb(99, 116, 144);
+    background: rgb(66, 76, 95);
+}
+
+#agents_button:focus {
+    border: round rgb(120, 148, 196);
+    background: rgb(78, 90, 115);
+}
+
+#agents_button.-primary {
+    border: round rgb(62, 147, 202);
+    background: rgb(44, 120, 172);
+    color: rgb(238, 246, 255);
+}
+
 #send_button:hover {
     border: round rgb(44, 128, 224);
     background: rgb(44, 128, 224);
@@ -82,6 +112,213 @@ Screen {
 #chat_column {
     width: 1fr;
     height: auto;
+}
+
+#agents_panel {
+    dock: right;
+    width: 44;
+    min-width: 36;
+    max-width: 56;
+    height: 1fr;
+    padding: 1 1;
+    background: rgb(20, 24, 33);
+    border-left: solid rgb(55, 69, 91);
+}
+
+#agents_panel:light {
+    background: rgb(243, 246, 252);
+    border-left: solid rgb(171, 180, 197);
+}
+
+#agents_panel_title {
+    width: 1fr;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    text-style: bold;
+    color: rgb(198, 226, 255);
+}
+
+#agents_panel_title:light {
+    color: rgb(47, 85, 130);
+}
+
+#agents_panel_scroll {
+    width: 1fr;
+    height: 1fr;
+}
+
+#agents_panel_column {
+    width: 1fr;
+    height: auto;
+}
+
+.agents-section-title {
+    width: 1fr;
+    padding: 0 1;
+    margin: 1 0 0 0;
+    text-style: bold;
+    color: rgb(145, 170, 210);
+}
+
+.agents-section-title:light {
+    color: rgb(66, 95, 142);
+}
+
+#agents_active_empty,
+#agents_past_empty {
+    width: 1fr;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    color: $text-muted;
+    text-style: italic;
+}
+
+#agents_active_column,
+#agents_past_column {
+    width: 1fr;
+    height: auto;
+}
+
+.subagent-card {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1 1 1;
+    border: round rgb(91, 105, 132);
+    background: rgb(30, 37, 50);
+    color: rgb(226, 232, 245);
+}
+
+.subagent-card:light {
+    border: round rgb(167, 177, 197);
+    background: rgb(235, 241, 251);
+    color: rgb(34, 41, 57);
+}
+
+.subagent-card-topbar {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+.subagent-card-summary {
+    width: 1fr;
+    height: auto;
+    padding: 0 1;
+}
+
+.subagent-card-dismiss {
+    width: 8;
+    min-width: 8;
+    margin: 0 0 0 1;
+}
+
+.subagent-card-details-collapsible {
+    width: 1fr;
+}
+
+.subagent-card-details {
+    width: 1fr;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+.subagent-card.status-running:dark {
+    border: round rgb(63, 176, 112);
+}
+
+.subagent-card.status-restarting:dark {
+    border: round rgb(113, 164, 230);
+}
+
+.subagent-card.status-terminating:dark {
+    border: round rgb(215, 148, 70);
+}
+
+.subagent-card.status-completed:dark {
+    border: round rgb(92, 198, 156);
+}
+
+.subagent-card.status-failed:dark {
+    border: round rgb(218, 94, 94);
+}
+
+.subagent-card.status-terminated:dark,
+.subagent-card.status-stuck:dark {
+    border: round rgb(141, 148, 166);
+}
+
+.subagent-card.status-running:light {
+    border: round rgb(63, 146, 99);
+}
+
+.subagent-card.status-restarting:light {
+    border: round rgb(75, 122, 189);
+}
+
+.subagent-card.status-terminating:light {
+    border: round rgb(185, 115, 43);
+}
+
+.subagent-card.status-completed:light {
+    border: round rgb(56, 156, 117);
+}
+
+.subagent-card.status-failed:light {
+    border: round rgb(183, 62, 62);
+}
+
+.subagent-card.status-terminated:light,
+.subagent-card.status-stuck:light {
+    border: round rgb(122, 128, 143);
+}
+
+.subagent-card.accent-a:dark {
+    background: rgb(31, 39, 56);
+}
+
+.subagent-card.accent-b:dark {
+    background: rgb(36, 41, 57);
+}
+
+.subagent-card.accent-c:dark {
+    background: rgb(33, 43, 55);
+}
+
+.subagent-card.accent-d:dark {
+    background: rgb(35, 39, 60);
+}
+
+.subagent-card.accent-e:dark {
+    background: rgb(33, 44, 49);
+}
+
+.subagent-card.accent-f:dark {
+    background: rgb(38, 36, 56);
+}
+
+.subagent-card.accent-a:light {
+    background: rgb(239, 244, 254);
+}
+
+.subagent-card.accent-b:light {
+    background: rgb(243, 244, 254);
+}
+
+.subagent-card.accent-c:light {
+    background: rgb(238, 246, 251);
+}
+
+.subagent-card.accent-d:light {
+    background: rgb(243, 241, 252);
+}
+
+.subagent-card.accent-e:light {
+    background: rgb(238, 248, 246);
+}
+
+.subagent-card.accent-f:light {
+    background: rgb(246, 242, 252);
 }
 
 /* ── System messages ── */
@@ -138,6 +375,17 @@ Screen {
     padding: 0 1;
     color: $text-muted;
     text-style: italic;
+}
+
+.agent-status {
+    width: 1fr;
+    padding: 0 1;
+    color: rgb(122, 204, 208);
+    text-style: italic;
+}
+
+.agent-status:light {
+    color: rgb(39, 118, 126);
 }
 
 .tool-output {
