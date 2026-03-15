@@ -1,5 +1,5 @@
 ROOT_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-WORKSPACE ?= $(abspath $(ROOT_DIR)/../llm-transpiler)
+WORKSPACE ?= $(ROOT_DIR)
 DOCKER_SCRIPT := $(ROOT_DIR)/scripts/dev-docker.sh
 
 .PHONY: run
