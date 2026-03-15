@@ -1,5 +1,14 @@
 # LLC
 
+```text
+ _      _       _____
+| |    | |     / ____|
+| |    | |    | |
+| |    | |    | |
+| |____| |____| |____
+|______|______|\_____|
+```
+
 LLC is a local coding agent application with a full-screen Textual TUI.
 It runs a LangGraph-based agent loop, streams tool/model events live, tracks token usage and cost, and stores sessions in SQLite.
 
