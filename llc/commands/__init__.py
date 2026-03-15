@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from llc.agent.subagents import SubAgentRuntime
     from llc.config import Settings
+    from llc.service.prompt_registry import PromptRegistry
 
 
 class CommandResult:
@@ -27,11 +28,13 @@ class ReplContext:
         agent: Any,
         thread_id: str,
         subagent_runtime: "SubAgentRuntime | None" = None,
+        prompt_registry: "PromptRegistry | None" = None,
     ) -> None:
         self.settings = settings
         self.agent = agent
         self.thread_id = thread_id
         self.subagent_runtime = subagent_runtime
+        self.prompt_registry = prompt_registry
 
 
 class Command(ABC):

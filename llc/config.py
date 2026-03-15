@@ -9,6 +9,7 @@ import yaml
 
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.yaml"
 COMPACT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "compact_prompt.yaml"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 def _load_prompt(path: Path, key: str) -> str:
@@ -81,6 +82,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_path(name: str) -> Path | None:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return None
+    return Path(raw).expanduser().resolve()
+
+
 class Settings(BaseModel, frozen=True):
     model_name: str = "gpt-4o-mini"
     compact_model_name: str | None = None
@@ -88,6 +96,10 @@ class Settings(BaseModel, frozen=True):
     openai_base_url: str | None = None
     firecrawl_api_key: str | None = None
     workspace_root: Path = Field(default_factory=lambda: Path.cwd().resolve())
+    prompts_dir: Path = PROMPTS_DIR
+    db_path: Path = Field(
+        default_factory=lambda: (Path.cwd().resolve() / ".llc" / "sessions.db")
+    )
     system_prompt: str = Field(default_factory=_load_system_prompt)
     compact_prompt: str = Field(default_factory=_load_compact_prompt)
     sub_agent_mode_enabled: bool = False
@@ -101,7 +113,10 @@ class Settings(BaseModel, frozen=True):
     def from_env(cls) -> "Settings":
         load_dotenv()
         workspace_root = Path.cwd().resolve()
-        system_prompt = _load_system_prompt()
+        prompts_dir = _env_path("LLC_PROMPTS_DIR") or PROMPTS_DIR
+        system_prompt = _load_prompt(prompts_dir / "system_prompt.yaml", "system_prompt")
+        compact_prompt = _load_prompt(prompts_dir / "compact_prompt.yaml", "compact_prompt")
+        db_path = _env_path("LLC_DB_PATH") or (workspace_root / ".llc" / "sessions.db")
         return cls(
             model_name=os.getenv("MODEL_NAME", "gpt-4o-mini"),
             compact_model_name=os.getenv("COMPACT_MODEL_NAME"),
@@ -109,10 +124,13 @@ class Settings(BaseModel, frozen=True):
             openai_base_url=os.getenv("OPENAI_BASE_URL"),
             firecrawl_api_key=os.getenv("FIRECRAWL_API_KEY"),
             workspace_root=workspace_root,
+            prompts_dir=prompts_dir,
+            db_path=db_path,
             system_prompt=_with_env_details(
                 system_prompt,
                 workspace_root,
             ),
+            compact_prompt=compact_prompt,
             sub_agent_mode_enabled=_env_bool("SUB_AGENT_MODE_ENABLED", default=False),
             max_sub_agents=_env_int("MAX_SUB_AGENTS", 5),
             sub_agent_report_interval_s=_env_int("SUB_AGENT_REPORT_INTERVAL_S", 8),

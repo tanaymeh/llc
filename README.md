@@ -5,7 +5,9 @@ Local LangGraph + LangChain coding agent that:
 - accepts user commands,
 - calls tools when needed (shell, read/write files, grep, edit, ShowDiff, etc.),
 - streams tokens with live markdown rendering and code block styling,
-- tracks token usage and estimates cost via OpenRouter pricing (including sub-agent usage).
+- tracks token usage and estimates cost via OpenRouter pricing (including sub-agent usage),
+- stores sessions locally in SQLite,
+- emits backend responses as typed events so alternative frontends can be added.
 
 ## Requirements
 
@@ -30,6 +32,8 @@ Set values in `.env`:
 - `SUB_AGENT_REPORT_INTERVAL_S` (optional; progress heartbeat interval in seconds)
 - `SUB_AGENT_MAX_RUNTIME_S` (optional; max runtime per sub-agent attempt in seconds)
 - `SUB_AGENT_CONTEXT_MESSAGES` (optional; number of recent messages to include as sub-agent context)
+- `LLC_DB_PATH` (optional; defaults to `<workspace>/.llc/sessions.db`)
+- `LLC_PROMPTS_DIR` (optional; defaults to `llc/prompts/`)
 
 Edit the assistant system prompt in `llc/prompts/system_prompt.yaml`.
 At runtime, LLC appends current environment metadata to the very end of the system prompt inside `<env>...</env>` tags.
@@ -72,6 +76,18 @@ Inside the TUI:
 - **Word-level editing**: `Ctrl+Backspace` delete word, `Ctrl+Left/Right` word navigation
 - **Experimental sub-agent mode**: orchestrator can spawn up to 5 parallel workers, request revisions, interrupt, and terminate workers
 - **Sub-Agents side panel**: toggleable Active/Past worker cards with live activity previews and expandable details
+
+## Backend Service Layer
+
+LLC now separates orchestration/backend logic from the Textual frontend:
+
+- `llc/service/engine.py` owns turn execution, command dispatch, hooks, and sub-agent runtime management.
+- `llc/service/stream_adapter.py` converts LangGraph stream chunks into typed event models.
+- `llc/service/events.py` defines the backend event contract using Pydantic models.
+- `llc/ui/repl.py` is a thin event consumer that renders those events in Textual.
+- `llc/storage/store.py` persists sessions/messages/token usage/event payloads to SQLite.
+
+This makes it straightforward to add a web UI later by consuming the same event stream.
 
 ## Experimental Sub-Agent Mode
 
@@ -159,11 +175,11 @@ Notes:
 
 ```text
 llc/                     # All source code
-├── main.py              # Entrypoint
-├── config.py            # Settings, prompt loading, env details
+├── main.py              # Entrypoint (wires SessionEngine + SessionStore + TUI)
+├── config.py            # Settings, prompt loading, env details, DB path
 ├── models.py            # Model list fetching + pricing from OpenRouter
 ├── agent/
-│   ├── graph.py         # StateGraph builder + MemorySaver
+│   ├── graph.py         # StateGraph builder + role-specific prompt injection
 │   ├── llm.py           # Chat model factory (OpenAI / OpenRouter)
 │   ├── nodes.py         # LLM node, tool node, routing
 │   ├── state.py         # LangGraph state schema
@@ -172,12 +188,21 @@ llc/                     # All source code
 │   ├── hooks.py         # Hook protocol, TokenCounterHook, AutoCompactHook
 │   ├── message_utils.py # Shared message text extraction
 │   └── tools/           # Tool implementations (Read, Write, Edit, Bash, Grep, etc.)
-├── commands/            # REPL slash-commands (/model, /compact, /enable, /subagent, /help, exit)
+├── commands/            # Slash-commands (/model, /compact, /enable, /subagent, /help, exit)
+├── service/
+│   ├── engine.py        # Frontend-agnostic backend orchestrator
+│   ├── events.py        # Typed backend event models
+│   ├── stream_adapter.py# LangGraph chunk -> event translation
+│   └── prompt_registry.py # Prompt loader/cache for YAML prompt files
+├── storage/
+│   ├── models.py        # Pydantic records for persisted entities
+│   ├── schema.py        # SQLite schema + indexes
+│   └── store.py         # Async session store (aiosqlite)
 ├── ui/
-│   ├── repl.py          # Textual app, chat workflow, streaming
+│   ├── repl.py          # Textual app consuming backend events
 │   ├── widgets.py       # ChatBubble, ComposerInput, ModelPickerScreen
 │   ├── rendering.py     # Diff rendering, tool output formatting
-│   ├── display.py       # Message / tool parsing helpers for streamed chunks
+│   ├── display.py       # UI-specific format helpers
 │   └── repl.tcss        # Theme-aware styles for chat panels and composer
-└── prompts/             # System and compaction prompt YAML files
+└── prompts/             # System/compact plus role and runtime prompt YAML files
 ```

@@ -1,4 +1,6 @@
-from typing import Literal
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -8,6 +10,9 @@ from llc.agent.nodes import make_llm_node, make_tool_node, should_continue
 from llc.agent.state import AgentState
 from llc.agent.tools import collect_tools
 from llc.config import Settings
+
+if TYPE_CHECKING:
+    from llc.service.prompt_registry import PromptRegistry
 
 AgentRole = Literal["default", "orchestrator", "subagent"]
 _MAX_SNAPSHOT_WORKERS = 5
@@ -31,12 +36,34 @@ _ISOLATED_TASK_MODE_APPEND = (
 )
 
 
-def _prompt_for_role(settings: Settings, role: AgentRole) -> str:
+def _prompt_for_role(
+    settings: Settings,
+    role: AgentRole,
+    prompt_registry: PromptRegistry | None = None,
+) -> str:
     base_prompt = settings.system_prompt.rstrip()
     if role == "orchestrator" and settings.sub_agent_mode_enabled:
-        return f"{base_prompt}\n\n{_ORCHESTRATOR_MODE_APPEND}"
+        append = _ORCHESTRATOR_MODE_APPEND
+        if prompt_registry is not None:
+            try:
+                append = prompt_registry.get(
+                    "orchestrator_mode",
+                    key="orchestrator_mode_prompt",
+                )
+            except Exception:
+                append = _ORCHESTRATOR_MODE_APPEND
+        return f"{base_prompt}\n\n{append.strip()}"
     if role == "subagent":
-        return f"{base_prompt}\n\n{_ISOLATED_TASK_MODE_APPEND}"
+        append = _ISOLATED_TASK_MODE_APPEND
+        if prompt_registry is not None:
+            try:
+                append = prompt_registry.get(
+                    "subagent_mode",
+                    key="subagent_mode_prompt",
+                )
+            except Exception:
+                append = _ISOLATED_TASK_MODE_APPEND
+        return f"{base_prompt}\n\n{append.strip()}"
     return settings.system_prompt
 
 
@@ -112,6 +139,7 @@ def build_agent_graph(
     *,
     role: AgentRole = "default",
     subagent_runtime: object | None = None,
+    prompt_registry: PromptRegistry | None = None,
 ):
     model = build_chat_model(settings)
     tools = collect_tools(
@@ -121,7 +149,7 @@ def build_agent_graph(
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
-    system_prompt = _prompt_for_role(settings, role)
+    system_prompt = _prompt_for_role(settings, role, prompt_registry)
     runtime_status_provider = _runtime_status_provider(
         role,
         subagent_runtime,
