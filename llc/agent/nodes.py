@@ -1,3 +1,4 @@
+import json
 import uuid
 from typing import Any, Callable, Literal
 
@@ -11,6 +12,26 @@ ToolNode = Callable[[AgentState], dict[str, Any]]
 RuntimeStatusProvider = Callable[[], str | None]
 AutoWaitProvider = Callable[[], bool]
 AutoWaitArgsProvider = Callable[[], dict[str, Any]]
+_MAX_REPORT_POLLS_BEFORE_AUTO_WAIT = 3
+_AUTO_WAIT_TIMEOUT_MS = 1200
+_DONE_REPORT_HINT = (
+    "Auto-guard: all sub-agents are already done. "
+    "Stop polling reports and provide a final combined outcome now."
+)
+
+
+def _parse_report_payload(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, str):
+        return None
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
 
 
 def _inject_auto_tool_call(
@@ -78,7 +99,10 @@ def make_llm_node(
 
 
 def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
+    report_poll_streak = 0
+
     def tool_node(state: AgentState) -> dict[str, Any]:
+        nonlocal report_poll_streak
         last_message = state["messages"][-1]
         tool_messages: list[ToolMessage] = []
 
@@ -88,6 +112,7 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
             user_facing = False
             render_mode = ""
             if tool is None:
+                report_poll_streak = 0
                 observation = f"Unknown tool: {tool_name}"
             else:
                 metadata = getattr(tool, "metadata", {}) or {}
@@ -96,7 +121,51 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                 try:
                     observation = tool.invoke(tool_call["args"])
                 except Exception as exc:  # noqa: BLE001
+                    report_poll_streak = 0
                     observation = f"Tool '{tool_name}' failed: {exc}"
+                else:
+                    if tool_name == "GetSubagentReport":
+                        report_poll_streak += 1
+                        report_payload = _parse_report_payload(observation)
+                        active_count = None
+                        if isinstance(report_payload, dict):
+                            try:
+                                active_count = int(report_payload.get("active_count", 0) or 0)
+                            except Exception:  # noqa: BLE001
+                                active_count = None
+
+                        if active_count == 0:
+                            report_poll_streak = 0
+                            observation = f"{observation}\n\n{_DONE_REPORT_HINT}"
+                        elif report_poll_streak >= _MAX_REPORT_POLLS_BEFORE_AUTO_WAIT:
+                            wait_tool = tools_by_name.get("WaitSubagents")
+                            if wait_tool is not None:
+                                try:
+                                    wait_observation = wait_tool.invoke(
+                                        {"timeout_ms": _AUTO_WAIT_TIMEOUT_MS}
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    wait_observation = (
+                                        f"Auto WaitSubagents failed: {exc}"
+                                    )
+                                observation = (
+                                    f"{observation}\n\n"
+                                    f"Auto-guard: detected {report_poll_streak} consecutive "
+                                    "GetSubagentReport calls. "
+                                    "Executed WaitSubagents to avoid busy polling.\n"
+                                    f"{wait_observation}"
+                                )
+                            else:
+                                observation = (
+                                    f"{observation}\n\n"
+                                    "Auto-guard: repeated GetSubagentReport calls detected. "
+                                    "Use WaitSubagents(timeout_ms=1200) before polling again."
+                                )
+                            report_poll_streak = 0
+                    elif tool_name == "WaitSubagents":
+                        report_poll_streak = 0
+                    else:
+                        report_poll_streak = 0
 
             tool_messages.append(
                 ToolMessage(

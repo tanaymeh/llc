@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from typing import Any
 
@@ -27,7 +28,6 @@ from llc.service.events import (
     TurnCompleted,
     UsageUpdate,
 )
-from llc.ui.display import format_tool_args
 from llc.ui.rendering import format_duration, render_user_facing_tool_output
 from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen, SubAgentCard
 
@@ -54,6 +54,18 @@ def _single_line_preview(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+def _format_tool_args(args: dict[str, Any]) -> str:
+    if not args:
+        return ""
+    parts: list[str] = []
+    for key, value in args.items():
+        val = repr(value) if isinstance(value, str) else str(value)
+        if len(val) > 60:
+            val = val[:57] + "..."
+        parts.append(f"{key}={val}")
+    return ", ".join(parts)
 
 
 def _format_agent_status(report: dict[str, Any]) -> str:
@@ -96,33 +108,65 @@ def _format_agent_status(report: dict[str, Any]) -> str:
 
 
 class _ReasoningTracker:
+    _WORD_WITH_TRAILING_SPACE_RE = re.compile(r"\S+\s*")
+    _WORD_RE = re.compile(r"\S+")
+
     def __init__(self) -> None:
         self.started_at: float | None = None
-        self._tokens: list[str] = []
+        self._buffer = ""
         self._last_emitted: float | None = None
 
     def feed(self, text: str) -> str | None:
-        cleaned = text.strip()
-        if not cleaned:
+        if not text or not text.strip():
             return None
         if self.started_at is None:
             self.started_at = time.monotonic()
-        words = cleaned.split()
-        if not words:
-            return None
-        self._tokens.extend(words)
+        self._buffer += text
         now = time.monotonic()
-        if len(self._tokens) < _REASONING_TOKENS_PER_LINE:
+        if self._word_count(self._buffer) < _REASONING_TOKENS_PER_LINE:
             return None
         if (
             self._last_emitted is not None
             and now - self._last_emitted < _REASONING_LINE_INTERVAL
         ):
             return None
-        line_tokens = self._tokens[:_REASONING_TOKENS_PER_LINE]
-        self._tokens = self._tokens[_REASONING_TOKENS_PER_LINE:]
+        line_text, remaining = self._consume_first_words(
+            self._buffer,
+            _REASONING_TOKENS_PER_LINE,
+        )
+        if line_text is None:
+            return None
+        self._buffer = remaining
         self._last_emitted = now
-        return " ".join(line_tokens)
+        rendered = self._to_single_line(line_text)
+        if not rendered:
+            return None
+        return rendered
+
+    @classmethod
+    def _word_count(cls, text: str) -> int:
+        return sum(1 for _ in cls._WORD_WITH_TRAILING_SPACE_RE.finditer(text))
+
+    @classmethod
+    def _consume_first_words(
+        cls,
+        text: str,
+        count: int,
+    ) -> tuple[str | None, str]:
+        seen = 0
+        cut_index = None
+        for match in cls._WORD_WITH_TRAILING_SPACE_RE.finditer(text):
+            seen += 1
+            if seen >= count:
+                cut_index = match.end()
+                break
+        if cut_index is None:
+            return None, text
+        return text[:cut_index], text[cut_index:]
+
+    @classmethod
+    def _to_single_line(cls, text: str) -> str:
+        return " ".join(match.group(0) for match in cls._WORD_RE.finditer(text))
 
     @property
     def active(self) -> bool:
@@ -133,7 +177,7 @@ class _ReasoningTracker:
         if self.started_at is not None:
             elapsed = max(time.monotonic() - self.started_at, 0.0)
         self.started_at = None
-        self._tokens.clear()
+        self._buffer = ""
         self._last_emitted = None
         return f"  Reasoned for {format_duration(elapsed)}"
 
@@ -314,7 +358,10 @@ class Repl(App[None]):
                     report = self._engine.get_subagent_report(include_all=True)
                 except Exception:
                     report = {"workers": []}
-                await self._sync_subagent_panel(report)
+                try:
+                    await self._sync_subagent_panel(report)
+                except Exception:
+                    pass
                 await asyncio.sleep(_AGENT_STATUS_POLL_INTERVAL_S)
         except asyncio.CancelledError:
             return
@@ -350,11 +397,11 @@ class Repl(App[None]):
                 await target_column.mount(card)
                 continue
 
-            card.update_from_snapshot(worker)
             if card.parent is not target_column:
                 if card.parent is not None:
                     await card.remove()
                 await target_column.mount(card)
+            card.update_from_snapshot(worker)
 
         stale_ids = [
             subagent_id
@@ -557,7 +604,7 @@ class Repl(App[None]):
 
                 if isinstance(event, ToolCallStarted):
                     bubble = await ensure_stream_bubble()
-                    args_str = format_tool_args(event.args)
+                    args_str = _format_tool_args(event.args)
                     line = f"  ↳ [{event.tool_index}] {event.tool_name}"
                     if args_str:
                         line += f"({args_str})"
