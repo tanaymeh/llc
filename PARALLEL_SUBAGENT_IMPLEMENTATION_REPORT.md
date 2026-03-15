@@ -19,8 +19,8 @@ The feature set is experimental and currently opt-in via `/enable sub-agent-mode
 
 ```mermaid
 flowchart TD
-  userInput[UserInput] --> repl[Repl TUI]
-  repl --> orchestratorGraph[OrchestratorGraph]
+  userInput[UserInput] --> missionUi[MissionControlUI]
+  missionUi --> orchestratorGraph[OrchestratorGraph]
   orchestratorGraph --> runtimeTools[SubAgent Control Tools]
   runtimeTools --> runtime[SubAgentRuntime]
   runtime --> workerGraphA[WorkerGraph A]
@@ -28,15 +28,20 @@ flowchart TD
   runtime --> workerGraphN[WorkerGraph N]
   runtime --> reportSnapshots[Compact Worker Snapshots]
   reportSnapshots --> orchestratorGraph
-  orchestratorGraph --> repl
+  orchestratorGraph --> missionUi
 ```
 
 Core components:
 
-- `llc/ui/repl.py`
-  - initializes session runtime
-  - builds orchestrator/worker graphs
-  - renders a toggleable side panel with active/past worker cards
+- `llc/ui/app.py`
+  - mission-control Textual app shell and event loop
+  - wires runtime event stream into panel updates
+  - handles command surface controls and interrupt flow
+- `llc/ui/state.py` and `llc/ui/telemetry_mapper.py`
+  - Pydantic UI-state contracts
+  - event-to-view model normalization for panels/logs/agents
+- `llc/ui/panels/agents.py`
+  - persistent agents pane rendering compact active/past worker telemetry rows
 - `llc/agent/graph.py`
   - role-aware graph construction (`default`, `orchestrator`, `subagent`)
   - injects live worker snapshot into orchestrator system prompt per turn
@@ -87,11 +92,11 @@ Implemented safeguards:
 
 ### TUI Progress Rendering
 
-- Side panel is toggled with `Ctrl+G` or the `Agents` button.
-- `Active Sub-Agents` lists running/restarting/terminating workers, or an explicit empty-state line when none are active.
-- `Past Sub-Agents` retains terminal workers (`completed`, `failed`, `terminated`, `stuck`) until user dismissal.
-- Each worker card shows concise goal/activity preview, supports expand-for-details, and marks terminal states as `Agent de-spawned`.
-- Banner token/cost totals include sub-agent token usage (worker execution plus completion-report calls), when pricing data is available.
+- Agents pane is mission-control style and remains visible in overview mode (`Ctrl+G` still toggles visibility).
+- Active workers are rendered as compact rows with status, goal/task preview, and latest activity/tool hints.
+- Past workers render in a separate section with terminal status and compact terminal-state summary.
+- Worker terminal states continue to map to `Agent de-spawned` activity semantics.
+- Top-bar token/cost totals include sub-agent token usage (worker execution plus completion-report calls), when pricing data is available.
 
 ### Session Interrupt Hotkey
 
@@ -105,7 +110,7 @@ Implemented safeguards:
 
 - The app remains turn-based for normal chat.
 - If the orchestrator has active workers during a response, the same orchestrator response is kept open until workers complete.
-- Live worker status cards continue updating in the side panel while the orchestrator is waiting.
+- Live worker telemetry rows continue updating in the agents pane while the orchestrator is waiting.
 - The orchestrator resumes and emits completion output without requiring a manual poll turn.
 
 ## Sub-Agent Runtime Lifecycle

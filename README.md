@@ -1,13 +1,13 @@
 # LLC
 
 Local LangGraph + LangChain coding agent that:
-- runs in a full-screen Textual TUI with chat panels and a fixed bottom composer,
-- accepts user commands,
-- calls tools when needed (shell, read/write files, grep, edit, ShowDiff, etc.),
-- streams tokens with live markdown rendering and code block styling,
-- tracks token usage and estimates cost via OpenRouter pricing (including sub-agent usage),
+- runs in a full-screen mission-control Textual interface (not chat bubbles),
+- accepts direct instructions and slash commands from a terminal-native command surface,
+- calls tools when needed (shell, read/write/edit files, grep/glob, ShowDiff, web tools),
+- streams model output, tool execution, worker status, and logs live,
+- tracks token usage and estimated cost (including sub-agent usage),
 - stores sessions locally in SQLite,
-- emits backend responses as typed events so alternative frontends can be added.
+- exposes typed backend events so other frontends can consume the same runtime.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ Set values in `.env`:
 - `LLC_PROMPTS_DIR` (optional; defaults to `llc/prompts/`)
 
 Edit the assistant system prompt in `llc/prompts/system_prompt.yaml`.
-At runtime, LLC appends current environment metadata to the very end of the system prompt inside `<env>...</env>` tags.
+At runtime, LLC appends current environment metadata to the end of the system prompt inside `<env>...</env>` tags.
 
 ## Run
 
@@ -44,117 +44,104 @@ At runtime, LLC appends current environment metadata to the very end of the syst
 uv run llc
 ```
 
-Or equivalently:
+Or:
 
 ```bash
 python -m llc
 ```
 
-Inside the TUI:
-- type in the bottom composer,
-- press `Ctrl+Enter` (or `Enter` on terminals that collapse `Ctrl+Enter`) to submit,
-- use `Ctrl+N` or `Ctrl+O` to insert a newline in the composer,
-- use `Ctrl+G` (or the `Agents` button) to toggle the Sub-Agents side panel,
-- press `Esc` twice quickly to interrupt the active session flow (current turn + active sub-agents),
-- use `/compact` to summarize and replace the oldest chat history once the model-visible history has more than 5 messages,
-- use `/enable sub-agent-mode` to enable experimental orchestrator/worker behavior,
-- use `/subagent {TASK}` to manually spawn one worker with explicit braces (repeat as needed up to max active workers),
-- use `exit` or `quit` to stop, `Ctrl+Q` to quit immediately.
+## Mission Control Interface
+
+The interface is organized into persistent operational regions:
+
+- **Top bar**: model, phase, health, token/cost totals, sub-agent counts, uptime.
+- **Execution domain**: tool timeline + mission lane (role-tagged `USER` / `AGENT` / `SYS` message flow).
+- **Agents pane**: compact nested orchestrator/sub-agent telemetry rows.
+- **Log band**: dense categorized stream (`SYS`, `TOOL`, `CODE`, `OBS`, `WARN`, `ERR`, etc.).
+- **Command surface**: anchored terminal prompt for instructions and slash commands.
+
+### Controls
+
+- `Enter` to submit from the command surface.
+- `Ctrl+Enter` (and `Ctrl+J`/`Ctrl+M`) also trigger send.
+- `Ctrl+G` toggles agents pane visibility.
+- `Ctrl+L` toggles focused-log mode.
+- `Ctrl+A` focuses agents mode.
+- `Ctrl+E` focuses execution mode.
+- `Ctrl+U` returns to overview mode.
+- `Esc` twice quickly interrupts the active flow (current turn + active sub-agents).
+- `Ctrl+Q` quits immediately.
+
+### Commands
+
+- `/help` shows commands.
+- `/model <model_id>` switches model directly.
+- `/model` opens inline model selection in the command surface (non-modal).
+- `/compact` summarizes and replaces older model-visible history.
+- `/enable sub-agent-mode` enables orchestrator/worker behavior.
+- `/subagent {TASK}` manually spawns one worker (strict braces required).
+- `exit` or `quit` exits.
 
 ## UI Features
 
-- **ASCII banner** with model info, token usage, and cost at the top (includes orchestrator + sub-agent usage)
-- **Chat transcript** with scrollable conversation history
-- **Fixed bottom composer** that stays visible like a chat app input
-- **Role-specific message panels** (User and Agent with model name)
-- **Tool call and reasoning traces** shown inline in agent messages
-- **User-facing tool outputs** rendered inline in chat bubbles
-- **ShowDiff visual rendering** with side-by-side colored old/new columns in TUI (session baseline vs current state)
-- **Chat compaction** via `/compact`, plus automatic compaction when the last prompt reaches 90% of the active model context length
-- **Send lock while streaming** (typing remains enabled but sending is disabled)
-- **Markdown and code rendering** tuned for readability in dark and light themes
-- **Word-level editing**: `Ctrl+Backspace` delete word, `Ctrl+Left/Right` word navigation
-- **Experimental sub-agent mode**: orchestrator can spawn up to 5 parallel workers, request revisions, interrupt, and terminate workers
-- **Sub-Agents side panel**: toggleable Active/Past worker cards with live activity previews and expandable details
+- Mission-control visual language (hard edges, thin separators, restrained accent colors).
+- Pydantic-backed UI state and telemetry mapping (`BaseModel`, validators, computed fields).
+- Live markdown/code rendering in execution lane.
+- Tool call timeline and user-facing tool output rendering.
+- Side-by-side diff rendering for `ShowDiff`.
+- Categorized, timestamped, source-attributed logs.
+- Inline model selector (no popup picker).
+- Bounded log/tool buffers with incremental updates for steady runtime performance.
 
 ## Backend Service Layer
 
-LLC now separates orchestration/backend logic from the Textual frontend:
+LLC separates orchestration/backend logic from the Textual frontend:
 
 - `llc/service/engine.py` owns turn execution, command dispatch, hooks, and sub-agent runtime management.
 - `llc/service/stream_adapter.py` converts LangGraph stream chunks into typed event models.
-- `llc/service/events.py` defines the backend event contract using Pydantic models.
-- `llc/ui/repl.py` is a thin event consumer that renders those events in Textual.
-- `llc/storage/store.py` persists sessions/messages/token usage/event payloads to SQLite.
+- `llc/service/events.py` defines the backend event contract (Pydantic).
+- `llc/ui/app.py` consumes backend events and renders mission-control regions.
+- `llc/ui/state.py` + `llc/ui/telemetry_mapper.py` normalize event data into UI state.
+- `llc/storage/store.py` persists sessions/messages/token usage/events in SQLite.
 
-This makes it straightforward to add a web UI later by consuming the same event stream.
+This keeps frontend concerns isolated while preserving a single backend runtime contract.
 
 ## Experimental Sub-Agent Mode
 
 Sub-agent mode is experimental and opt-in.
 
-- Enable with `/enable sub-agent-mode` (or set `SUB_AGENT_MODE_ENABLED=true` before launch).
-- The orchestrator can still execute tasks directly; delegation is advised only for complex, cleanly separable work.
-- Manual worker spawn syntax is strict: `/subagent {TASK}`.
-- Successful `/subagent` launches automatically trigger an orchestrator follow-up response that stays open until active workers finish.
-- Workers run in isolation and do not communicate with each other.
+- Enable with `/enable sub-agent-mode` (or `SUB_AGENT_MODE_ENABLED=true` before launch).
+- Manual spawn syntax is strict: `/subagent {TASK}`.
+- Successful `/subagent` launches trigger orchestrator follow-up so completion does not require manual polling.
+- Workers are isolated and do not communicate with each other.
 - Max active workers is enforced by `MAX_SUB_AGENTS` and capped at `5`.
-- Use `Ctrl+G` or the `Agents` button to open/close the side panel.
-- `Active Sub-Agents` always shows currently running workers (or an explicit empty state).
-- `Past Sub-Agents` retains completed/failed/terminated/stuck workers until dismissed.
-- Worker cards show goal + current activity in compact form, support expansion for details, and display `Agent de-spawned` after terminal states.
-- Orchestrator receives a live worker snapshot on each model turn (no explicit status-tool call required).
-- Worker report payloads are bounded to reduce context growth.
+- Worker telemetry appears in the persistent agents pane and updates live.
+- Orchestrator receives live worker snapshots each turn.
+- Worker report payloads are bounded to protect context length.
 
-### Current Status (Implemented)
-
-- Session-scoped `SubAgentRuntime` with spawn/revise/interrupt/terminate/wait/report lifecycle.
-- Role-aware graph behavior using the main `system_prompt` with inline mode modifiers.
-- Strict worker isolation:
-  - worker graphs do not receive sub-agent control tools,
-  - worker context is sanitized to avoid orchestration chatter.
-- Completion normalization:
-  - successful workers are represented as compact goal + final result snapshots,
-  - optional completion report generation is bounded and timeout-protected.
-- Context protection:
-  - report payload size caps,
-  - revision input truncation,
-  - compaction adjustment for oversized retained messages.
-
-### Current Interaction Model
-
-- The app is turn-based for normal chat.
-- If the orchestrator has active workers during a response, that same response stays open until all workers are done.
-- Live worker status updates are continuously reflected in the Sub-Agents side panel.
-- Once workers finish, the orchestrator continues and emits the completion update without requiring a manual poll message.
-
-### Detailed Report
-
-- See [Parallel Sub-Agent Implementation Report](PARALLEL_SUBAGENT_IMPLEMENTATION_REPORT.md) for architecture, lifecycle, safeguards, and known limitations.
+Detailed design/status: [Parallel Sub-Agent Implementation Report](PARALLEL_SUBAGENT_IMPLEMENTATION_REPORT.md).
 
 ## Docker
 
-Rebuild and launch the app in one command while mounting any host folder as the agent workspace:
+Rebuild and launch in one command while mounting a host workspace:
 
 ```bash
 make run
 ```
 
-`make run` uses the quiet Docker build mode and mounts the sibling `../llm-transpiler` project by default.
-Override the mounted workspace when needed:
+Override mounted workspace:
 
 ```bash
 make run WORKSPACE=/path/to/folder
 ```
 
-You can still call the Docker helper directly:
+Direct script usage:
 
 ```bash
 ./scripts/dev-docker.sh /path/to/folder
 ```
 
-The default mode keeps Docker build output quiet so you land directly in the app chat screen.
-Use debug mode only when you want full Docker logs:
+Debug build output:
 
 ```bash
 ./scripts/dev-docker.sh --debug /path/to/folder
@@ -163,46 +150,37 @@ LOCAL_CLAUDE_DOCKER_DEBUG=1 ./scripts/dev-docker.sh /path/to/folder
 ```
 
 Notes:
-- the mounted folder is available inside the container as `/workspace`,
-- the app still reads credentials from the repo `.env`,
-- terminal color support (`TERM`, `COLORTERM`) is forwarded for better TUI rendering,
-- `ripgrep` (`rg`) is available inside the container,
-- `ast-grep` (`ast-grep`) is available inside the container for `code_grep`,
-- the script still runs `docker build` on every launch (quiet mode only hides build logs),
-- rerun the same command after code changes to rebuild and launch again.
+- mounted folder is available as `/workspace`,
+- app still reads credentials from repo `.env`,
+- `TERM` and `COLORTERM` are forwarded for better terminal rendering,
+- `rg` and `ast-grep` are available in the container,
+- `docker build` still runs on each launch.
 
 ## Project Layout
 
 ```text
 llc/                     # All source code
-├── main.py              # Entrypoint (wires SessionEngine + SessionStore + TUI)
+├── main.py              # Entrypoint (SessionEngine + SessionStore + MissionControlApp)
 ├── config.py            # Settings, prompt loading, env details, DB path
 ├── models.py            # Model list fetching + pricing from OpenRouter
-├── agent/
-│   ├── graph.py         # StateGraph builder + role-specific prompt injection
-│   ├── llm.py           # Chat model factory (OpenAI / OpenRouter)
-│   ├── nodes.py         # LLM node, tool node, routing
-│   ├── state.py         # LangGraph state schema
-│   ├── subagents/       # Runtime manager + worker state models
-│   ├── compact.py       # History compaction logic
-│   ├── hooks.py         # Hook protocol, TokenCounterHook, AutoCompactHook
-│   ├── message_utils.py # Shared message text extraction
-│   └── tools/           # Tool implementations (Read, Write, Edit, Bash, Grep, etc.)
-├── commands/            # Slash-commands (/model, /compact, /enable, /subagent, /help, exit)
+├── agent/               # LangGraph runtime, nodes, tools, sub-agent runtime
+├── commands/            # Slash commands (/model, /compact, /enable, /subagent, /help, exit)
 ├── service/
 │   ├── engine.py        # Frontend-agnostic backend orchestrator
 │   ├── events.py        # Typed backend event models
 │   ├── stream_adapter.py# LangGraph chunk -> event translation
-│   └── prompt_registry.py # Prompt loader/cache for YAML prompt files
+│   └── prompt_registry.py
 ├── storage/
-│   ├── models.py        # Pydantic records for persisted entities
+│   ├── models.py        # Persisted entity records
 │   ├── schema.py        # SQLite schema + indexes
-│   └── store.py         # Async session store (aiosqlite)
+│   └── store.py         # Async session store
 ├── ui/
-│   ├── repl.py          # Textual app consuming backend events
-│   ├── widgets.py       # ChatBubble, ComposerInput, ModelPickerScreen
-│   ├── rendering.py     # Diff rendering, tool output formatting
-│   ├── display.py       # UI-specific format helpers
-│   └── repl.tcss        # Theme-aware styles for chat panels and composer
-└── prompts/             # System/compact plus role and runtime prompt YAML files
+│   ├── app.py           # Mission-control Textual app
+│   ├── app.tcss         # Mission-control style system
+│   ├── state.py         # Pydantic UI state models
+│   ├── telemetry_mapper.py
+│   ├── theme.py         # Theme registration/palettes
+│   ├── rendering.py     # Diff and tool-output render helpers
+│   └── panels/          # Top bar, execution, agents, logs, command surface
+└── prompts/             # System/compact + mode/runtime prompt YAML files
 ```

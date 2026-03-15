@@ -8,7 +8,7 @@ from llc.commands.subagent import SubagentCommand
 from llc.config import Settings
 from llc.service.engine import SessionEngine
 from llc.storage.store import SessionStore
-from llc.ui.repl import Repl
+from llc.ui import MissionControlApp
 
 
 def _build_registry() -> CommandRegistry:
@@ -27,7 +27,7 @@ def main() -> None:
     registry = _build_registry()
     store = SessionStore(settings.db_path)
     engine = SessionEngine(settings, registry, store=store)
-    app = Repl(engine)
+    app = MissionControlApp(engine)
     app.run()
 
 

@@ -19,7 +19,8 @@ Notes:
   To start with it enabled by default, set `SUB_AGENT_MODE_ENABLED=true` in .env.
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
-  Inside the TUI, use `Ctrl+G` or the `Agents` button to toggle the sub-agent side panel.
+  Mission-control UI controls: `Ctrl+G` toggles agents pane, `Ctrl+L` focuses logs.
+  Use `/model` for inline model selection in the command surface.
 EOF
 }
 
