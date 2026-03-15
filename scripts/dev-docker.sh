@@ -25,7 +25,7 @@ EOF
 }
 
 DEBUG=0
-if [[ "${LOCAL_CLAUDE_DOCKER_DEBUG:-0}" == "1" ]]; then
+if [[ "${LLC_DOCKER_DEBUG:-0}" == "1" ]]; then
   DEBUG=1
 fi
 

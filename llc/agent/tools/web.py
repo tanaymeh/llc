@@ -63,10 +63,10 @@ Usage notes:
         blocked_domains: Optional[list[str]] = None,
     ) -> str:
         """
-- Allows Claude to search the web and use the results to inform responses
+- Allows the agent to search the web and use the results to inform responses
 - Provides up-to-date information for current events and recent data
 - Returns search result information formatted as search result blocks
-- Use this tool for accessing information beyond Claude's knowledge cutoff
+- Use this tool for accessing information beyond the model's built-in knowledge cutoff
 - Searches are performed automatically within a single API call
 
 Usage notes:
