@@ -1,0 +1,298 @@
+Screen {
+    background: #0A0D0E;
+    color: #E3ECE9;
+}
+
+#top_bar {
+    dock: top;
+    height: 3;
+    padding: 0 1;
+    background: #101617;
+    border-bottom: solid #253133;
+    color: #E3ECE9;
+}
+
+#main_row {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#execution {
+    width: 1fr;
+    padding: 0 1;
+    border-right: solid #253133;
+}
+
+#agents {
+    width: 42;
+    min-width: 32;
+    max-width: 56;
+    padding: 0 1;
+}
+
+#agents_resize_handle {
+    width: 1;
+    color: #253133;
+    background: #0A0D0E;
+    content-align: center middle;
+}
+
+.agents-resizing #agents_resize_handle,
+#agents_resize_handle:hover {
+    color: #79F2C0;
+    background: #101617;
+}
+
+.panel-title {
+    width: 1fr;
+    color: #79F2C0;
+    text-style: bold;
+    padding: 0 0 0 0;
+    margin: 0 0 1 0;
+}
+
+.subpanel-title {
+    width: 1fr;
+    color: #93A19E;
+    text-style: bold;
+    margin: 0 0 0 0;
+}
+
+#execution_reasoning_log {
+    height: 6;
+    min-height: 4;
+    max-height: 8;
+    border: solid #253133;
+    background: #0D1314;
+    color: #B8FFE8;
+    margin: 0 0 1 0;
+    scrollbar-size-horizontal: 0;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: #0D1314;
+    scrollbar-color: #253133;
+    scrollbar-color-hover: #66DED3;
+    scrollbar-color-active: #79F2C0;
+    scrollbar-corner-color: #0D1314;
+}
+
+#execution_tool_log {
+    height: 5;
+    min-height: 4;
+    max-height: 8;
+    border: solid #253133;
+    background: #101617;
+    color: #93A19E;
+    margin: 0 0 1 0;
+    scrollbar-size-horizontal: 0;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: #101617;
+    scrollbar-color: #253133;
+    scrollbar-color-hover: #66DED3;
+    scrollbar-color-active: #79F2C0;
+    scrollbar-corner-color: #101617;
+}
+
+#mission_lane {
+    height: 1fr;
+    border: solid #253133;
+    background: #101617;
+    padding: 0 0;
+}
+
+.mission-message {
+    width: 1fr;
+    height: auto;
+    border-bottom: solid #253133;
+    margin: 0;
+    padding: 0 1;
+}
+
+.role-user {
+    background: #0F1719;
+}
+
+.role-agent {
+    background: #101617;
+}
+
+.role-system {
+    background: #0D1213;
+}
+
+.lane-header {
+    width: 1fr;
+    color: #79F2C0;
+    text-style: bold;
+    margin: 0;
+}
+
+.role-user .lane-header {
+    color: #66DED3;
+}
+
+.role-system .lane-header {
+    color: #93A19E;
+}
+
+.lane-meta {
+    width: 1fr;
+    color: #667270;
+    text-style: dim;
+    margin: 0;
+}
+
+.lane-content {
+    width: 1fr;
+    height: auto;
+    background: transparent;
+    color: #E3ECE9;
+    margin: 0;
+    text-wrap: wrap;
+}
+
+.lane-markdown {
+    width: 1fr;
+    height: auto;
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    color: #E3ECE9;
+}
+
+.lane-markdown MarkdownFence {
+    border: solid #253133;
+    margin: 0 0 1 0;
+}
+
+.lane-tool-output {
+    width: 1fr;
+    margin: 0 0 1 0;
+}
+
+#agents_scroll {
+    border: solid #253133;
+    background: #101617;
+    padding: 0;
+}
+
+#agents_body {
+    width: 1fr;
+    color: #E3ECE9;
+    padding: 0 1;
+}
+
+#log_panel {
+    dock: bottom;
+    height: 14;
+    min-height: 8;
+    border-top: solid #253133;
+    padding: 0 1;
+    background: #0B1112;
+}
+
+#log_stream {
+    width: 1fr;
+    height: 1fr;
+    border: solid #253133;
+    background: #101617;
+}
+
+#command_surface {
+    dock: bottom;
+    height: auto;
+    border-top: solid #253133;
+    padding: 0 1;
+    background: #101617;
+}
+
+#command_row {
+    width: 1fr;
+    height: 3;
+    align: left middle;
+}
+
+#command_prompt {
+    width: 2;
+    height: 1;
+    color: #79F2C0;
+    text-style: bold;
+    content-align: left middle;
+}
+
+#command_input {
+    width: 1fr;
+    height: 3;
+    border: solid #253133;
+    background: #0A0D0E;
+    color: #E3ECE9;
+}
+
+#command_hint {
+    width: auto;
+    height: 1;
+    color: #667270;
+    margin: 0 0 0 1;
+    content-align: left middle;
+}
+
+#model_selector {
+    width: 1fr;
+    height: auto;
+    margin: 0 0 1 0;
+    border: solid #253133;
+    background: #0A0D0E;
+    padding: 0 1 1 1;
+}
+
+#model_selector_title {
+    color: #79F2C0;
+    text-style: bold;
+    margin: 0 0 1 0;
+}
+
+#model_filter_input {
+    width: 1fr;
+    border: solid #253133;
+    background: #101617;
+    color: #E3ECE9;
+    margin: 0 0 1 0;
+}
+
+#model_option_list {
+    width: 1fr;
+    max-height: 10;
+    border: solid #253133;
+    background: #101617;
+}
+
+#model_option_list > .option-list--option-highlighted {
+    background: #16342E;
+    color: #B8FFE8;
+}
+
+.mode-focus-logs #main_row,
+.mode-focus-logs #execution,
+.mode-focus-logs #agents {
+    display: none;
+}
+
+.mode-focus-logs #log_panel {
+    height: 1fr;
+}
+
+.mode-focus-agents #execution {
+    display: none;
+}
+
+.mode-focus-agents #agents {
+    width: 1fr;
+}
+
+.mode-focus-execution #agents {
+    display: none;
+}
+
+.mode-focus-execution #execution {
+    width: 1fr;
+    border-right: none;
+}
