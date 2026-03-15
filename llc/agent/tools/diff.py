@@ -1,10 +1,10 @@
 import difflib
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel, ConfigDict
 
 _IGNORED_DIRS = {
     ".git",
@@ -22,8 +22,9 @@ _MAX_DIFF_CHARS = 120_000
 _SESSION_BASELINES: dict[str, dict[str, "_SnapshotEntry"]] = {}
 
 
-@dataclass(frozen=True)
-class _SnapshotEntry:
+class _SnapshotEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     kind: str
     content: str
     size: int

@@ -13,6 +13,7 @@ from llc.agent.llm import build_chat_model
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.types import ACTIVE_STATUSES, SubAgentRecord
 from llc.config import Settings
+from llc.service.prompt_registry import PromptRegistry
 
 SubAgentBuilder = Callable[[Settings], Any]
 _MAX_STORED_FINAL_OUTPUT_CHARS = 12000
@@ -47,9 +48,15 @@ class _StopRequested(RuntimeError):
 
 
 class SubAgentRuntime:
-    def __init__(self, settings: Settings, build_subagent: SubAgentBuilder) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        build_subagent: SubAgentBuilder,
+        prompt_registry: PromptRegistry | None = None,
+    ) -> None:
         self._settings = settings
         self._build_subagent = build_subagent
+        self._prompt_registry = prompt_registry
         self._records: dict[str, SubAgentRecord] = {}
         self._lock = RLock()
         self._closed = False
@@ -359,7 +366,17 @@ class SubAgentRuntime:
 
         try:
             async for mode, chunk in agent.astream(
-                {"messages": [HumanMessage(content=_render_assignment(task, context))]},
+                {
+                    "messages": [
+                        HumanMessage(
+                            content=_render_assignment(
+                                task,
+                                context,
+                                self._prompt_registry,
+                            )
+                        )
+                    ]
+                },
                 config={"configurable": {"thread_id": thread_id}},
                 stream_mode=["messages", "updates"],
             ):
@@ -469,6 +486,7 @@ class SubAgentRuntime:
             activity_detail="Summarizing sub-agent output.",
             last_tool_name=last_tool_name,
         )
+        report_prompt = self._completion_report_prompt()
         (
             completion_report,
             report_input_tokens,
@@ -480,6 +498,7 @@ class SubAgentRuntime:
             settings=settings,
             goal=task,
             final_output=final_output,
+            report_prompt=report_prompt,
         )
         _accumulate_usage_by_model(
             usage_by_model,
@@ -598,7 +617,12 @@ class SubAgentRuntime:
         feedback = "\n".join(item.strip() for item in record.pending_feedback if item.strip())
         record.pending_feedback.clear()
         record.attempt += 1
-        record.task = _task_with_feedback(record.base_task, feedback, record.final_output)
+        record.task = _task_with_feedback(
+            record.base_task,
+            feedback,
+            record.final_output,
+            self._prompt_registry,
+        )
         record.stop_event.clear()
         record.status = "restarting"
         record.error = ""
@@ -753,32 +777,92 @@ class SubAgentRuntime:
         trimmed.sort(key=lambda record: record.created_at)
         return trimmed
 
+    def _completion_report_prompt(self) -> str:
+        registry = self._prompt_registry
+        if registry is not None:
+            try:
+                return registry.get(
+                    "subagent_report",
+                    key="subagent_report_prompt",
+                )
+            except Exception:
+                return _SUBAGENT_REPORT_PROMPT
+        return _SUBAGENT_REPORT_PROMPT
 
-def _render_assignment(task: str, context: str) -> str:
-    if not context.strip():
+
+def _render_assignment(
+    task: str,
+    context: str,
+    prompt_registry: PromptRegistry | None = None,
+) -> str:
+    clean_task = task.strip()
+    clean_context = context.strip()
+    if prompt_registry is not None:
+        if clean_context:
+            try:
+                return prompt_registry.get_formatted(
+                    "assignment",
+                    key="assignment_with_context_prompt",
+                    task=clean_task,
+                    context=clean_context,
+                )
+            except Exception:
+                pass
+        try:
+            return prompt_registry.get_formatted(
+                "assignment",
+                key="assignment_prompt",
+                task=clean_task,
+            )
+        except Exception:
+            pass
+    if not clean_context:
         return (
             "Assigned task:\n"
-            f"{task.strip()}\n\n"
+            f"{clean_task}\n\n"
             "Execute this task and provide a clear final result."
         )
     return (
         "Assigned task:\n"
-        f"{task.strip()}\n\n"
+        f"{clean_task}\n\n"
         "Relevant context:\n"
-        f"{context.strip()}\n\n"
+        f"{clean_context}\n\n"
         "Execute the task using the context and provide a clear final result."
     )
 
 
-def _task_with_feedback(base_task: str, feedback: str, prior_output: str) -> str:
-    if not feedback and not prior_output:
+def _task_with_feedback(
+    base_task: str,
+    feedback: str,
+    prior_output: str,
+    prompt_registry: PromptRegistry | None = None,
+) -> str:
+    base = base_task.strip()
+    prior = prior_output.strip()
+    revised = feedback.strip()
+    trimmed_prior = _preview_text(prior, _MAX_REVISION_PART_CHARS) if prior else ""
+    trimmed_feedback = _preview_text(revised, _MAX_REVISION_PART_CHARS) if revised else ""
+
+    if prompt_registry is not None:
+        try:
+            rendered = prompt_registry.get_formatted(
+                "assignment",
+                key="revision_task_prompt",
+                base_task=base,
+                prior_output=trimmed_prior,
+                feedback=trimmed_feedback,
+            ).strip()
+            if rendered:
+                return rendered
+        except Exception:
+            pass
+
+    if not revised and not prior:
         return base_task
-    parts = [f"Original task:\n{base_task.strip()}"]
-    if prior_output.strip():
-        trimmed_prior = _preview_text(prior_output.strip(), _MAX_REVISION_PART_CHARS)
+    parts = [f"Original task:\n{base}"]
+    if prior:
         parts.append(f"Prior attempt output:\n{trimmed_prior}")
-    if feedback.strip():
-        trimmed_feedback = _preview_text(feedback.strip(), _MAX_REVISION_PART_CHARS)
+    if revised:
         parts.append(f"Revision instructions:\n{trimmed_feedback}")
     parts.append("Produce an improved final result.")
     return "\n\n".join(parts)
@@ -791,6 +875,7 @@ async def _build_completion_report(
     settings: Settings,
     goal: str,
     final_output: str,
+    report_prompt: str,
 ) -> tuple[str, int, int, str]:
     report_model_name = settings.compact_model_name or settings.model_name
     fallback = _preview_text(final_output.strip(), _MAX_COMPLETION_REPORT_CHARS)
@@ -806,7 +891,7 @@ async def _build_completion_report(
         response = await asyncio.wait_for(
             model.ainvoke(
                 [
-                    SystemMessage(content=_SUBAGENT_REPORT_PROMPT),
+                    SystemMessage(content=report_prompt),
                     HumanMessage(
                         content=(
                             "Goal:\n"

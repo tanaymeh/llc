@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
-import uuid
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage
 from rich.text import Text
 from textual import on, work
 from textual.actions import SkipAction
@@ -16,18 +15,18 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.worker import Worker, WorkerState, get_current_worker
 from textual.widgets import Button, Markdown, Static
 
-from llc.agent import build_agent_graph
-from llc.commands import CommandRegistry, ReplContext
-from llc.config import Settings
-from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
-from llc.agent.subagents import SubAgentRuntime
-from llc.models import AvailableModel, fetch_models, get_model_pricing
-from llc.ui.display import (
-    collect_new_user_facing_tool_results,
-    collect_new_tool_calls,
-    extract_reasoning,
-    format_tool_args,
-    message_text,
+from llc.models import AvailableModel
+from llc.service.engine import SessionEngine
+from llc.service.events import (
+    CommandOutput,
+    ErrorOccurred,
+    ReasoningDelta,
+    SubagentStatusUpdate,
+    TextDelta,
+    ToolCallStarted,
+    ToolResultEvent,
+    TurnCompleted,
+    UsageUpdate,
 )
 from llc.ui.rendering import format_duration, render_user_facing_tool_output
 from llc.ui.widgets import ChatBubble, ComposerInput, ModelPickerScreen, SubAgentCard
@@ -48,14 +47,6 @@ _ACTIVE_WORKER_STATUSES = {"running", "restarting", "terminating"}
 _DOUBLE_ESCAPE_WINDOW_S = 0.6
 _SUBAGENT_PANEL_EMPTY_ACTIVE = "No sub-agents are currently running."
 _SUBAGENT_PANEL_EMPTY_PAST = "No past sub-agents yet."
-_SESSION_INTERRUPT_MESSAGE = "Session Interrupted, what should be done differently?"
-_MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
-    "A manual /subagent launch just occurred.\n"
-    "Continue orchestration for all currently active workers.\n"
-    "Do not launch new workers unless explicitly required for safety.\n"
-    "Keep this response open until all workers complete.\n"
-    "Provide concise progress updates and then a final combined outcome."
-)
 
 
 def _single_line_preview(text: str, limit: int) -> str:
@@ -63,6 +54,18 @@ def _single_line_preview(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+def _format_tool_args(args: dict[str, Any]) -> str:
+    if not args:
+        return ""
+    parts: list[str] = []
+    for key, value in args.items():
+        val = repr(value) if isinstance(value, str) else str(value)
+        if len(val) > 60:
+            val = val[:57] + "..."
+        parts.append(f"{key}={val}")
+    return ", ".join(parts)
 
 
 def _format_agent_status(report: dict[str, Any]) -> str:
@@ -105,33 +108,65 @@ def _format_agent_status(report: dict[str, Any]) -> str:
 
 
 class _ReasoningTracker:
+    _WORD_WITH_TRAILING_SPACE_RE = re.compile(r"\S+\s*")
+    _WORD_RE = re.compile(r"\S+")
+
     def __init__(self) -> None:
         self.started_at: float | None = None
-        self._tokens: list[str] = []
+        self._buffer = ""
         self._last_emitted: float | None = None
 
     def feed(self, text: str) -> str | None:
-        cleaned = text.strip()
-        if not cleaned:
+        if not text or not text.strip():
             return None
         if self.started_at is None:
             self.started_at = time.monotonic()
-        words = cleaned.split()
-        if not words:
-            return None
-        self._tokens.extend(words)
+        self._buffer += text
         now = time.monotonic()
-        if len(self._tokens) < _REASONING_TOKENS_PER_LINE:
+        if self._word_count(self._buffer) < _REASONING_TOKENS_PER_LINE:
             return None
         if (
             self._last_emitted is not None
             and now - self._last_emitted < _REASONING_LINE_INTERVAL
         ):
             return None
-        line_tokens = self._tokens[:_REASONING_TOKENS_PER_LINE]
-        self._tokens = self._tokens[_REASONING_TOKENS_PER_LINE:]
+        line_text, remaining = self._consume_first_words(
+            self._buffer,
+            _REASONING_TOKENS_PER_LINE,
+        )
+        if line_text is None:
+            return None
+        self._buffer = remaining
         self._last_emitted = now
-        return " ".join(line_tokens)
+        rendered = self._to_single_line(line_text)
+        if not rendered:
+            return None
+        return rendered
+
+    @classmethod
+    def _word_count(cls, text: str) -> int:
+        return sum(1 for _ in cls._WORD_WITH_TRAILING_SPACE_RE.finditer(text))
+
+    @classmethod
+    def _consume_first_words(
+        cls,
+        text: str,
+        count: int,
+    ) -> tuple[str | None, str]:
+        seen = 0
+        cut_index = None
+        for match in cls._WORD_WITH_TRAILING_SPACE_RE.finditer(text):
+            seen += 1
+            if seen >= count:
+                cut_index = match.end()
+                break
+        if cut_index is None:
+            return None, text
+        return text[:cut_index], text[cut_index:]
+
+    @classmethod
+    def _to_single_line(cls, text: str) -> str:
+        return " ".join(match.group(0) for match in cls._WORD_RE.finditer(text))
 
     @property
     def active(self) -> bool:
@@ -142,7 +177,7 @@ class _ReasoningTracker:
         if self.started_at is not None:
             elapsed = max(time.monotonic() - self.started_at, 0.0)
         self.started_at = None
-        self._tokens.clear()
+        self._buffer = ""
         self._last_emitted = None
         return f"  Reasoned for {format_duration(elapsed)}"
 
@@ -168,20 +203,12 @@ class Repl(App[None]):
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
-    def __init__(self, settings: Settings, registry: CommandRegistry) -> None:
+    def __init__(self, engine: SessionEngine) -> None:
         super().__init__()
-        self._settings = settings
-        self._command_registry = registry
-        self._ctx: ReplContext | None = None
-        self._agent_thread_id = f"tui-{uuid.uuid4()}"
-        self._token_hook = TokenCounterHook()
-        self._hooks: list[Hook] = [self._token_hook, AutoCompactHook()]
+        self._engine = engine
         self._available_models: list[AvailableModel] = []
-        self._turn_input = 0
-        self._turn_output = 0
-        self._turn_text_len = 0
+        self._usage = UsageUpdate()
         self._busy = False
-        self._subagent_runtime: SubAgentRuntime | None = None
         self._active_turn_worker: Worker[None] | None = None
         self._last_escape_pressed_at: float = 0.0
         self._interrupt_in_progress = False
@@ -217,20 +244,8 @@ class Repl(App[None]):
         self._set_agents_panel_visible(False)
         self._refresh_banner()
 
-        self._subagent_runtime = SubAgentRuntime(
-            self._settings,
-            build_subagent=lambda settings: build_agent_graph(
-                settings,
-                role="subagent",
-            ),
-        )
-        role = "orchestrator" if self._settings.sub_agent_mode_enabled else "default"
         try:
-            agent = build_agent_graph(
-                self._settings,
-                role=role,
-                subagent_runtime=self._subagent_runtime,
-            )
+            await self._engine.initialize()
         except Exception as exc:  # noqa: BLE001
             await self._append_system(
                 "Model initialization failed. "
@@ -240,19 +255,22 @@ class Repl(App[None]):
             )
             return
 
-        self._ctx = ReplContext(
-            settings=self._settings,
-            agent=agent,
-            thread_id=self._agent_thread_id,
-            subagent_runtime=self._subagent_runtime,
-        )
+        self._available_models = self._engine.available_models
         self._start_subagent_panel_polling()
         await self._append_system(
             "Connected. Type `/help` for commands. "
             "`Ctrl+Enter` to send (`Enter` on many terminals). "
             "`Ctrl+N`/`Ctrl+O` insert newline. `Ctrl+Q` to quit."
         )
-        self._load_available_models()
+        self._refresh_banner()
+
+    def on_unmount(self) -> None:
+        task = self._subagent_panel_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._subagent_panel_task = None
+        with contextlib.suppress(RuntimeError):
+            asyncio.create_task(self._engine.shutdown())
 
     def _configure_composer(self) -> None:
         composer = self._composer_input()
@@ -299,6 +317,33 @@ class Repl(App[None]):
         button = self.query_one("#agents_button", Button)
         button.variant = "primary" if visible else "default"
 
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self._set_send_enabled(not busy)
+
+    def _refresh_banner(self) -> None:
+        banner = Text()
+        banner.append(LLC_LOGO, style="bold cyan")
+        banner.append("\n  Model: ", style="dim")
+        banner.append(self._engine.model_name, style="bold")
+        banner.append("   |   ", style="dim")
+        banner.append(
+            f"Tokens: {self._usage.session_input_tokens:,} in / {self._usage.session_output_tokens:,} out",
+            style="dim",
+        )
+        if self._usage.session_cost > 0:
+            banner.append(f"   |   ${self._usage.session_cost:.4f}", style="dim")
+        banner.append("\n  Type ", style="dim")
+        banner.append("/help", style="bold")
+        banner.append(" for commands. ", style="dim")
+        banner.append("/model", style="bold")
+        banner.append(" to switch models.", style="dim")
+        if self._engine.sub_agent_mode_enabled:
+            banner.append("  ", style="dim")
+            banner.append("sub-agent mode: ", style="dim")
+            banner.append("ON", style="bold green")
+        self.query_one("#banner", Static).update(banner)
+
     def _start_subagent_panel_polling(self) -> None:
         task = self._subagent_panel_task
         if task is not None and not task.done():
@@ -310,13 +355,13 @@ class Repl(App[None]):
             while True:
                 report: dict[str, Any] = {"workers": []}
                 try:
-                    if self._ctx is not None and self._ctx.subagent_runtime is not None:
-                        report = self._ctx.subagent_runtime.get_subagent_report(
-                            include_all=True,
-                        )
-                except Exception:  # noqa: BLE001
+                    report = self._engine.get_subagent_report(include_all=True)
+                except Exception:
                     report = {"workers": []}
-                await self._sync_subagent_panel(report)
+                try:
+                    await self._sync_subagent_panel(report)
+                except Exception:
+                    pass
                 await asyncio.sleep(_AGENT_STATUS_POLL_INTERVAL_S)
         except asyncio.CancelledError:
             return
@@ -352,11 +397,11 @@ class Repl(App[None]):
                 await target_column.mount(card)
                 continue
 
-            card.update_from_snapshot(worker)
             if card.parent is not target_column:
                 if card.parent is not None:
                     await card.remove()
                 await target_column.mount(card)
+            card.update_from_snapshot(worker)
 
         stale_ids = [
             subagent_id
@@ -370,81 +415,6 @@ class Repl(App[None]):
 
         self._agents_active_empty().display = active_count == 0
         self._agents_past_empty().display = past_count == 0
-
-    def _set_busy(self, busy: bool) -> None:
-        self._busy = busy
-        self._set_send_enabled(not busy)
-
-    def _current_model_name(self) -> str:
-        if self._ctx is not None:
-            return self._ctx.settings.model_name
-        return self._settings.model_name
-
-    def _refresh_banner(self) -> None:
-        model_name = self._current_model_name()
-        subagent_in, subagent_out, subagent_cost = self._subagent_usage_snapshot()
-        inp = self._token_hook.session_input + subagent_in
-        out = self._token_hook.session_output + subagent_out
-        total_cost = self._token_hook.session_cost + subagent_cost
-        banner = Text()
-        banner.append(LLC_LOGO, style="bold cyan")
-        banner.append("\n  Model: ", style="dim")
-        banner.append(model_name, style="bold")
-        banner.append("   |   ", style="dim")
-        banner.append(f"Tokens: {inp:,} in / {out:,} out", style="dim")
-        if total_cost > 0:
-            banner.append(f"   |   ${total_cost:.4f}", style="dim")
-        banner.append("\n  Type ", style="dim")
-        banner.append("/help", style="bold")
-        banner.append(" for commands. ", style="dim")
-        banner.append("/model", style="bold")
-        banner.append(" to switch models.", style="dim")
-        if self._ctx is not None and self._ctx.settings.sub_agent_mode_enabled:
-            banner.append("  ", style="dim")
-            banner.append("sub-agent mode: ", style="dim")
-            banner.append("ON", style="bold green")
-        self.query_one("#banner", Static).update(banner)
-
-    def _subagent_usage_snapshot(self) -> tuple[int, int, float]:
-        runtime = self._subagent_runtime
-        if runtime is None:
-            return 0, 0, 0.0
-        try:
-            usage = runtime.get_usage_totals()
-        except Exception:  # noqa: BLE001
-            return 0, 0, 0.0
-
-        input_tokens = int(usage.get("input_tokens", 0) or 0)
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
-        input_tokens = max(input_tokens, 0)
-        output_tokens = max(output_tokens, 0)
-
-        by_model = usage.get("by_model", {})
-        if not isinstance(by_model, dict):
-            return input_tokens, output_tokens, 0.0
-
-        cost = 0.0
-        for raw_model_name, raw_bucket in by_model.items():
-            model_name = str(raw_model_name).strip()
-            if not model_name or not isinstance(raw_bucket, dict):
-                continue
-            model_input = max(int(raw_bucket.get("input_tokens", 0) or 0), 0)
-            model_output = max(int(raw_bucket.get("output_tokens", 0) or 0), 0)
-            if model_input == 0 and model_output == 0:
-                continue
-            pricing = get_model_pricing(self._available_models, model_name)
-            if pricing is None:
-                continue
-            cost += model_input * pricing[0] + model_output * pricing[1]
-        return input_tokens, output_tokens, cost
-
-    def on_unmount(self) -> None:
-        task = self._subagent_panel_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._subagent_panel_task = None
-        if self._subagent_runtime is not None:
-            self._subagent_runtime.shutdown()
 
     async def _append_message(
         self,
@@ -522,7 +492,7 @@ class Repl(App[None]):
         self._active_turn_worker = self._handle_user_turn(user_input)
 
     def _do_send(self) -> None:
-        if self._busy or self._ctx is None:
+        if self._busy:
             return
         raw = self._composer_input().text.strip()
         if not raw:
@@ -558,21 +528,8 @@ class Repl(App[None]):
         worker = get_current_worker()
         try:
             await self._append_message("user", user_input)
-            if self._ctx is None:
-                return
-
-            match = self._command_registry.match(user_input)
-            if match:
-                command, args = match
-                await self._run_command(command, args)
-                return
-
-            bubble = await self._append_message(
-                "agent",
-                "",
-                model_name=self._ctx.settings.model_name,
-            )
-            await self._stream_agent_response(user_input, bubble)
+            await self._stream_engine_response(user_input)
+            self._available_models = self._engine.available_models
         finally:
             if self._active_turn_worker is worker:
                 self._active_turn_worker = None
@@ -582,14 +539,17 @@ class Repl(App[None]):
     async def _interrupt_session(self) -> None:
         try:
             await self._cancel_active_turn_worker()
-            self._terminate_active_subagents()
             self._set_busy(False)
             self._composer_input().focus()
-            await self._append_message(
-                "agent",
-                _SESSION_INTERRUPT_MESSAGE,
-                model_name=self._current_model_name(),
-            )
+            async for event in self._engine.interrupt():
+                if isinstance(event, CommandOutput) and event.message:
+                    await self._append_message(
+                        "agent",
+                        event.message,
+                        model_name=self._engine.model_name,
+                    )
+                elif isinstance(event, ErrorOccurred):
+                    await self._append_system(event.message)
         finally:
             self._interrupt_in_progress = False
 
@@ -603,168 +563,114 @@ class Repl(App[None]):
                 await asyncio.wait_for(worker.wait(), timeout=1.5)
         self._active_turn_worker = None
 
-    def _terminate_active_subagents(self) -> None:
-        runtime = self._subagent_runtime
-        if runtime is None:
-            return
-        try:
-            report = runtime.get_subagent_report()
-        except Exception:  # noqa: BLE001
-            return
-        workers = report.get("workers", [])
-        if not isinstance(workers, list):
-            return
-        for worker in workers:
-            if not isinstance(worker, dict):
-                continue
-            status = str(worker.get("status", ""))
-            if status not in _ACTIVE_WORKER_STATUSES:
-                continue
-            subagent_id = str(worker.get("id", "")).strip()
-            if not subagent_id:
-                continue
-            with contextlib.suppress(Exception):
-                runtime.terminate_subagent(
-                    subagent_id,
-                    reason="session_interrupted",
-                )
-
-    async def _run_command(self, command: Any, args: str) -> None:
-        if self._ctx is None:
-            return
-        result = await command.execute(args, self._ctx)
-        if result.message:
-            await self._append_message(
-                "agent",
-                result.message,
-                model_name=self._ctx.settings.model_name,
-            )
-        spawned_subagent_id = str(result.data.get("spawned_subagent_id", "")).strip()
-        if (
-            spawned_subagent_id
-            and self._ctx.settings.sub_agent_mode_enabled
-            and self._ctx.subagent_runtime is not None
-        ):
-            report = self._ctx.subagent_runtime.get_subagent_report()
-            try:
-                active_count = int(report.get("active_count", 0) or 0)
-            except Exception:  # noqa: BLE001
-                active_count = 0
-            if active_count > 0:
-                followup_bubble = await self._append_message(
-                    "agent",
-                    "",
-                    model_name=self._ctx.settings.model_name,
-                )
-                await self._stream_agent_response(
-                    _MANUAL_SUBAGENT_FOLLOWUP_PROMPT,
-                    followup_bubble,
-                )
-        self._refresh_banner()
-        if result.should_exit:
-            self.exit()
-
-    async def _stream_agent_response(
-        self, user_input: str, bubble: ChatBubble
-    ) -> None:
-        if self._ctx is None:
-            return
-
-        md_stream = Markdown.get_stream(bubble.markdown_widget())
-        fallback_text = ""
-        saw_text = False
-        seen_ids: set[str] = set()
-        seen_tool_result_ids: set[str] = set()
+    async def _stream_engine_response(self, user_input: str) -> None:
+        stream_bubble: ChatBubble | None = None
+        md_stream: Any | None = None
         reasoning = _ReasoningTracker()
-        tool_idx = 0
         agent_status_stop = asyncio.Event()
         agent_status_task: asyncio.Task[None] | None = None
-        if (
-            self._ctx.settings.sub_agent_mode_enabled
-            and self._ctx.subagent_runtime is not None
-        ):
-            agent_status_task = asyncio.create_task(
-                self._poll_agent_status(bubble, agent_status_stop)
-            )
+
+        async def ensure_stream_bubble() -> ChatBubble:
+            nonlocal stream_bubble, md_stream, agent_status_task
+            if stream_bubble is None:
+                stream_bubble = await self._append_message(
+                    "agent",
+                    "",
+                    model_name=self._engine.model_name,
+                )
+                md_stream = Markdown.get_stream(stream_bubble.markdown_widget())
+                if self._engine.sub_agent_mode_enabled:
+                    agent_status_task = asyncio.create_task(
+                        self._poll_agent_status(stream_bubble, agent_status_stop)
+                    )
+            return stream_bubble
 
         try:
-            async for mode, chunk in self._ctx.agent.astream(
-                {"messages": [HumanMessage(content=user_input)]},
-                config={"configurable": {"thread_id": self._agent_thread_id}},
-                stream_mode=["messages", "updates"],
-            ):
-                if mode == "messages":
-                    msg_chunk, meta = chunk
-                    if meta.get("langgraph_node") != "llm":
-                        continue
-
-                    r_text = extract_reasoning(msg_chunk)
-                    if r_text:
-                        line = reasoning.feed(r_text)
-                        if line is not None:
-                            bubble.update_reasoning_line(f"  {line}")
-                        continue
-
-                    text = message_text(msg_chunk.content)
-                    if text:
-                        if reasoning.active:
-                            bubble.set_reasoning_summary(reasoning.finish())
-                        saw_text = True
-                        self._turn_text_len += len(text)
-                        await md_stream.write(text)
-
-                if mode != "updates" or not isinstance(chunk, dict):
+            async for event in self._engine.send_message(user_input):
+                if isinstance(event, TextDelta):
+                    bubble = await ensure_stream_bubble()
+                    if reasoning.active:
+                        bubble.set_reasoning_summary(reasoning.finish())
+                    if md_stream is not None:
+                        await md_stream.write(event.text)
                     continue
 
-                for node_update in chunk.values():
-                    if not isinstance(node_update, dict):
-                        continue
-                    for msg in node_update.get("messages", []):
-                        if not isinstance(msg, AIMessage):
-                            continue
-                        self._extract_usage(msg)
-                        if getattr(msg, "tool_calls", None):
-                            continue
-                        t = message_text(msg.content)
-                        if t:
-                            fallback_text = t
+                if isinstance(event, ReasoningDelta):
+                    bubble = await ensure_stream_bubble()
+                    line = reasoning.feed(event.text)
+                    if line is not None:
+                        bubble.update_reasoning_line(f"  {line}")
+                    continue
 
-                new_tools = collect_new_tool_calls(chunk, seen_ids)
-                for tc in new_tools:
-                    tool_idx += 1
-                    name = tc.get("name", "tool")
-                    args = tc.get("args", {})
-                    args_str = format_tool_args(args)
-                    line = f"  ↳ [{tool_idx}] {name}"
+                if isinstance(event, ToolCallStarted):
+                    bubble = await ensure_stream_bubble()
+                    args_str = _format_tool_args(event.args)
+                    line = f"  ↳ [{event.tool_index}] {event.tool_name}"
                     if args_str:
                         line += f"({args_str})"
                     bubble.update_tool_status(line)
+                    continue
 
-                user_facing_results = collect_new_user_facing_tool_results(
-                    chunk, seen_tool_result_ids
-                )
-                for result in user_facing_results:
+                if isinstance(event, ToolResultEvent):
+                    if not event.user_facing:
+                        continue
+                    bubble = await ensure_stream_bubble()
                     bubble.append_tool_output(
                         render_user_facing_tool_output(
-                            result["tool_name"],
-                            result["render_mode"],
-                            result["content"],
+                            event.tool_name,
+                            event.render_mode,
+                            event.content,
                         )
                     )
+                    continue
 
-            await md_stream.stop()
+                if isinstance(event, SubagentStatusUpdate):
+                    report = {
+                        "workers": event.workers,
+                        "active_count": event.active_count,
+                        "max_sub_agents": event.max_sub_agents,
+                    }
+                    if stream_bubble is not None:
+                        stream_bubble.update_agent_status(_format_agent_status(report))
+                    await self._sync_subagent_panel(report)
+                    continue
 
-            if reasoning.active:
-                bubble.set_reasoning_summary(reasoning.finish())
+                if isinstance(event, UsageUpdate):
+                    self._usage = event
+                    self._refresh_banner()
+                    continue
 
-            if not saw_text and fallback_text.strip():
-                await bubble.set_markdown(fallback_text)
-        except asyncio.CancelledError:
-            await md_stream.stop()
-            raise
-        except Exception as exc:  # noqa: BLE001
-            await md_stream.stop()
-            await bubble.set_markdown(f"Request failed: `{exc!s}`")
+                if isinstance(event, CommandOutput):
+                    if event.message:
+                        await self._append_message(
+                            "agent",
+                            event.message,
+                            model_name=self._engine.model_name,
+                        )
+                    if event.should_exit:
+                        self.exit()
+                    continue
+
+                if isinstance(event, ErrorOccurred):
+                    if stream_bubble is None:
+                        await self._append_message(
+                            "agent",
+                            f"Request failed: `{event.message}`",
+                            model_name=self._engine.model_name,
+                        )
+                    elif md_stream is not None:
+                        await md_stream.stop()
+                        md_stream = None
+                        await stream_bubble.set_markdown(f"Request failed: `{event.message}`")
+                    else:
+                        await stream_bubble.set_markdown(f"Request failed: `{event.message}`")
+                    continue
+
+                if isinstance(event, TurnCompleted):
+                    if reasoning.active and stream_bubble is not None:
+                        stream_bubble.set_reasoning_summary(reasoning.finish())
+                    if event.compact_message:
+                        await self._append_system(event.compact_message)
         finally:
             agent_status_stop.set()
             if agent_status_task is not None:
@@ -774,9 +680,13 @@ class Repl(App[None]):
                     agent_status_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await agent_status_task
-            bubble.clear_tool_status()
-            bubble.clear_agent_status()
-            await self._finish_turn()
+            if md_stream is not None:
+                with contextlib.suppress(Exception):
+                    await md_stream.stop()
+            if stream_bubble is not None:
+                stream_bubble.clear_tool_status()
+                stream_bubble.clear_agent_status()
+            self._refresh_banner()
 
     async def _poll_agent_status(
         self,
@@ -786,13 +696,11 @@ class Repl(App[None]):
         while not stop_signal.is_set():
             status_text = ""
             try:
-                if self._ctx is not None and self._ctx.subagent_runtime is not None:
-                    report = self._ctx.subagent_runtime.get_subagent_report()
-                    status_text = _format_agent_status(report)
-            except Exception:  # noqa: BLE001
+                report = self._engine.get_subagent_report()
+                status_text = _format_agent_status(report)
+            except Exception:
                 status_text = ""
             bubble.update_agent_status(status_text)
-            self._refresh_banner()
             try:
                 await asyncio.wait_for(
                     stop_signal.wait(),
@@ -801,52 +709,3 @@ class Repl(App[None]):
             except asyncio.TimeoutError:
                 continue
 
-    async def _finish_turn(self) -> None:
-        turn_input = self._turn_input
-        turn_output = self._turn_output
-        text_len = self._turn_text_len
-        self._turn_input = 0
-        self._turn_output = 0
-        self._turn_text_len = 0
-
-        if turn_input == 0 and turn_output == 0 and text_len > 0:
-            turn_output = max(1, text_len // 4)
-
-        if self._ctx is not None:
-            hook_ctx = HookContext(
-                agent=self._ctx.agent,
-                thread_id=self._ctx.thread_id,
-                settings=self._ctx.settings,
-                last_turn_input_tokens=turn_input,
-                last_turn_output_tokens=turn_output,
-                available_models=self._available_models,
-                compact_prompt=self._ctx.settings.compact_prompt,
-            )
-            for hook in self._hooks:
-                try:
-                    message = await hook.after_turn(hook_ctx)
-                except Exception as exc:  # noqa: BLE001
-                    message = f"Hook failed: `{exc!s}`"
-                if message:
-                    await self._append_system(message)
-        self._refresh_banner()
-
-    def _extract_usage(self, msg: Any) -> None:
-        usage = getattr(msg, "usage_metadata", None)
-        if not usage:
-            return
-        if isinstance(usage, dict):
-            self._turn_input += usage.get("input_tokens", 0) or 0
-            self._turn_output += usage.get("output_tokens", 0) or 0
-        else:
-            self._turn_input += getattr(usage, "input_tokens", 0) or 0
-            self._turn_output += getattr(usage, "output_tokens", 0) or 0
-
-    @work(exclusive=True, exit_on_error=False)
-    async def _load_available_models(self) -> None:
-        models = await fetch_models(
-            base_url=self._settings.openai_base_url,
-            api_key=self._settings.openai_api_key,
-        )
-        self._available_models = models
-        self._refresh_banner()

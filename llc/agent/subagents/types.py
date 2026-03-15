@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
-from dataclasses import dataclass, field
 from threading import Event
 from typing import Any, Literal
+from pydantic import BaseModel, ConfigDict, Field
 
 SubAgentStatus = Literal[
     "running",
@@ -18,8 +18,9 @@ SubAgentStatus = Literal[
 ACTIVE_STATUSES: set[SubAgentStatus] = {"running", "restarting", "terminating"}
 
 
-@dataclass(slots=True)
-class SubAgentRecord:
+class SubAgentRecord(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     id: str
     name: str
     base_task: str
@@ -45,7 +46,7 @@ class SubAgentRecord:
     finished_at: float = 0.0
     last_activity_at: float = 0.0
     terminate_requested: bool = False
-    pending_feedback: list[str] = field(default_factory=list)
-    stop_event: Event = field(default_factory=Event)
+    pending_feedback: list[str] = Field(default_factory=list)
+    stop_event: Event = Field(default_factory=Event)
     future: Future[dict[str, Any]] | None = None
 

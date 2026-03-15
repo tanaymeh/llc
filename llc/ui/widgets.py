@@ -6,6 +6,7 @@ from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Button, Collapsible, Input, Markdown, OptionList, Static, TextArea
@@ -229,6 +230,16 @@ class SubAgentCard(Vertical):
 
     def update_from_snapshot(self, snapshot: dict[str, object]) -> None:
         self._snapshot = dict(snapshot)
+        if not self.is_mounted:
+            return
+        try:
+            summary_widget = self.query_one(".subagent-card-summary", Static)
+            details_widget = self.query_one(".subagent-card-details", Static)
+            dismiss_button = self.query_one(".subagent-card-dismiss", Button)
+            collapsible = self.query_one(Collapsible)
+        except NoMatches:
+            return
+
         status = str(snapshot.get("status", "unknown")).strip().lower() or "unknown"
         goal = str(snapshot.get("goal", "")).strip()
         current_activity = str(snapshot.get("current_activity", "")).strip()
@@ -250,7 +261,7 @@ class SubAgentCard(Vertical):
             f"Goal: {summary_goal}\n"
             f"Now: {summary_activity}"
         )
-        self.query_one(".subagent-card-summary", Static).update(summary_text)
+        summary_widget.update(summary_text)
 
         details_lines = [
             f"ID: {self.subagent_id}",
@@ -271,11 +282,11 @@ class SubAgentCard(Vertical):
             details_lines.append(f"Error: {error}")
         if stop_reason:
             details_lines.append(f"Stop reason: {stop_reason}")
-        self.query_one(".subagent-card-details", Static).update("\n".join(details_lines))
+        details_widget.update("\n".join(details_lines))
 
         card_title = f"{short_id} | {summary_activity or 'Working'}"
-        self.query_one(Collapsible).title = card_title
-        self.query_one(".subagent-card-dismiss", Button).disabled = (
+        collapsible.title = card_title
+        dismiss_button.disabled = (
             status in self._ACTIVE_STATUSES
         )
 

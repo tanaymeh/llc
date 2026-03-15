@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 
 import httpx
+from pydantic import BaseModel, ConfigDict
 
 
-@dataclass(frozen=True, slots=True)
-class AvailableModel:
+class AvailableModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     id: str
     name: str
     prompt_price: float | None = None
