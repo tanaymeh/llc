@@ -82,6 +82,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    values = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return values or default
+
+
 def _env_path(name: str) -> Path | None:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -108,6 +126,13 @@ class Settings(BaseModel, frozen=True):
     sub_agent_max_runtime_s: int = Field(default=900, ge=30, le=7200)
     sub_agent_context_messages: int = Field(default=8, ge=1, le=20)
     shell_timeout: int = 120
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65535)
+    api_allowed_origins: tuple[str, ...] = (
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    )
+    api_subagent_report_interval_s: float = Field(default=1.0, ge=0.2, le=30.0)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -136,4 +161,14 @@ class Settings(BaseModel, frozen=True):
             sub_agent_report_interval_s=_env_int("SUB_AGENT_REPORT_INTERVAL_S", 8),
             sub_agent_max_runtime_s=_env_int("SUB_AGENT_MAX_RUNTIME_S", 900),
             sub_agent_context_messages=_env_int("SUB_AGENT_CONTEXT_MESSAGES", 8),
+            api_host=os.getenv("LLC_API_HOST", "127.0.0.1"),
+            api_port=_env_int("LLC_API_PORT", 8000),
+            api_allowed_origins=_env_csv(
+                "LLC_API_ALLOWED_ORIGINS",
+                ("http://localhost:5173", "http://127.0.0.1:5173"),
+            ),
+            api_subagent_report_interval_s=_env_float(
+                "LLC_API_SUBAGENT_REPORT_INTERVAL_S",
+                1.0,
+            ),
         )

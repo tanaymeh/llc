@@ -9,12 +9,19 @@
 |______|______|\_____|
 ```
 
-LLC is a local coding agent application with a full-screen Textual TUI.
-It runs a LangGraph-based agent loop, streams tool/model events live, tracks token usage and cost, and stores sessions in SQLite.
+LLC is a local coding agent runtime with:
+
+- a backend API service (default runtime),
+- a React mission-control frontend (`llc-frontend/`),
+- and a deprecated Textual TUI mode.
+
+The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists sessions in SQLite.
 
 ## What it includes
 
-- Mission-control TUI (execution lane, logs, agents pane, command surface)
+- Backend API with WebSocket event streaming (`/api/ws/{session_id}`)
+- React mission-control web UI (`llc-frontend/`)
+- Optional Mission-control TUI (`llc tui`)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), web search/fetch, and diff rendering
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers)
@@ -22,36 +29,76 @@ It runs a LangGraph-based agent loop, streams tool/model events live, tracks tok
 
 ## Implementation overview
 
-- `llc/main.py`: entrypoint wiring (`Settings` -> `SessionStore` -> `SessionEngine` -> `MissionControlApp`)
+- `llc/main.py`: mode-aware entrypoint (`serve` default, `tui` optional)
 - `llc/agent/`: LangGraph graph, nodes, tool collection, compaction, sub-agent runtime
-- `llc/service/`: backend orchestration, stream-to-event adapter, prompt registry
+- `llc/service/`: backend orchestration, stream adapter, API server, prompt registry
 - `llc/ui/`: Textual app, panels, state models, telemetry mapping
 - `llc/storage/`: SQLite schema and async persistence layer
 - `llc/prompts/`: system/compact/runtime YAML prompts
+- `llc-frontend/`: React frontend shell wired to live backend events
 
 ## Requirements
 
 - Python `>=3.13`
 - [`uv`](https://docs.astral.sh/uv/)
 - OpenAI-compatible model endpoint and API key
+- Node.js `20+` (for local frontend development)
 
 For full tool coverage:
 
 - `ripgrep` (`rg`) for text search
 - `ast-grep` (`sg`/`ast-grep`) for structural code search (`code_grep` tool)
 
-## Install and run from source
+## Install from source
 
 ```bash
 cp .env.example .env
 uv sync --frozen
+```
+
+## Run backend API (default)
+
+```bash
 uv run llc
 ```
 
-You can also run:
+Override bind host/port:
 
 ```bash
-python -m llc
+uv run llc serve --host 0.0.0.0 --port 8000
+```
+
+## Run TUI mode
+
+```bash
+uv run llc tui
+```
+
+## Run frontend (separate service)
+
+```bash
+cd llc-frontend
+npm ci
+npm run dev
+```
+
+Frontend reads backend URL from `VITE_LLC_API_BASE_URL` (default: `http://127.0.0.1:8000`).
+
+## Run full stack in Docker (single command)
+
+```bash
+make run
+```
+
+This starts both containers:
+
+- backend API at `http://localhost:8000`
+- frontend dev server at `http://localhost:5173`
+
+Use an external workspace mount if needed:
+
+```bash
+make run WORKSPACE=/path/to/project
 ```
 
 ## Install as a local app command
@@ -100,6 +147,10 @@ Set values in `.env`:
 - `SUB_AGENT_CONTEXT_MESSAGES`
 - `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`)
 - `LLC_PROMPTS_DIR` (default: `llc/prompts`)
+- `LLC_API_HOST` (default: `127.0.0.1`)
+- `LLC_API_PORT` (default: `8000`)
+- `LLC_API_ALLOWED_ORIGINS` (comma-separated list; default includes Vite localhost origins)
+- `LLC_API_SUBAGENT_REPORT_INTERVAL_S` (default: `1.0`)
 
 ## TUI controls
 
@@ -115,7 +166,7 @@ Set values in `.env`:
 ## Commands
 
 - `/help`
-- `/model <model_id>` (or `/model` to open inline selector)
+- `/model <model_id>`
 - `/compact`
 - `/enable sub-agent-mode`
 - `/subagent {TASK}`
@@ -123,19 +174,25 @@ Set values in `.env`:
 
 ## Docker
 
-Build and run the app in Docker, mounting a target workspace into `/workspace`:
+Full stack (backend + frontend) in Docker:
 
 ```bash
 make run
 ```
 
-Override mounted directory:
+Stop stack:
 
 ```bash
-make run WORKSPACE=/path/to/project
+make down
 ```
 
-Direct script:
+Tail logs:
+
+```bash
+make logs
+```
+
+Backend-only helper (no frontend):
 
 ```bash
 ./scripts/dev-docker.sh /path/to/project

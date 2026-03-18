@@ -31,7 +31,8 @@ class ModelCommand(Command):
             )
             ctx.settings = new_settings
             return CommandResult(
-                message=f"Now using `{model_name}`."
+                message=f"Now using `{model_name}`.",
+                data={"model_name": model_name},
             )
         except Exception as exc:  # noqa: BLE001
             return CommandResult(
