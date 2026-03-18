@@ -21,9 +21,10 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 
 - Backend API with WebSocket event streaming (`/api/ws/{session_id}`)
 - React mission-control web UI (`llc-frontend/`)
+- Markdown-rendered agent responses in mission-control UI (GFM tables, task lists, code blocks)
 - Optional Mission-control TUI (`llc tui`)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
-- Built-in tools for shell, file edits, search (`rg`/glob), web search/fetch, and diff rendering
+- Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers)
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 

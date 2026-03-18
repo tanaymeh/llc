@@ -1033,8 +1033,6 @@ def _activity_from_tool_name(tool_name: str) -> str:
         return "Searching codebase"
     if normalized == "bash":
         return "Running shell commands"
-    if normalized == "showdiff":
-        return "Reviewing diffs"
     if normalized == "todowrite":
         return "Updating plan"
     return "Working"

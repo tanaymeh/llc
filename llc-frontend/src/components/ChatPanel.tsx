@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import type { Components } from 'react-markdown';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { AgentMessageActivity, Message } from '../types';
 
 interface ChatPanelProps {
@@ -6,6 +9,23 @@ interface ChatPanelProps {
 }
 
 const ACTIVITY_TRANSITION_MS = 170;
+const EXTERNAL_LINK_PATTERN = /^(?:[a-z][a-z\d+.-]*:|\/\/)/i;
+
+const markdownComponents = {
+  a({ href, children, ...props }) {
+    const isExternal = typeof href === 'string' && EXTERNAL_LINK_PATTERN.test(href);
+    return (
+      <a
+        {...props}
+        href={href}
+        rel={isExternal ? 'noreferrer noopener' : undefined}
+        target={isExternal ? '_blank' : undefined}
+      >
+        {children}
+      </a>
+    );
+  },
+} satisfies Components;
 
 const activityPalette = (
   kind: AgentMessageActivity['kind']
@@ -211,9 +231,20 @@ export function ChatPanel({ messages }: ChatPanelProps) {
                 <AgentActivityBadge activity={message.activity} />
               )}
             </div>
-            <p className={`${getMessageContentColor(message)} text-sm font-mono leading-relaxed`}>
-              {message.content}
-            </p>
+            {message.role === 'AGENT' ? (
+              <div className={`${getMessageContentColor(message)} mission-markdown text-sm font-mono leading-relaxed`}>
+                <ReactMarkdown
+                  components={markdownComponents}
+                  remarkPlugins={[remarkGfm]}
+                >
+                  {message.content}
+                </ReactMarkdown>
+              </div>
+            ) : (
+              <p className={`${getMessageContentColor(message)} text-sm font-mono leading-relaxed whitespace-pre-wrap break-words`}>
+                {message.content}
+              </p>
+            )}
           </div>
         ))}
       </div>

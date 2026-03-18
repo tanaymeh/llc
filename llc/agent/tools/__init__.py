@@ -1,7 +1,6 @@
 from langchain_core.tools import BaseTool
 
 from llc.agent.tools.code_grep import make_code_grep_tools
-from llc.agent.tools.diff import make_diff_tools
 from llc.agent.tools.edit import make_edit_tools
 from llc.agent.tools.filesystem import make_filesystem_tools
 from llc.agent.tools.glob import make_glob_tools
@@ -25,7 +24,6 @@ def collect_tools(
         *make_glob_tools(settings.workspace_root),
         *make_grep_tools(settings.workspace_root),
         *make_edit_tools(settings.workspace_root),
-        *make_diff_tools(settings.workspace_root),
         *make_todo_tools(),
         *make_web_tools(settings.firecrawl_api_key),
         *make_code_grep_tools(settings.workspace_root),

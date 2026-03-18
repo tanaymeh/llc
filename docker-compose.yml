@@ -23,7 +23,10 @@ services:
   frontend:
     image: node:22-alpine
     command: >
-      sh -c "if [ ! -f node_modules/.bin/vite ]; then npm ci; fi &&
+      sh -c "if [ ! -f node_modules/.bin/vite ] ||
+      [ ! -f node_modules/.llc-last-package-lock ] ||
+      ! cmp -s package-lock.json node_modules/.llc-last-package-lock; then
+      npm ci && cp package-lock.json node_modules/.llc-last-package-lock; fi &&
       npm run dev -- --host 0.0.0.0 --port 5173 --strictPort"
     environment:
       VITE_LLC_API_BASE_URL: http://localhost:${LLC_API_PORT:-8000}

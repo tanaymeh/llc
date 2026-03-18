@@ -254,9 +254,6 @@ const summarizeToolCall = (toolName: string, args: Record<string, unknown>): str
     const todoCount = Array.isArray(todosRaw) ? todosRaw.length : 0;
     return todoCount > 0 ? `${todoCount} todo items` : 'update todo list';
   }
-  if (normalizedTool === 'showdiff') {
-    return 'render session diff';
-  }
   return '';
 };
 

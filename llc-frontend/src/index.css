@@ -239,4 +239,164 @@ body {
     background-color: var(--surface-accent);
     box-shadow: inset 0 0 0 1px var(--border-strong);
   }
+
+  .mission-markdown {
+    color: inherit;
+    overflow-wrap: anywhere;
+  }
+
+  .mission-markdown > :first-child {
+    margin-top: 0;
+  }
+
+  .mission-markdown > :last-child {
+    margin-bottom: 0;
+  }
+
+  .mission-markdown p {
+    margin: 0.35rem 0;
+  }
+
+  .mission-markdown h1,
+  .mission-markdown h2,
+  .mission-markdown h3,
+  .mission-markdown h4,
+  .mission-markdown h5,
+  .mission-markdown h6 {
+    margin: 0.75rem 0 0.35rem;
+    color: var(--text-primary);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    line-height: 1.35;
+  }
+
+  .mission-markdown h1 {
+    font-size: 0.96rem;
+  }
+
+  .mission-markdown h2 {
+    font-size: 0.91rem;
+  }
+
+  .mission-markdown h3,
+  .mission-markdown h4,
+  .mission-markdown h5,
+  .mission-markdown h6 {
+    font-size: 0.84rem;
+  }
+
+  .mission-markdown ul,
+  .mission-markdown ol {
+    margin: 0.4rem 0;
+    padding-left: 1.35rem;
+  }
+
+  .mission-markdown li + li {
+    margin-top: 0.2rem;
+  }
+
+  .mission-markdown li::marker {
+    color: var(--text-faint);
+  }
+
+  .mission-markdown a {
+    color: var(--accent-selection);
+    text-decoration-line: underline;
+    text-decoration-color: var(--accent-selection-border);
+    text-underline-offset: 3px;
+    transition: color 160ms ease, text-decoration-color 160ms ease;
+  }
+
+  .mission-markdown a:hover {
+    color: var(--text-primary);
+    text-decoration-color: currentColor;
+  }
+
+  .mission-markdown strong {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .mission-markdown blockquote {
+    margin: 0.45rem 0;
+    padding: 0.45rem 0.7rem;
+    border-left: 2px solid var(--accent-selection-border);
+    background-color: var(--surface-accent);
+    color: var(--text-muted);
+  }
+
+  .mission-markdown hr {
+    margin: 0.65rem 0;
+    border: 0;
+    height: 1px;
+    background-color: var(--border-subtle);
+  }
+
+  .mission-markdown code {
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.35rem;
+    background-color: var(--surface-panel-muted);
+    padding: 0.05rem 0.32rem;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+  }
+
+  .mission-markdown pre {
+    margin: 0.5rem 0;
+    border: 1px solid var(--border-subtle);
+    border-radius: 0.5rem;
+    background-color: var(--surface-panel-muted);
+    padding: 0.65rem 0.8rem;
+    overflow-x: auto;
+  }
+
+  .mission-markdown pre code {
+    border: 0;
+    border-radius: 0;
+    background-color: transparent;
+    padding: 0;
+    color: inherit;
+    font-size: 0.78rem;
+    line-height: 1.5;
+  }
+
+  .mission-markdown table {
+    margin: 0.55rem 0;
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .mission-markdown thead tr {
+    background-color: var(--surface-accent);
+  }
+
+  .mission-markdown th,
+  .mission-markdown td {
+    border: 1px solid var(--border-subtle);
+    padding: 0.35rem 0.5rem;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  .mission-markdown th {
+    color: var(--text-primary);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    font-size: 0.72rem;
+    font-weight: 600;
+  }
+
+  .mission-markdown img {
+    display: block;
+    max-width: 100%;
+    border-radius: 0.5rem;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .mission-markdown input[type='checkbox'] {
+    margin-right: 0.45rem;
+    accent-color: var(--accent-selection);
+  }
 }
