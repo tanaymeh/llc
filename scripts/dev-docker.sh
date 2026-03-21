@@ -19,6 +19,7 @@ Examples:
 Notes:
   This helper runs backend API only in Docker.
   For full backend + frontend stack, use: `make run`.
+  If you cloned without `--recurse-submodules`, initialize `llc-frontend/` first.
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
 EOF

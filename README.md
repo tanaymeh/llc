@@ -12,7 +12,7 @@
 LLC is a local coding agent runtime with:
 
 - a backend API service (default runtime),
-- a React mission-control frontend (`llc-frontend/`),
+- a React mission-control frontend (Git submodule at `llc-frontend/`),
 - and a deprecated Textual TUI mode.
 
 The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists sessions in SQLite.
@@ -53,6 +53,7 @@ For full tool coverage:
 ## Install from source
 
 ```bash
+git submodule update --init --recursive
 cp .env.example .env
 uv sync --frozen
 ```
@@ -84,6 +85,7 @@ npm run dev
 ```
 
 Frontend reads backend URL from `VITE_LLC_API_BASE_URL` (default: `http://127.0.0.1:8000`).
+If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive` first.
 
 ## Run full stack in Docker (single command)
 
