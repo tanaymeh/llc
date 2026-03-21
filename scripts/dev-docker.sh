@@ -3,28 +3,29 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/dev-docker.sh [--debug] [target-dir]
+Usage: ./scripts/dev-docker.sh [--debug] [--port PORT] [target-dir]
 
 Options:
   --debug, -d   Show full Docker build output.
+  --port        API port to publish (default: 8000).
   --help, -h    Show this help message.
 
 Examples:
   ./scripts/dev-docker.sh
+  ./scripts/dev-docker.sh --port 8000
   ./scripts/dev-docker.sh /path/to/workspace
   ./scripts/dev-docker.sh --debug /path/to/workspace
 
 Notes:
-  Experimental sub-agent mode can be enabled at runtime via `/enable sub-agent-mode`.
-  To start with it enabled by default, set `SUB_AGENT_MODE_ENABLED=true` in .env.
+  This helper runs backend API only in Docker.
+  For full backend + frontend stack, use: `make run`.
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
-  Mission-control UI controls: `Ctrl+G` toggles agents pane, `Ctrl+L` focuses logs.
-  Use `/model` for inline model selection in the command surface.
 EOF
 }
 
 DEBUG=0
+PORT="${LLC_API_PORT:-8000}"
 if [[ "${LLC_DOCKER_DEBUG:-0}" == "1" ]]; then
   DEBUG=1
 fi
@@ -34,6 +35,18 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --debug|-d)
       DEBUG=1
+      ;;
+    --port)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --port" >&2
+        usage >&2
+        exit 1
+      fi
+      PORT="$2"
+      shift
+      ;;
+    --port=*)
+      PORT="${1#*=}"
       ;;
     --help|-h)
       usage
@@ -50,6 +63,11 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+  echo "Invalid --port value: $PORT" >&2
+  exit 1
+fi
 
 if [[ ${#POSITIONAL_ARGS[@]} -gt 1 ]]; then
   echo "Expected at most one target directory argument." >&2
@@ -79,10 +97,16 @@ fi
 TERM_VALUE="${TERM:-xterm-256color}"
 COLORTERM_VALUE="${COLORTERM:-truecolor}"
 
-exec docker run --rm -it --init \
-  -w /workspace \
-  --env-file "$REPO_ROOT/.env" \
-  -e "TERM=$TERM_VALUE" \
-  -e "COLORTERM=$COLORTERM_VALUE" \
-  --mount "type=bind,src=$TARGET_DIR,dst=/workspace" \
-  llc-dev
+DOCKER_ARGS=(
+  --rm
+  -it
+  --init
+  -w /workspace
+  --env-file "$REPO_ROOT/.env"
+  -e "TERM=$TERM_VALUE"
+  -e "COLORTERM=$COLORTERM_VALUE"
+  --mount "type=bind,src=$TARGET_DIR,dst=/workspace"
+)
+
+DOCKER_ARGS+=(-p "${PORT}:${PORT}")
+exec docker run "${DOCKER_ARGS[@]}" llc-dev serve --host 0.0.0.0 --port "$PORT"

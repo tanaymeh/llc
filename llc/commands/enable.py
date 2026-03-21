@@ -19,7 +19,10 @@ class EnableCommand(Command):
             )
 
         if ctx.settings.sub_agent_mode_enabled:
-            return CommandResult(message="`sub-agent-mode` is already enabled.")
+            return CommandResult(
+                message="`sub-agent-mode` is already enabled.",
+                data={"sub_agent_mode_enabled": True},
+            )
 
         try:
             new_settings = ctx.settings.model_copy(update={"sub_agent_mode_enabled": True})
@@ -36,7 +39,8 @@ class EnableCommand(Command):
                 message=(
                     "Enabled `sub-agent-mode`. "
                     "Use `/subagent {TASK}` to spawn workers manually."
-                )
+                ),
+                data={"sub_agent_mode_enabled": True},
             )
         except Exception as exc:  # noqa: BLE001
             return CommandResult(message=f"Failed to enable sub-agent mode: {exc!s}")

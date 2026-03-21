@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -29,6 +30,33 @@ _MAX_COMPLETION_REPORT_CHARS = 900
 _REPORT_LLM_TIMEOUT_S = 8.0
 _MAX_REPORT_WORKERS = 8
 _MAX_ACTIVITY_PREVIEW_CHARS = 80
+_VICTORIAN_NAMES: tuple[str, ...] = (
+    "Mr Darcy",
+    "Miss Bennet",
+    "Lady Bronte",
+    "Lord Tennyson",
+    "Mrs Gaskell",
+    "Sir Fairfax",
+    "Miss Elinor",
+    "Master Pip",
+    "Lady Ada",
+    "Mr Bingley",
+    "Miss Nightingale",
+    "Lord Ashford",
+    "Mrs Templeton",
+    "Sir Whitmore",
+    "Miss Hawthorne",
+    "Mr Pembroke",
+    "Lady Winthrop",
+    "Captain Blackwood",
+    "Miss Worthing",
+    "Reverend Pritchard",
+    "Baroness Carlisle",
+    "Mr Thackeray",
+    "Lady Beatrice",
+    "Miss Amelia",
+    "Lord Rochester",
+)
 _SUBAGENT_REPORT_PROMPT = (
     "You are writing a concise, information-rich execution report for a completed coding task.\n"
     "Return 4 short sections using plain text headings:\n"
@@ -110,11 +138,20 @@ class SubAgentRuntime:
                     ),
                 }
 
-            subagent_id = f"subagent-{uuid.uuid4().hex[:8]}"
+            provided_name = (name or "").strip()
+            existing_names = {
+                str(existing.name).strip().lower()
+                for existing in self._records.values()
+                if str(existing.name).strip()
+            }
+            selected_name = provided_name or _pick_victorian_name(existing_names)
+            subagent_id = _build_subagent_id(selected_name)
+            while subagent_id in self._records:
+                subagent_id = _build_subagent_id(selected_name)
             now = time.time()
             record = SubAgentRecord(
                 id=subagent_id,
-                name=name or subagent_id,
+                name=selected_name,
                 base_task=clean_task,
                 task=clean_task,
                 context=context.strip(),
@@ -996,11 +1033,37 @@ def _activity_from_tool_name(tool_name: str) -> str:
         return "Searching codebase"
     if normalized == "bash":
         return "Running shell commands"
-    if normalized == "showdiff":
-        return "Reviewing diffs"
     if normalized == "todowrite":
         return "Updating plan"
     return "Working"
+
+
+def _pick_victorian_name(used_names: set[str]) -> str:
+    available = [name for name in _VICTORIAN_NAMES if name.lower() not in used_names]
+    if available:
+        return random.choice(available)
+    return random.choice(_VICTORIAN_NAMES)
+
+
+def _slugify_label(value: str) -> str:
+    parts: list[str] = []
+    for ch in value.lower():
+        if ch.isalnum():
+            parts.append(ch)
+        elif ch in {" ", "-", "_"}:
+            parts.append("-")
+    slug = "".join(parts)
+    slug = "-".join(part for part in slug.split("-") if part)
+    if not slug:
+        return "victorian-agent"
+    if len(slug) <= 24:
+        return slug
+    return slug[:24].rstrip("-")
+
+
+def _build_subagent_id(name: str) -> str:
+    slug = _slugify_label(name)
+    return f"subagent-{slug}-{uuid.uuid4().hex[:4]}"
 
 
 def _token_usage(message: Any) -> tuple[int, int]:
