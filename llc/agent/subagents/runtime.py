@@ -8,16 +8,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import RLock
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage
 
-from llc.agent.llm import build_chat_model
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.types import ACTIVE_STATUSES, SubAgentRecord
 from llc.config import Settings
 from llc.observability import (
     capture_parent_context,
     merge_langchain_config,
-    start_child_span,
     start_linked_subagent_trace,
     update_observation,
 )
@@ -30,11 +28,6 @@ _MAX_REPORT_PREVIEW_CHARS = 220
 _MAX_ERROR_PREVIEW_CHARS = 220
 _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REVISION_PART_CHARS = 1800
-_MAX_REPORT_HISTORY_CHARS = 28000
-_MAX_HISTORY_MESSAGE_CHARS = 1000
-_MAX_REPORT_INPUT_FINAL_CHARS = 2400
-_MAX_COMPLETION_REPORT_CHARS = 900
-_REPORT_LLM_TIMEOUT_S = 8.0
 _MAX_REPORT_WORKERS = 8
 _MAX_ACTIVITY_PREVIEW_CHARS = 80
 _VICTORIAN_NAMES: tuple[str, ...] = (
@@ -64,18 +57,6 @@ _VICTORIAN_NAMES: tuple[str, ...] = (
     "Miss Amelia",
     "Lord Rochester",
 )
-_SUBAGENT_REPORT_PROMPT = (
-    "You are writing a concise, information-rich execution report for a completed coding task.\n"
-    "Return 4 short sections using plain text headings:\n"
-    "Goal\n"
-    "Work done\n"
-    "Outcome\n"
-    "Notes\n"
-    "Keep total output under a 1000 words.\n"
-    "Do not include chain-of-thought or unnecessary detail."
-)
-
-
 class _StopRequested(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -349,7 +330,6 @@ class SubAgentRuntime:
         record.stop_reason = ""
         record.error = ""
         record.status = "running"
-        record.completion_report = ""
         record.latest_report = "Running."
         record.current_activity = "Running"
         record.activity_detail = "Worker started."
@@ -435,16 +415,19 @@ class SubAgentRuntime:
             task=task,
             model_name=settings.model_name,
         ) as trace_scope:
+            trace_stream_config = dict(trace_scope.langchain_config)
+            trace_stream_config.pop("callbacks", None)
             stream_config = merge_langchain_config(
                 {"configurable": {"thread_id": thread_id}},
-                trace_scope.langchain_config,
+                trace_stream_config,
             )
             try:
                 async for mode, chunk in agent.astream(
                     {
                         "messages": [
-                            HumanMessage(
-                                content=_render_assignment(
+                            SystemMessage(
+                                content=_render_subagent_prompt(
+                                    settings,
                                     task,
                                     context,
                                     self._prompt_registry,
@@ -566,41 +549,9 @@ class SubAgentRuntime:
                 final_output = (
                     final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
                 )
-            self._update_progress(
-                subagent_id,
-                attempt,
-                tool_calls,
-                output_chars,
-                report="Generating completion report.",
-                activity="Generating report",
-                activity_detail="Summarizing sub-agent output.",
-                last_tool_name=last_tool_name,
-            )
-            report_prompt = self._completion_report_prompt()
-            (
-                completion_report,
-                report_input_tokens,
-                report_output_tokens,
-                report_model_name,
-            ) = await _build_completion_report(
-                agent=agent,
-                thread_id=thread_id,
-                settings=settings,
-                goal=task,
-                final_output=final_output,
-                report_prompt=report_prompt,
-                langchain_config=trace_scope.langchain_config,
-            )
-            _accumulate_usage_by_model(
-                usage_by_model,
-                report_model_name,
-                report_input_tokens,
-                report_output_tokens,
-            )
             result = {
                 "status": "completed",
                 "final_output": final_output,
-                "completion_report": completion_report,
                 "tool_calls": tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,
@@ -609,7 +560,6 @@ class SubAgentRuntime:
                 trace_scope.observation,
                 output={
                     "status": "completed",
-                    "completion_report": completion_report,
                     "final_output_preview": _preview_text(
                         final_output,
                         _MAX_FINAL_OUTPUT_PREVIEW_CHARS,
@@ -690,7 +640,6 @@ class SubAgentRuntime:
             record.stop_reason = result.get("stop_reason", "")
             record.error = result.get("error", "")
             record.final_output = result.get("final_output", "")
-            record.completion_report = result.get("completion_report", "")
             record.tool_calls = max(record.tool_calls, result.get("tool_calls", 0))
             record.output_chars = max(record.output_chars, result.get("output_chars", 0))
             self._merge_usage_locked(_normalize_usage_by_model(result.get("usage_by_model")))
@@ -730,7 +679,6 @@ class SubAgentRuntime:
         record.status = "restarting"
         record.error = ""
         record.final_output = ""
-        record.completion_report = ""
         record.finished_at = 0.0
         record.latest_report = "Restarting with feedback."
         record.current_activity = "Restarting with feedback"
@@ -804,11 +752,7 @@ class SubAgentRuntime:
             return snapshot
 
         if record.status == "completed":
-            final_result = (
-                record.completion_report.strip()
-                or record.final_output.strip()
-                or "Completed."
-            )
+            final_result = record.final_output.strip() or "Completed."
             snapshot["final_result"] = _preview_text(
                 final_result,
                 _MAX_FINAL_OUTPUT_PREVIEW_CHARS,
@@ -880,58 +824,36 @@ class SubAgentRuntime:
         trimmed.sort(key=lambda record: record.created_at)
         return trimmed
 
-    def _completion_report_prompt(self) -> str:
-        registry = self._prompt_registry
-        if registry is not None:
-            try:
-                return registry.get(
-                    "subagent_report",
-                    key="subagent_report_prompt",
-                )
-            except Exception:
-                return _SUBAGENT_REPORT_PROMPT
-        return _SUBAGENT_REPORT_PROMPT
-
-
-def _render_assignment(
+def _render_subagent_prompt(
+    settings: Settings,
     task: str,
     context: str,
     prompt_registry: PromptRegistry | None = None,
 ) -> str:
     clean_task = task.strip()
     clean_context = context.strip()
+    context_block = ""
+    if clean_context:
+        context_block = (
+            "\n\n"
+            "Additional context and instructions from orchestrator:\n"
+            f"{clean_context}"
+        )
+    base_prompt = settings.system_prompt.rstrip()
     if prompt_registry is not None:
-        if clean_context:
-            try:
-                return prompt_registry.get_formatted(
-                    "assignment",
-                    key="assignment_with_context_prompt",
-                    task=clean_task,
-                    context=clean_context,
-                )
-            except Exception:
-                pass
         try:
-            return prompt_registry.get_formatted(
-                "assignment",
-                key="assignment_prompt",
+            rendered = prompt_registry.get_formatted(
+                "subagent_mode",
+                key="subagent_mode_prompt",
+                base_prompt=base_prompt,
                 task=clean_task,
-            )
+                context_block=context_block,
+            ).strip()
+            if rendered:
+                return rendered
         except Exception:
             pass
-    if not clean_context:
-        return (
-            "Assigned task:\n"
-            f"{clean_task}\n\n"
-            "Execute this task and provide a clear final result."
-        )
-    return (
-        "Assigned task:\n"
-        f"{clean_task}\n\n"
-        "Relevant context:\n"
-        f"{clean_context}\n\n"
-        "Execute the task using the context and provide a clear final result."
-    )
+    return f"{base_prompt}\n\nHere's your task:\n{clean_task}{context_block}"
 
 
 def _task_with_feedback(
@@ -949,7 +871,7 @@ def _task_with_feedback(
     if prompt_registry is not None:
         try:
             rendered = prompt_registry.get_formatted(
-                "assignment",
+                "subagent_mode",
                 key="revision_task_prompt",
                 base_task=base,
                 prior_output=trimmed_prior,
@@ -969,138 +891,6 @@ def _task_with_feedback(
         parts.append(f"Revision instructions:\n{trimmed_feedback}")
     parts.append("Produce an improved final result.")
     return "\n\n".join(parts)
-
-
-async def _build_completion_report(
-    *,
-    agent: Any,
-    thread_id: str,
-    settings: Settings,
-    goal: str,
-    final_output: str,
-    report_prompt: str,
-    langchain_config: dict[str, Any] | None = None,
-) -> tuple[str, int, int, str]:
-    report_model_name = settings.compact_model_name or settings.model_name
-    fallback = _preview_text(final_output.strip(), _MAX_COMPLETION_REPORT_CHARS)
-    if not fallback:
-        fallback = "Task completed."
-    try:
-        messages = await _aget_worker_messages(agent, thread_id)
-        transcript = _render_history_for_report(messages)
-        if not transcript:
-            return fallback, 0, 0, report_model_name
-
-        model = build_chat_model(settings, settings.compact_model_name)
-        request_messages = [
-            SystemMessage(content=report_prompt),
-            HumanMessage(
-                content=(
-                    "Goal:\n"
-                    f"{_preview_text(goal.strip(), _MAX_TASK_PREVIEW_CHARS)}\n\n"
-                    "Final output:\n"
-                    f"{_preview_text(final_output.strip(), _MAX_REPORT_INPUT_FINAL_CHARS)}\n\n"
-                    "Worker transcript:\n"
-                    f"{transcript}"
-                )
-            ),
-        ]
-        with start_child_span(
-            "llc.api.subagent.report_generation",
-            input_payload={"goal": _preview_text(goal, _MAX_TASK_PREVIEW_CHARS)},
-            tags=("llc", "api", "subagent", "report"),
-            metadata={"llc_model_name": report_model_name},
-        ) as report_span:
-            if langchain_config:
-                response = await asyncio.wait_for(
-                    model.ainvoke(request_messages, config=langchain_config),
-                    timeout=_REPORT_LLM_TIMEOUT_S,
-                )
-            else:
-                response = await asyncio.wait_for(
-                    model.ainvoke(request_messages),
-                    timeout=_REPORT_LLM_TIMEOUT_S,
-                )
-        usage_input, usage_output = _token_usage(response)
-        report = message_text(response.content, include_reasoning=False).strip()
-        if not report:
-            update_observation(
-                report_span,
-                output={"status": "empty_report", "fallback": fallback},
-            )
-            return fallback, usage_input, usage_output, report_model_name
-        update_observation(
-            report_span,
-            output={
-                "status": "ok",
-                "report_preview": _preview_text(report, _MAX_REPORT_PREVIEW_CHARS),
-            },
-        )
-        return (
-            _preview_text(report, _MAX_COMPLETION_REPORT_CHARS),
-            usage_input,
-            usage_output,
-            report_model_name,
-        )
-    except Exception:  # noqa: BLE001
-        return fallback, 0, 0, report_model_name
-
-
-async def _aget_worker_messages(agent: Any, thread_id: str) -> list[Any]:
-    state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
-    values = getattr(state, "values", {})
-    messages = values.get("messages", [])
-    if not isinstance(messages, list):
-        return []
-    return list(messages)
-
-
-def _render_history_for_report(messages: list[Any]) -> str:
-    if not messages:
-        return ""
-
-    remaining = _MAX_REPORT_HISTORY_CHARS
-    rendered: list[str] = []
-    for idx, message in enumerate(messages, start=1):
-        heading = _message_heading(message)
-        body = _message_body(message)
-        if not body:
-            continue
-        body = _preview_text(body, _MAX_HISTORY_MESSAGE_CHARS)
-        block = f"[{idx}] {heading}\n{body}\n\n"
-        if len(block) <= remaining:
-            rendered.append(block)
-            remaining -= len(block)
-            continue
-        if remaining <= 40:
-            break
-        rendered.append(block[: remaining - 20] + "\n...[truncated]\n")
-        break
-    return "".join(rendered).strip()
-
-
-def _message_heading(message: Any) -> str:
-    if isinstance(message, HumanMessage):
-        return "User"
-    if isinstance(message, ToolMessage):
-        return "Tool"
-    if isinstance(message, SystemMessage):
-        return "System"
-    if isinstance(message, AIMessage):
-        return "Assistant"
-    return "Message"
-
-
-def _message_body(message: Any) -> str:
-    content = message_text(getattr(message, "content", ""), include_reasoning=False).strip()
-    if content:
-        return content
-    if isinstance(message, AIMessage):
-        tool_calls = getattr(message, "tool_calls", None) or []
-        if tool_calls:
-            names = ", ".join(str(tc.get("name", "tool")) for tc in tool_calls[:6])
-            return f"Tool calls: {names}"
-    return ""
 
 
 def _preview_text(text: str, limit: int) -> str:

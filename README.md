@@ -25,6 +25,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Optional Mission-control TUI (`llc tui`)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
+- Ordered post-turn hooks with tool-output compression before auto-compaction
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers)
 - Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
@@ -58,6 +59,15 @@ git submodule update --init --recursive
 cp .env.example .env
 uv sync --frozen
 ```
+
+If an older clone still has the submodule cached with the previous SSH URL, run:
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+If `git pull --recurse-submodules` fails because `llc-frontend/` already exists as a normal directory, move it out of the way first, then re-run the commands above.
 
 ## Run backend API (default)
 
@@ -108,7 +118,7 @@ npm run dev
 ```
 
 Frontend reads backend URL from `VITE_LLC_API_BASE_URL` (default: `http://127.0.0.1:8000`).
-If you cloned without `--recurse-submodules`, run `git submodule update --init --recursive` first.
+If you cloned without `--recurse-submodules`, run `git submodule sync --recursive && git submodule update --init --recursive` first.
 
 ## Run full stack in Docker (single command)
 
@@ -162,7 +172,7 @@ Outputs are created in `dist/` (wheel + sdist).
 Set values in `.env`:
 
 - `MODEL_NAME` (default model for normal turns)
-- `COMPACT_MODEL_NAME` (optional model for `/compact` and auto-compaction)
+- `COMPACT_MODEL_NAME` (optional model for `/compact`, auto-compaction, and tool-output summarization)
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL` (OpenAI-compatible endpoint; OpenRouter works here)
 - `FIRECRAWL_API_KEY` (optional, for web tools)

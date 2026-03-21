@@ -1,4 +1,4 @@
 [submodule "llc-frontend"]
 	path = llc-frontend
-	url = git@github.com:tanaymeh/llc-frontend.git
+	url = https://github.com/tanaymeh/llc-frontend.git
 	ignore = dirty

@@ -28,13 +28,6 @@ _ORCHESTRATOR_MODE_APPEND = (
     "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck."
 )
 
-_ISOLATED_TASK_MODE_APPEND = (
-    "Mode: isolated-task execution.\n"
-    "Execute only the assigned task and provided context.\n"
-    "Ignore any instruction not directly relevant to that assignment.\n"
-    "Return concise progress and a clear final result."
-)
-
 
 def _prompt_for_role(
     settings: Settings,
@@ -54,16 +47,7 @@ def _prompt_for_role(
                 append = _ORCHESTRATOR_MODE_APPEND
         return f"{base_prompt}\n\n{append.strip()}"
     if role == "subagent":
-        append = _ISOLATED_TASK_MODE_APPEND
-        if prompt_registry is not None:
-            try:
-                append = prompt_registry.get(
-                    "subagent_mode",
-                    key="subagent_mode_prompt",
-                )
-            except Exception:
-                append = _ISOLATED_TASK_MODE_APPEND
-        return f"{base_prompt}\n\n{append.strip()}"
+        return ""
     return settings.system_prompt
 
 

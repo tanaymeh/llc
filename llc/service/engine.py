@@ -7,11 +7,24 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from llc.agent import build_agent_graph
-from llc.agent.hooks import AutoCompactHook, Hook, HookContext, TokenCounterHook
+from llc.agent.hooks import (
+    AutoCompactHook,
+    Hook,
+    HookContext,
+    TokenCounterHook,
+    ToolOutputSummaryHook,
+    hook_order,
+)
 from llc.agent.subagents import SubAgentRuntime
 from llc.commands import CommandRegistry, ReplContext
 from llc.config import Settings
@@ -28,6 +41,7 @@ from llc.service.events import (
     SessionRestored,
     SubagentStatusUpdate,
     TextDelta,
+    ToolResultEvent,
     TurnCompleted,
     TurnStarted,
     UsageUpdate,
@@ -72,7 +86,10 @@ class SessionEngine:
         self._subagent_runtime: SubAgentRuntime | None = None
         self._agent: Any | None = None
         self._token_hook = TokenCounterHook()
-        self._hooks: list[Hook] = [self._token_hook, AutoCompactHook()]
+        self._hooks: list[Hook] = sorted(
+            [self._token_hook, ToolOutputSummaryHook(), AutoCompactHook()],
+            key=hook_order,
+        )
         self._available_models: list[AvailableModel] = []
         self._initialized = False
         self._turn_lock: asyncio.Lock | None = None
@@ -317,6 +334,7 @@ class SessionEngine:
         assistant_parts: list[str] = []
         saw_text = False
         last_subagent_snapshot = ""
+        tool_output_candidates: dict[str, tuple[str, str]] = {}
         with start_api_turn_trace(
             enabled=self._langfuse_enabled,
             session_id=self._session_id,
@@ -326,9 +344,11 @@ class SessionEngine:
             sub_agent_mode_enabled=self._settings.sub_agent_mode_enabled,
             prompt_text=prompt_text,
         ) as trace_scope:
+            trace_stream_config = dict(trace_scope.langchain_config)
+            trace_stream_config.pop("callbacks", None)
             stream_config = merge_langchain_config(
                 {"configurable": {"thread_id": self._thread_id}},
-                trace_scope.langchain_config,
+                trace_stream_config,
             )
             try:
                 async for mode, chunk in self._agent.astream(
@@ -341,6 +361,13 @@ class SessionEngine:
                         if isinstance(event, TextDelta):
                             saw_text = True
                             assistant_parts.append(event.text)
+                        elif isinstance(event, ToolResultEvent):
+                            tool_call_id = event.tool_call_id.strip()
+                            if tool_call_id:
+                                tool_output_candidates[tool_call_id] = (
+                                    event.tool_name.strip(),
+                                    event.content,
+                                )
                         await self._persist_event(event, turn_id=turn_id)
                         yield event
 
@@ -385,6 +412,7 @@ class SessionEngine:
             hook_message = await self._run_hooks(
                 turn_input_tokens=turn_input,
                 turn_output_tokens=turn_output,
+                tool_output_candidates=tool_output_candidates,
             )
             usage_final = self._build_usage_event(
                 turn_input_tokens=turn_input,
@@ -424,10 +452,15 @@ class SessionEngine:
         *,
         turn_input_tokens: int,
         turn_output_tokens: int,
+        tool_output_candidates: dict[str, tuple[str, str]],
     ) -> str | None:
         if self._agent is None:
             return None
-        if turn_input_tokens <= 0 and turn_output_tokens <= 0:
+        if (
+            turn_input_tokens <= 0
+            and turn_output_tokens <= 0
+            and not tool_output_candidates
+        ):
             return None
 
         hook_ctx = HookContext(
@@ -438,9 +471,10 @@ class SessionEngine:
             last_turn_output_tokens=turn_output_tokens,
             available_models=self._available_models,
             compact_prompt=self._settings.compact_prompt,
+            tool_output_candidates=tool_output_candidates,
         )
         messages: list[str] = []
-        for hook in self._hooks:
+        for hook in sorted(self._hooks, key=hook_order):
             try:
                 maybe_message = await hook.after_turn(hook_ctx)
             except Exception as exc:  # noqa: BLE001

@@ -38,7 +38,6 @@ class SubAgentRecord(BaseModel):
     attempt: int = 1
     stop_reason: str = ""
     final_output: str = ""
-    completion_report: str = ""
     error: str = ""
     latest_report: str = ""
     current_activity: str = "Queued"

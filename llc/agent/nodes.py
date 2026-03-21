@@ -79,9 +79,10 @@ def make_llm_node(
             runtime_status = runtime_status_provider()
             if runtime_status:
                 prompt = f"{system_prompt.rstrip()}\n\n{runtime_status.strip()}"
-        response = model_with_tools.invoke(
-            [SystemMessage(content=prompt), *state["messages"]]
-        )
+        messages = list(state["messages"])
+        if prompt.strip():
+            messages = [SystemMessage(content=prompt), *messages]
+        response = model_with_tools.invoke(messages)
         if auto_wait_provider is not None and auto_wait_tool_name:
             should_wait = False
             try:
