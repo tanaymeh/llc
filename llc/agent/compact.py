@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import (
@@ -23,6 +25,13 @@ _SUMMARY_PREFIX = "Summary of earlier conversation:\n\n"
 _OVERSIZED_MESSAGE_CHARS = 12000
 
 
+@dataclass(slots=True)
+class CompactionPlan:
+    source_signature: str
+    replacement_messages: list[Any]
+    compacted_count: int
+
+
 async def aget_history_messages(agent: Any, thread_id: str) -> list[AnyMessage]:
     state = await agent.aget_state(_graph_config(thread_id))
     values = getattr(state, "values", {})
@@ -32,29 +41,55 @@ async def aget_history_messages(agent: Any, thread_id: str) -> list[AnyMessage]:
     return list(messages)
 
 
-async def compact_history(agent: Any, thread_id: str, settings: Settings) -> int:
+async def build_compaction_plan(
+    agent: Any,
+    thread_id: str,
+    settings: Settings,
+) -> CompactionPlan | None:
     messages = await aget_history_messages(agent, thread_id)
     if len(messages) < _MIN_COMPACT_MESSAGES:
-        return 0
+        return None
 
     split_index = _find_split_index(messages)
     split_index = _adjust_split_for_oversized_messages(messages, split_index)
     if split_index <= 0 or split_index >= len(messages):
-        return 0
+        return None
 
     summary = await _summarize_messages(messages[:split_index], settings)
     retained = [_clone_message(message) for message in messages[split_index:]]
-    replacement = [
+    replacement_messages: list[Any] = [
         RemoveMessage(id=REMOVE_ALL_MESSAGES),
         SystemMessage(content=f"{_SUMMARY_PREFIX}{summary}"),
         *retained,
     ]
+    return CompactionPlan(
+        source_signature=_messages_signature(messages),
+        replacement_messages=replacement_messages,
+        compacted_count=split_index,
+    )
+
+
+async def apply_compaction_plan(
+    agent: Any,
+    thread_id: str,
+    plan: CompactionPlan,
+) -> int:
+    current_messages = await aget_history_messages(agent, thread_id)
+    if _messages_signature(current_messages) != plan.source_signature:
+        return 0
     await agent.aupdate_state(
         _graph_config(thread_id),
-        {"messages": replacement},
+        {"messages": plan.replacement_messages},
         as_node="llm",
     )
-    return split_index
+    return plan.compacted_count
+
+
+async def compact_history(agent: Any, thread_id: str, settings: Settings) -> int:
+    plan = await build_compaction_plan(agent, thread_id, settings)
+    if plan is None:
+        return 0
+    return await apply_compaction_plan(agent, thread_id, plan)
 
 
 def _graph_config(thread_id: str) -> dict[str, dict[str, str]]:
@@ -98,6 +133,21 @@ def _is_boundary_message(message: AnyMessage) -> bool:
 
 def _clone_message(message: AnyMessage) -> AnyMessage:
     return message.model_copy(update={"id": None})
+
+
+def _messages_signature(messages: list[AnyMessage]) -> str:
+    digest = hashlib.sha1()
+    digest.update(f"count:{len(messages)}|".encode("utf-8"))
+    for message in messages:
+        msg_id = getattr(message, "id", None)
+        if isinstance(msg_id, str) and msg_id.strip():
+            digest.update(f"id:{msg_id}|".encode("utf-8"))
+            continue
+        message_type = message.__class__.__name__
+        content = message_text(message.content, include_reasoning=True).strip()
+        content_hash = hashlib.sha1(content.encode("utf-8")).hexdigest()
+        digest.update(f"type:{message_type}:{content_hash}|".encode("utf-8"))
+    return digest.hexdigest()
 
 
 async def _summarize_messages(messages: list[AnyMessage], settings: Settings) -> str:
@@ -185,5 +235,4 @@ def _preview_text(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
-
 

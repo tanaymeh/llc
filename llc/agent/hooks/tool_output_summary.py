@@ -28,9 +28,14 @@ _TOOL_SUMMARY_PROMPT = (
 
 
 class ToolOutputSummaryHook:
+    name = "tool_output_summary"
     order = HOOK_ORDER_TOOL_OUTPUT_SUMMARY
+    execution_mode = "background"
 
-    async def after_turn(self, ctx: HookContext) -> str | None:
+    async def prepare_after_turn(
+        self,
+        ctx: HookContext,
+    ) -> dict[str, tuple[str, str]] | None:
         candidates = {
             tool_call_id: (tool_name, content)
             for tool_call_id, (tool_name, content) in ctx.tool_output_candidates.items()
@@ -48,13 +53,17 @@ class ToolOutputSummaryHook:
             )
             if summary:
                 summaries[tool_call_id] = (tool_name, summary)
-        if not summaries:
-            return None
+        return summaries or None
 
+    async def apply_prepared(
+        self,
+        ctx: HookContext,
+        prepared: dict[str, tuple[str, str]],
+    ) -> str | None:
         replaced_count = await _swap_tool_output_summaries(
             agent=ctx.agent,
             thread_id=ctx.thread_id,
-            summaries=summaries,
+            summaries=prepared,
         )
         if replaced_count <= 0:
             return None

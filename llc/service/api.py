@@ -185,6 +185,7 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
     async def session_ws(websocket: WebSocket, session_id: str) -> None:
         await websocket.accept()
         engine = await manager.get_or_create(session_id)
+        async_event_queue = engine.subscribe_async_events()
         send_lock = asyncio.Lock()
         active_turn_task: asyncio.Task[None] | None = None
         stream_tasks: set[asyncio.Task[None]] = set()
@@ -204,6 +205,11 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
                 raise
             except Exception as exc:  # noqa: BLE001
                 await send_error(str(exc))
+
+        async def stream_async_engine_events() -> None:
+            while True:
+                event = await async_event_queue.get()
+                await send_event(event)
 
         def track_stream_task(task: asyncio.Task[None], *, marks_active_turn: bool) -> None:
             nonlocal active_turn_task
@@ -243,6 +249,7 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
                 await asyncio.sleep(settings.api_subagent_report_interval_s)
 
         poll_task = asyncio.create_task(stream_subagent_status())
+        async_events_task = asyncio.create_task(stream_async_engine_events())
         try:
             while True:
                 raw_payload = await websocket.receive_json()
@@ -285,9 +292,13 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
         except WebSocketDisconnect:
             return
         finally:
+            engine.unsubscribe_async_events(async_event_queue)
             poll_task.cancel()
             with suppress(asyncio.CancelledError):
                 await poll_task
+            async_events_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await async_events_task
             for task in list(stream_tasks):
                 task.cancel()
             for task in list(stream_tasks):

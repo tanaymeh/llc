@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import (
@@ -21,6 +22,7 @@ from llc.agent import build_agent_graph
 from llc.agent.hooks import (
     AutoCompactHook,
     Hook,
+    HookExecutionMode,
     HookContext,
     TokenCounterHook,
     ToolOutputSummaryHook,
@@ -39,6 +41,8 @@ from llc.service.events import (
     CommandOutput,
     ErrorOccurred,
     Event,
+    HookStage,
+    HookUpdate,
     SessionRestored,
     SubagentStatusUpdate,
     TextDelta,
@@ -68,6 +72,23 @@ def _preview_text(text: str, limit: int = _MAX_TRACE_TEXT_PREVIEW_CHARS) -> str:
     return cleaned[: limit - 3] + "..."
 
 
+@dataclass(slots=True)
+class _HookJob:
+    hook: Hook
+    hook_name: str
+    turn_id: str | None
+    ctx: HookContext
+
+
+@dataclass(slots=True)
+class _HookPreparedResult:
+    hook: Hook
+    hook_name: str
+    turn_id: str | None
+    ctx: HookContext
+    prepared: Any
+
+
 class SessionEngine:
     def __init__(
         self,
@@ -87,20 +108,30 @@ class SessionEngine:
         self._subagent_runtime: SubAgentRuntime | None = None
         self._agent: Any | None = None
         self._token_hook = TokenCounterHook()
-        self._tool_output_summary_hook = ToolOutputSummaryHook()
         self._hooks: list[Hook] = sorted(
-            [self._token_hook, AutoCompactHook()],
+            [self._token_hook, ToolOutputSummaryHook(), AutoCompactHook()],
             key=hook_order,
         )
+        self._blocking_hooks: list[Hook] = [
+            hook for hook in self._hooks if self._hook_execution_mode(hook) == "blocking"
+        ]
+        self._background_hooks: list[Hook] = [
+            hook for hook in self._hooks if self._hook_execution_mode(hook) == "background"
+        ]
         self._available_models: list[AvailableModel] = []
         self._initialized = False
         self._turn_lock: asyncio.Lock | None = None
+        self._hook_apply_lock = asyncio.Lock()
         self._langfuse_enabled = enable_langfuse_tracing
         self._active_turn_task: asyncio.Task[Any] | None = None
         self._active_turn_id: str = ""
         self._interrupt_requested = False
         self._background_tasks: set[asyncio.Task[Any]] = set()
-        self._pending_tool_summary_task: asyncio.Task[Any] | None = None
+        self._hook_runner_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._hook_pending_jobs: dict[str, _HookJob] = {}
+        self._hook_ready_results: dict[str, _HookPreparedResult] = {}
+        self._hook_apply_task: asyncio.Task[Any] | None = None
+        self._async_event_subscribers: set[asyncio.Queue[Event]] = set()
 
     @property
     def session_id(self) -> str:
@@ -117,6 +148,14 @@ class SessionEngine:
     @property
     def available_models(self) -> list[AvailableModel]:
         return list(self._available_models)
+
+    def subscribe_async_events(self) -> asyncio.Queue[Event]:
+        queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=200)
+        self._async_event_subscribers.add(queue)
+        return queue
+
+    def unsubscribe_async_events(self, queue: asyncio.Queue[Event]) -> None:
+        self._async_event_subscribers.discard(queue)
 
     def get_subagent_report(self, *, include_all: bool = False) -> dict[str, Any]:
         runtime = self._subagent_runtime
@@ -182,7 +221,11 @@ class SessionEngine:
             with suppress(asyncio.CancelledError):
                 await task
         self._background_tasks.clear()
-        self._pending_tool_summary_task = None
+        self._hook_runner_tasks.clear()
+        self._hook_pending_jobs.clear()
+        self._hook_ready_results.clear()
+        self._hook_apply_task = None
+        self._async_event_subscribers.clear()
         if self._subagent_runtime is not None:
             self._subagent_runtime.shutdown()
         if self._store is not None:
@@ -210,13 +253,13 @@ class SessionEngine:
 
     async def send_message(self, text: str) -> AsyncIterator[Event]:
         await self.initialize()
-        await self._await_pending_tool_summary()
         if self._turn_lock is None:
             raise RuntimeError("Session engine lock was not initialized")
         if self._agent is None:
             raise RuntimeError("Agent was not initialized")
 
         async with self._turn_lock:
+            await self._apply_ready_hook_results(lock_held=True)
             turn_id = f"turn-{uuid.uuid4().hex[:10]}"
             self._active_turn_task = asyncio.current_task()
             self._active_turn_id = turn_id
@@ -244,6 +287,7 @@ class SessionEngine:
                     self._active_turn_task = None
                     self._active_turn_id = ""
                     self._interrupt_requested = False
+                    self._schedule_ready_hook_apply()
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         await self.initialize()
@@ -254,7 +298,7 @@ class SessionEngine:
 
     async def restore_session(self, session_id: str) -> AsyncIterator[Event]:
         await self.initialize()
-        await self._await_pending_tool_summary()
+        await self._apply_ready_hook_results()
         if self._store is None:
             event = ErrorOccurred(message="Session store is not configured.")
             await self._persist_event(event, turn_id="")
@@ -450,12 +494,13 @@ class SessionEngine:
             if turn_input == 0 and turn_output == 0 and adapter.streamed_text_chars > 0:
                 turn_output = max(1, adapter.streamed_text_chars // 4)
 
-            hook_message = await self._run_hooks(
+            hook_message = await self._run_blocking_hooks(
                 turn_input_tokens=turn_input,
                 turn_output_tokens=turn_output,
                 tool_output_candidates=tool_output_candidates,
             )
-            self._schedule_tool_output_summary(
+            self._enqueue_background_hooks(
+                turn_id=turn_id,
                 turn_input_tokens=turn_input,
                 turn_output_tokens=turn_output,
                 tool_output_candidates=tool_output_candidates,
@@ -493,7 +538,7 @@ class SessionEngine:
                 },
             )
 
-    async def _run_hooks(
+    async def _run_blocking_hooks(
         self,
         *,
         turn_input_tokens: int,
@@ -517,14 +562,194 @@ class SessionEngine:
         if hook_ctx is None:
             return None
         messages: list[str] = []
-        for hook in sorted(self._hooks, key=hook_order):
+        for hook in self._blocking_hooks:
             try:
-                maybe_message = await hook.after_turn(hook_ctx)
+                prepared = await hook.prepare_after_turn(hook_ctx)
             except Exception as exc:  # noqa: BLE001
-                maybe_message = f"Hook failed: `{exc!s}`"
+                messages.append(f"Hook failed: `{self._hook_name(hook)}`: `{exc!s}`")
+                continue
+            if prepared is None:
+                continue
+            try:
+                maybe_message = await hook.apply_prepared(hook_ctx, prepared)
+            except Exception as exc:  # noqa: BLE001
+                messages.append(f"Hook failed: `{self._hook_name(hook)}`: `{exc!s}`")
+                continue
             if maybe_message:
                 messages.append(maybe_message)
         return "\n".join(messages) if messages else None
+
+    def _enqueue_background_hooks(
+        self,
+        *,
+        turn_id: str,
+        turn_input_tokens: int,
+        turn_output_tokens: int,
+        tool_output_candidates: dict[str, tuple[str, str]],
+    ) -> None:
+        if self._agent is None or not self._background_hooks:
+            return
+        if (
+            turn_input_tokens <= 0
+            and turn_output_tokens <= 0
+            and not tool_output_candidates
+        ):
+            return
+        hook_ctx = self._build_hook_context(
+            turn_input_tokens=turn_input_tokens,
+            turn_output_tokens=turn_output_tokens,
+            tool_output_candidates=tool_output_candidates,
+        )
+        if hook_ctx is None:
+            return
+        for hook in self._background_hooks:
+            self._enqueue_background_hook(
+                _HookJob(
+                    hook=hook,
+                    hook_name=self._hook_name(hook),
+                    turn_id=turn_id,
+                    ctx=hook_ctx,
+                )
+            )
+
+    def _enqueue_background_hook(self, job: _HookJob) -> None:
+        hook_name = job.hook_name
+        pending_existing = self._hook_pending_jobs.get(hook_name)
+        self._hook_pending_jobs[hook_name] = job
+        if pending_existing is not None:
+            self._emit_hook_update(
+                hook_name=hook_name,
+                stage="coalesced",
+                turn_id=job.turn_id,
+                message="Replaced older queued hook run.",
+            )
+        self._emit_hook_update(
+            hook_name=hook_name,
+            stage="queued",
+            turn_id=job.turn_id,
+            message=None,
+        )
+
+        runner = self._hook_runner_tasks.get(hook_name)
+        if runner is not None and not runner.done():
+            return
+        task = asyncio.create_task(self._run_background_hook_loop(job.hook, hook_name=hook_name))
+        self._hook_runner_tasks[hook_name] = task
+        self._track_background_task(task)
+
+    async def _run_background_hook_loop(self, hook: Hook, *, hook_name: str) -> None:
+        while True:
+            job = self._hook_pending_jobs.pop(hook_name, None)
+            if job is None:
+                return
+
+            self._emit_hook_update(
+                hook_name=hook_name,
+                stage="running",
+                turn_id=job.turn_id,
+                message=None,
+            )
+            try:
+                prepared = await hook.prepare_after_turn(job.ctx)
+            except Exception as exc:  # noqa: BLE001
+                self._emit_hook_update(
+                    hook_name=hook_name,
+                    stage="failed",
+                    turn_id=job.turn_id,
+                    message=f"{exc!s}",
+                )
+                continue
+
+            if prepared is None:
+                self._emit_hook_update(
+                    hook_name=hook_name,
+                    stage="skipped",
+                    turn_id=job.turn_id,
+                    message=None,
+                )
+                continue
+
+            if hook_name in self._hook_ready_results:
+                self._emit_hook_update(
+                    hook_name=hook_name,
+                    stage="coalesced",
+                    turn_id=job.turn_id,
+                    message="Replaced older prepared hook result.",
+                )
+            self._hook_ready_results[hook_name] = _HookPreparedResult(
+                hook=hook,
+                hook_name=hook_name,
+                turn_id=job.turn_id,
+                ctx=job.ctx,
+                prepared=prepared,
+            )
+            self._schedule_ready_hook_apply()
+
+    def _schedule_ready_hook_apply(self) -> None:
+        if not self._hook_ready_results:
+            return
+        task = self._hook_apply_task
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(self._apply_ready_hook_results())
+        self._hook_apply_task = task
+        self._track_background_task(task)
+
+    async def _apply_ready_hook_results(self, *, lock_held: bool = False) -> None:
+        if not self._hook_ready_results:
+            return
+        if self._agent is None:
+            self._hook_ready_results.clear()
+            return
+
+        if lock_held:
+            await self._apply_ready_hook_results_unlocked()
+            return
+
+        if self._active_turn_task is not None and not self._active_turn_task.done():
+            return
+        if self._turn_lock is None:
+            return
+        async with self._turn_lock:
+            await self._apply_ready_hook_results_unlocked()
+
+    async def _apply_ready_hook_results_unlocked(self) -> None:
+        if not self._hook_ready_results:
+            return
+        async with self._hook_apply_lock:
+            if self._active_turn_task is not None and not self._active_turn_task.done():
+                return
+            for hook in sorted(self._background_hooks, key=hook_order):
+                hook_name = self._hook_name(hook)
+                ready = self._hook_ready_results.pop(hook_name, None)
+                if ready is None:
+                    continue
+                try:
+                    maybe_message = await ready.hook.apply_prepared(ready.ctx, ready.prepared)
+                except Exception as exc:  # noqa: BLE001
+                    self._emit_hook_update(
+                        hook_name=hook_name,
+                        stage="failed",
+                        turn_id=ready.turn_id,
+                        message=f"{exc!s}",
+                    )
+                    continue
+                if maybe_message:
+                    self._emit_hook_update(
+                        hook_name=hook_name,
+                        stage="applied",
+                        turn_id=ready.turn_id,
+                        message=maybe_message,
+                    )
+                else:
+                    self._emit_hook_update(
+                        hook_name=hook_name,
+                        stage="skipped",
+                        turn_id=ready.turn_id,
+                        message=None,
+                    )
+        if self._hook_ready_results:
+            self._schedule_ready_hook_apply()
 
     def _build_hook_context(
         self,
@@ -546,24 +771,20 @@ class SessionEngine:
             tool_output_candidates=tool_output_candidates,
         )
 
-    async def _await_pending_tool_summary(self) -> None:
-        pending = self._pending_tool_summary_task
-        if pending is None:
-            return
-        try:
-            await asyncio.shield(pending)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            pass
-
     def _track_background_task(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.add(task)
 
         def _cleanup(done: asyncio.Task[Any]) -> None:
             self._background_tasks.discard(done)
-            if self._pending_tool_summary_task is done:
-                self._pending_tool_summary_task = None
+            if self._hook_apply_task is done:
+                self._hook_apply_task = None
+            stale_runner_names = [
+                name
+                for name, runner in self._hook_runner_tasks.items()
+                if runner is done
+            ]
+            for name in stale_runner_names:
+                self._hook_runner_tasks.pop(name, None)
             try:
                 done.result()
             except asyncio.CancelledError:
@@ -573,37 +794,46 @@ class SessionEngine:
 
         task.add_done_callback(_cleanup)
 
-    def _schedule_tool_output_summary(
+    def _hook_execution_mode(self, hook: Hook) -> HookExecutionMode:
+        mode = str(getattr(hook, "execution_mode", "background")).strip().lower()
+        if mode == "blocking":
+            return "blocking"
+        return "background"
+
+    def _hook_name(self, hook: Hook) -> str:
+        raw_name = str(getattr(hook, "name", hook.__class__.__name__)).strip()
+        if raw_name:
+            return raw_name
+        return hook.__class__.__name__
+
+    def _emit_hook_update(
         self,
         *,
-        turn_input_tokens: int,
-        turn_output_tokens: int,
-        tool_output_candidates: dict[str, tuple[str, str]],
+        hook_name: str,
+        stage: HookStage,
+        turn_id: str | None,
+        message: str | None,
     ) -> None:
-        if not tool_output_candidates:
-            return
-        hook_ctx = self._build_hook_context(
-            turn_input_tokens=turn_input_tokens,
-            turn_output_tokens=turn_output_tokens,
-            tool_output_candidates=tool_output_candidates,
+        event = HookUpdate(
+            hook_name=hook_name,
+            stage=stage,
+            turn_id=turn_id,
+            message=message,
         )
-        if hook_ctx is None:
+        self._publish_async_event(event, turn_id=turn_id or "")
+
+    def _publish_async_event(self, event: Event, *, turn_id: str) -> None:
+        for queue in list(self._async_event_subscribers):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                with suppress(asyncio.QueueEmpty):
+                    queue.get_nowait()
+                with suppress(asyncio.QueueFull):
+                    queue.put_nowait(event)
+        if self._store is None:
             return
-
-        previous = self._pending_tool_summary_task
-
-        async def _runner() -> None:
-            if previous is not None:
-                try:
-                    await previous
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
-            await self._tool_output_summary_hook.after_turn(hook_ctx)
-
-        task = asyncio.create_task(_runner())
-        self._pending_tool_summary_task = task
+        task = asyncio.create_task(self._persist_event(event, turn_id=turn_id))
         self._track_background_task(task)
 
     def _build_subagent_status_event(
@@ -615,7 +845,7 @@ class SessionEngine:
         if runtime is None:
             return None, None
         try:
-            report = runtime.get_subagent_report()
+            report = runtime.get_subagent_report(include_all=True)
         except Exception:
             return None, None
 

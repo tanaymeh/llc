@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from llc.agent.compact import compact_history
+from llc.agent.compact import CompactionPlan, apply_compaction_plan, build_compaction_plan
 from llc.models import AvailableModel
 
 from .base import HookContext
@@ -8,9 +8,11 @@ from .ordering import HOOK_ORDER_AUTO_COMPACT
 
 
 class AutoCompactHook:
+    name = "auto_compact"
     order = HOOK_ORDER_AUTO_COMPACT
+    execution_mode = "background"
 
-    async def after_turn(self, ctx: HookContext) -> str | None:
+    async def prepare_after_turn(self, ctx: HookContext) -> CompactionPlan | None:
         if ctx.last_turn_input_tokens <= 0:
             return None
 
@@ -25,10 +27,21 @@ class AutoCompactHook:
         if ctx.last_turn_input_tokens <= threshold:
             return None
 
-        compacted_count = await compact_history(
+        return await build_compaction_plan(
             ctx.agent,
             ctx.thread_id,
             ctx.settings,
+        )
+
+    async def apply_prepared(
+        self,
+        ctx: HookContext,
+        prepared: CompactionPlan,
+    ) -> str | None:
+        compacted_count = await apply_compaction_plan(
+            ctx.agent,
+            ctx.thread_id,
+            prepared,
         )
         if compacted_count <= 0:
             return None

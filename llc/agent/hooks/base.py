@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from llc.config import Settings
 from llc.models import AvailableModel
 
+HookExecutionMode = Literal["background", "blocking"]
+
 
 class Hook(Protocol):
+    name: str
     order: int
+    execution_mode: HookExecutionMode
 
-    async def after_turn(self, ctx: "HookContext") -> str | None: ...
+    async def prepare_after_turn(self, ctx: "HookContext") -> Any | None: ...
+
+    async def apply_prepared(self, ctx: "HookContext", prepared: Any) -> str | None: ...
 
 
 class HookContext(BaseModel):

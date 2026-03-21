@@ -58,6 +58,17 @@ class SubagentStatusUpdate(_EventBase):
     max_sub_agents: int = 0
 
 
+HookStage = Literal["queued", "running", "applied", "failed", "coalesced", "skipped"]
+
+
+class HookUpdate(_EventBase):
+    type: Literal["hook_update"] = "hook_update"
+    hook_name: str
+    stage: HookStage
+    turn_id: str | None = None
+    message: str | None = None
+
+
 class TurnCompleted(_EventBase):
     type: Literal["turn_completed"] = "turn_completed"
     input_tokens: int = 0
@@ -92,6 +103,7 @@ Event = Annotated[
         | ToolResultEvent
         | UsageUpdate
         | SubagentStatusUpdate
+        | HookUpdate
         | TurnCompleted
         | CommandOutput
         | ErrorOccurred
@@ -101,4 +113,3 @@ Event = Annotated[
 ]
 
 EVENT_ADAPTER = TypeAdapter(Event)
-

@@ -25,7 +25,7 @@ Notes:
   Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
   Sub-agent watchdog/timing knobs are read from `.env` (`SUB_AGENT_*`).
   Sub-agents run as isolated worker processes.
-  Tool-output summarization runs post-turn in background and is applied before next turn.
+  Post-turn hooks run in background by default (blocking only when explicitly configured).
 EOF
 }
 

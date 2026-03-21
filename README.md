@@ -23,8 +23,8 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Markdown-rendered agent responses in mission-control UI (GFM tables, task lists, code blocks)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
-- Ordered post-turn hooks with tool-output compression before auto-compaction
-- Non-blocking post-turn tool-output summarization (applies before next turn starts)
+- Ordered post-turn hooks with explicit `blocking` opt-in (background by default)
+- Async `hook_update` runtime events plus expiring mission-control hook reminders
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers, process-isolated)
 - Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
