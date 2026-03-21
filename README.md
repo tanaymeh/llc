@@ -12,8 +12,7 @@
 LLC is a local coding agent runtime with:
 
 - a backend API service (default runtime),
-- a React mission-control frontend (Git submodule at `llc-frontend/`),
-- and a deprecated Textual TUI mode.
+- and a React mission-control frontend (Git submodule at `llc-frontend/`).
 
 The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists sessions in SQLite.
 
@@ -22,7 +21,6 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Backend API with WebSocket event streaming (`/api/ws/{session_id}`)
 - React mission-control web UI (`llc-frontend/`)
 - Markdown-rendered agent responses in mission-control UI (GFM tables, task lists, code blocks)
-- Optional Mission-control TUI (`llc tui`)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
 - Ordered post-turn hooks with tool-output compression before auto-compaction
@@ -32,10 +30,9 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 
 ## Implementation overview
 
-- `llc/main.py`: mode-aware entrypoint (`serve` default, `tui` optional)
+- `llc/main.py`: backend API entrypoint (`serve` optional for backward compatibility)
 - `llc/agent/`: LangGraph graph, nodes, tool collection, compaction, sub-agent runtime
 - `llc/service/`: backend orchestration, stream adapter, API server, prompt registry
-- `llc/ui/`: Textual app, panels, state models, telemetry mapping
 - `llc/storage/`: SQLite schema and async persistence layer
 - `llc/prompts/`: system/compact/runtime YAML prompts
 - `llc-frontend/`: React frontend shell wired to live backend events
@@ -79,12 +76,6 @@ Override bind host/port:
 
 ```bash
 uv run llc serve --host 0.0.0.0 --port 8000
-```
-
-## Run TUI mode
-
-```bash
-uv run llc tui
 ```
 
 ## Run local Langfuse (separate service)

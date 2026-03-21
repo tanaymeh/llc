@@ -8,10 +8,7 @@ from llc.commands.help import HelpCommand
 from llc.commands.model import ModelCommand
 from llc.commands.subagent import SubagentCommand
 from llc.config import Settings
-from llc.service.engine import SessionEngine
 from llc.service.api import create_api_app
-from llc.storage.store import SessionStore
-from llc.ui import MissionControlApp
 
 
 def _build_registry() -> CommandRegistry:
@@ -23,13 +20,6 @@ def _build_registry() -> CommandRegistry:
     registry.register(SubagentCommand())
     registry.register(HelpCommand(registry))
     return registry
-
-
-def _run_tui(settings: Settings, registry: CommandRegistry) -> None:
-    store = SessionStore(settings.db_path)
-    engine = SessionEngine(settings, registry, store=store)
-    app = MissionControlApp(engine)
-    app.run()
 
 
 def _run_api(settings: Settings, registry: CommandRegistry) -> None:
@@ -47,26 +37,26 @@ def _run_api(settings: Settings, registry: CommandRegistry) -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="llc",
-        description="Run LLC API server (default) or Textual TUI.",
+        description="Run the LLC API server.",
     )
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=("serve", "tui"),
+        choices=("serve",),
         default="serve",
-        help="`serve` starts the API server, `tui` starts the terminal UI.",
+        help="Optional explicit API mode for backward compatibility.",
     )
     parser.add_argument(
         "--host",
         type=str,
         default=None,
-        help="Override API host (serve mode only).",
+        help="Override API host.",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="Override API port (serve mode only).",
+        help="Override API port.",
     )
     return parser.parse_args()
 
@@ -86,9 +76,6 @@ def main() -> None:
         if updates:
             settings = settings.model_copy(update=updates)
     registry = _build_registry()
-    if args.mode == "tui":
-        _run_tui(settings, registry)
-        return
     _run_api(settings, registry)
 
 
