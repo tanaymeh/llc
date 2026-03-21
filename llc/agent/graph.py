@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -118,6 +118,24 @@ def _active_workers_provider(role: AgentRole, subagent_runtime: object | None):
     return provider
 
 
+def _auto_wait_args_provider(
+    role: AgentRole,
+    subagent_runtime: object | None,
+    wait_timeout_ms: int,
+):
+    if role != "orchestrator" or subagent_runtime is None:
+        return None
+
+    timeout_ms = max(int(wait_timeout_ms or 0), 0)
+
+    def provider() -> dict[str, Any]:
+        if timeout_ms <= 0:
+            return {}
+        return {"timeout_ms": timeout_ms}
+
+    return provider
+
+
 def build_agent_graph(
     settings: Settings,
     *,
@@ -140,6 +158,11 @@ def build_agent_graph(
         settings.max_sub_agents,
     )
     active_workers_provider = _active_workers_provider(role, subagent_runtime)
+    auto_wait_args_provider = _auto_wait_args_provider(
+        role,
+        subagent_runtime,
+        settings.sub_agent_wait_timeout_ms,
+    )
 
     builder = StateGraph(AgentState)
     builder.add_node(
@@ -150,6 +173,7 @@ def build_agent_graph(
             runtime_status_provider=runtime_status_provider,
             auto_wait_provider=active_workers_provider,
             auto_wait_tool_name="WaitSubagents",
+            auto_wait_args_provider=auto_wait_args_provider,
         ),
     )
     builder.add_node("tools", make_tool_node(tools_by_name))

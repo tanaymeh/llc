@@ -24,7 +24,8 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
 - Ordered post-turn hooks with tool-output compression before auto-compaction
-- Optional orchestrator + parallel worker sub-agent mode (max 5 workers)
+- Non-blocking post-turn tool-output summarization (applies before next turn starts)
+- Optional orchestrator + parallel worker sub-agent mode (max 5 workers, process-isolated)
 - Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 
@@ -176,6 +177,10 @@ Set values in `.env`:
 - `MAX_SUB_AGENTS` (hard-capped to `5`)
 - `SUB_AGENT_REPORT_INTERVAL_S`
 - `SUB_AGENT_MAX_RUNTIME_S`
+- `SUB_AGENT_STALL_TIMEOUT_S` (watchdog: max seconds without progress heartbeat)
+- `SUB_AGENT_STOP_GRACE_S` (watchdog grace after stop request before marked stuck)
+- `SUB_AGENT_MAX_TOOL_CALLS` (loop-budget cap per worker attempt)
+- `SUB_AGENT_WAIT_TIMEOUT_MS` (default timeout for `WaitSubagents`; use `0` for unbounded)
 - `SUB_AGENT_CONTEXT_MESSAGES`
 - `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`)
 - `LLC_PROMPTS_DIR` (default: `llc/prompts`)

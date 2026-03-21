@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from concurrent.futures import Future
-from threading import Event
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,8 +46,10 @@ class SubAgentRecord(BaseModel):
     started_at: float = 0.0
     finished_at: float = 0.0
     last_activity_at: float = 0.0
+    stop_requested_at: float = 0.0
     terminate_requested: bool = False
     pending_feedback: list[str] = Field(default_factory=list)
-    stop_event: Event = Field(default_factory=Event)
-    future: Future[dict[str, Any]] | None = None
-
+    stop_event: Any = None
+    worker_process: Any = None
+    worker_queue: Any = None
+    worker_result_received: bool = False

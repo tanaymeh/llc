@@ -35,7 +35,7 @@ def make_subagent_tools(runtime: SubAgentRuntime) -> list[BaseTool]:
 
     @tool
     def WaitSubagents(ids: Optional[list[str]] = None, timeout_ms: Optional[int] = None) -> str:
-        """Wait for selected sub-agents (or all) until completion or timeout."""
+        """Wait briefly for selected sub-agents (or all); pass timeout_ms=0 for unbounded wait."""
         return _render(runtime.wait_subagents(ids, timeout_ms))
 
     @tool

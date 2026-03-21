@@ -5,6 +5,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 from langchain_core.messages import (
@@ -86,8 +87,9 @@ class SessionEngine:
         self._subagent_runtime: SubAgentRuntime | None = None
         self._agent: Any | None = None
         self._token_hook = TokenCounterHook()
+        self._tool_output_summary_hook = ToolOutputSummaryHook()
         self._hooks: list[Hook] = sorted(
-            [self._token_hook, ToolOutputSummaryHook(), AutoCompactHook()],
+            [self._token_hook, AutoCompactHook()],
             key=hook_order,
         )
         self._available_models: list[AvailableModel] = []
@@ -97,6 +99,8 @@ class SessionEngine:
         self._active_turn_task: asyncio.Task[Any] | None = None
         self._active_turn_id: str = ""
         self._interrupt_requested = False
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_tool_summary_task: asyncio.Task[Any] | None = None
 
     @property
     def session_id(self) -> str:
@@ -171,6 +175,14 @@ class SessionEngine:
         self._initialized = True
 
     async def shutdown(self) -> None:
+        background_tasks = list(self._background_tasks)
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._background_tasks.clear()
+        self._pending_tool_summary_task = None
         if self._subagent_runtime is not None:
             self._subagent_runtime.shutdown()
         if self._store is not None:
@@ -198,6 +210,7 @@ class SessionEngine:
 
     async def send_message(self, text: str) -> AsyncIterator[Event]:
         await self.initialize()
+        await self._await_pending_tool_summary()
         if self._turn_lock is None:
             raise RuntimeError("Session engine lock was not initialized")
         if self._agent is None:
@@ -241,6 +254,7 @@ class SessionEngine:
 
     async def restore_session(self, session_id: str) -> AsyncIterator[Event]:
         await self.initialize()
+        await self._await_pending_tool_summary()
         if self._store is None:
             event = ErrorOccurred(message="Session store is not configured.")
             await self._persist_event(event, turn_id="")
@@ -441,6 +455,11 @@ class SessionEngine:
                 turn_output_tokens=turn_output,
                 tool_output_candidates=tool_output_candidates,
             )
+            self._schedule_tool_output_summary(
+                turn_input_tokens=turn_input,
+                turn_output_tokens=turn_output,
+                tool_output_candidates=tool_output_candidates,
+            )
             usage_final = self._build_usage_event(
                 turn_input_tokens=turn_input,
                 turn_output_tokens=turn_output,
@@ -490,16 +509,13 @@ class SessionEngine:
         ):
             return None
 
-        hook_ctx = HookContext(
-            agent=self._agent,
-            thread_id=self._thread_id,
-            settings=self._settings,
-            last_turn_input_tokens=turn_input_tokens,
-            last_turn_output_tokens=turn_output_tokens,
-            available_models=self._available_models,
-            compact_prompt=self._settings.compact_prompt,
+        hook_ctx = self._build_hook_context(
+            turn_input_tokens=turn_input_tokens,
+            turn_output_tokens=turn_output_tokens,
             tool_output_candidates=tool_output_candidates,
         )
+        if hook_ctx is None:
+            return None
         messages: list[str] = []
         for hook in sorted(self._hooks, key=hook_order):
             try:
@@ -509,6 +525,86 @@ class SessionEngine:
             if maybe_message:
                 messages.append(maybe_message)
         return "\n".join(messages) if messages else None
+
+    def _build_hook_context(
+        self,
+        *,
+        turn_input_tokens: int,
+        turn_output_tokens: int,
+        tool_output_candidates: dict[str, tuple[str, str]],
+    ) -> HookContext | None:
+        if self._agent is None:
+            return None
+        return HookContext(
+            agent=self._agent,
+            thread_id=self._thread_id,
+            settings=self._settings,
+            last_turn_input_tokens=turn_input_tokens,
+            last_turn_output_tokens=turn_output_tokens,
+            available_models=self._available_models,
+            compact_prompt=self._settings.compact_prompt,
+            tool_output_candidates=tool_output_candidates,
+        )
+
+    async def _await_pending_tool_summary(self) -> None:
+        pending = self._pending_tool_summary_task
+        if pending is None:
+            return
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+    def _track_background_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done)
+            if self._pending_tool_summary_task is done:
+                self._pending_tool_summary_task = None
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        task.add_done_callback(_cleanup)
+
+    def _schedule_tool_output_summary(
+        self,
+        *,
+        turn_input_tokens: int,
+        turn_output_tokens: int,
+        tool_output_candidates: dict[str, tuple[str, str]],
+    ) -> None:
+        if not tool_output_candidates:
+            return
+        hook_ctx = self._build_hook_context(
+            turn_input_tokens=turn_input_tokens,
+            turn_output_tokens=turn_output_tokens,
+            tool_output_candidates=tool_output_candidates,
+        )
+        if hook_ctx is None:
+            return
+
+        previous = self._pending_tool_summary_task
+
+        async def _runner() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            await self._tool_output_summary_hook.after_turn(hook_ctx)
+
+        task = asyncio.create_task(_runner())
+        self._pending_tool_summary_task = task
+        self._track_background_task(task)
 
     def _build_subagent_status_event(
         self,
