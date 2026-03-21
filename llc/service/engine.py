@@ -94,6 +94,9 @@ class SessionEngine:
         self._initialized = False
         self._turn_lock: asyncio.Lock | None = None
         self._langfuse_enabled = enable_langfuse_tracing
+        self._active_turn_task: asyncio.Task[Any] | None = None
+        self._active_turn_id: str = ""
+        self._interrupt_requested = False
 
     @property
     def session_id(self) -> str:
@@ -176,6 +179,10 @@ class SessionEngine:
 
     async def interrupt(self) -> AsyncIterator[Event]:
         await self.initialize()
+        self._interrupt_requested = True
+        active_turn = self._active_turn_task
+        if active_turn is not None and not active_turn.done():
+            active_turn.cancel()
         self._terminate_active_subagents(reason="session_interrupted")
         message = self._safe_prompt(
             "interrupt",
@@ -185,6 +192,9 @@ class SessionEngine:
         event = CommandOutput(message=message)
         await self._persist_event(event, turn_id="")
         yield event
+        completed = TurnCompleted(input_tokens=0, output_tokens=0)
+        await self._persist_event(completed, turn_id="")
+        yield completed
 
     async def send_message(self, text: str) -> AsyncIterator[Event]:
         await self.initialize()
@@ -195,23 +205,32 @@ class SessionEngine:
 
         async with self._turn_lock:
             turn_id = f"turn-{uuid.uuid4().hex[:10]}"
-            started = TurnStarted(turn_id=turn_id)
-            await self._persist_event(started, turn_id=turn_id)
-            yield started
-            await self._persist_message(role="user", content=text)
+            self._active_turn_task = asyncio.current_task()
+            self._active_turn_id = turn_id
+            self._interrupt_requested = False
+            try:
+                started = TurnStarted(turn_id=turn_id)
+                await self._persist_event(started, turn_id=turn_id)
+                yield started
+                await self._persist_message(role="user", content=text)
 
-            match = self._registry.match(text)
-            if match is not None:
-                command, args = match
-                async for event in self._run_command(command, args, turn_id):
+                match = self._registry.match(text)
+                if match is not None:
+                    command, args = match
+                    async for event in self._run_command(command, args, turn_id):
+                        yield event
+                    return
+
+                async for event in self._stream_agent_response(
+                    prompt_text=text,
+                    turn_id=turn_id,
+                ):
                     yield event
-                return
-
-            async for event in self._stream_agent_response(
-                prompt_text=text,
-                turn_id=turn_id,
-            ):
-                yield event
+            finally:
+                if self._active_turn_id == turn_id:
+                    self._active_turn_task = None
+                    self._active_turn_id = ""
+                    self._interrupt_requested = False
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         await self.initialize()
@@ -387,6 +406,14 @@ class SessionEngine:
                         last_subagent_snapshot = snapshot_key
                         await self._persist_event(subagent_event, turn_id=turn_id)
                         yield subagent_event
+            except asyncio.CancelledError:
+                if not self._interrupt_requested:
+                    raise
+                update_observation(
+                    trace_scope.observation,
+                    output={"status": "interrupted", "turn_id": turn_id},
+                )
+                return
             except Exception as exc:  # noqa: BLE001
                 update_observation(
                     trace_scope.observation,
@@ -741,4 +768,3 @@ class SessionEngine:
             {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *restored]},
             as_node="llm",
         )
-

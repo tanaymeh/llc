@@ -8,7 +8,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import RLock
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.types import ACTIVE_STATUSES, SubAgentRecord
@@ -426,13 +426,18 @@ class SubAgentRuntime:
                     {
                         "messages": [
                             SystemMessage(
-                                content=_render_subagent_prompt(
+                                content=_render_subagent_system_prompt(
                                     settings,
+                                    self._prompt_registry,
+                                )
+                            ),
+                            HumanMessage(
+                                content=_render_subagent_task_message(
                                     task,
                                     context,
                                     self._prompt_registry,
                                 )
-                            )
+                            ),
                         ]
                     },
                     config=stream_config,
@@ -824,8 +829,26 @@ class SubAgentRuntime:
         trimmed.sort(key=lambda record: record.created_at)
         return trimmed
 
-def _render_subagent_prompt(
+def _render_subagent_system_prompt(
     settings: Settings,
+    prompt_registry: PromptRegistry | None = None,
+) -> str:
+    base_prompt = settings.system_prompt.rstrip()
+    if prompt_registry is not None:
+        try:
+            rendered = prompt_registry.get_formatted(
+                "subagent_mode",
+                key="subagent_mode_prompt",
+                base_prompt=base_prompt,
+            ).strip()
+            if rendered:
+                return rendered
+        except Exception:
+            pass
+    return base_prompt
+
+
+def _render_subagent_task_message(
     task: str,
     context: str,
     prompt_registry: PromptRegistry | None = None,
@@ -839,13 +862,11 @@ def _render_subagent_prompt(
             "Additional context and instructions from orchestrator:\n"
             f"{clean_context}"
         )
-    base_prompt = settings.system_prompt.rstrip()
     if prompt_registry is not None:
         try:
             rendered = prompt_registry.get_formatted(
                 "subagent_mode",
-                key="subagent_mode_prompt",
-                base_prompt=base_prompt,
+                key="task_message_prompt",
                 task=clean_task,
                 context_block=context_block,
             ).strip()
@@ -853,7 +874,7 @@ def _render_subagent_prompt(
                 return rendered
         except Exception:
             pass
-    return f"{base_prompt}\n\nHere's your task:\n{clean_task}{context_block}"
+    return f"Here's your task:\n{clean_task}{context_block}"
 
 
 def _task_with_feedback(
@@ -993,4 +1014,3 @@ def _normalize_usage_by_model(raw_usage: Any) -> dict[str, dict[str, int]]:
             "output_tokens": output_tokens,
         }
     return normalized
-

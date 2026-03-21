@@ -1,5 +1,6 @@
 import os
 import platform
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +11,25 @@ import yaml
 SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.yaml"
 COMPACT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "compact_prompt.yaml"
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+_TREE_MAX_DEPTH = 3
+_TREE_MAX_ENTRIES = 200
+_README_MAX_LINES = 50
+_GIT_LOG_MAX_COMMITS = 10
+_TREE_IGNORED_NAMES = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    "dist",
+    "build",
+}
 
 
 def _load_prompt(path: Path, key: str) -> str:
@@ -44,6 +64,87 @@ def _format_today(now: datetime) -> str:
     return f"{now.strftime('%A %b')} {now.day}, {now.year}"
 
 
+def _run_git(
+    workspace_root: Path,
+    *args: str,
+) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=workspace_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (
+        subprocess.CalledProcessError,
+        FileNotFoundError,
+        subprocess.SubprocessError,
+        OSError,
+    ):
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _is_ignored_tree_entry(path: Path) -> bool:
+    return path.name in _TREE_IGNORED_NAMES
+
+
+def _build_directory_tree(root: Path) -> str:
+    lines = [f"{root.name}/"]
+    entry_count = 1
+    truncated = False
+
+    def walk(directory: Path, prefix: str, depth: int) -> None:
+        nonlocal entry_count, truncated
+        if truncated or depth >= _TREE_MAX_DEPTH:
+            return
+        try:
+            children = sorted(
+                (
+                    child
+                    for child in directory.iterdir()
+                    if not _is_ignored_tree_entry(child)
+                ),
+                key=lambda child: (not child.is_dir(), child.name.lower()),
+            )
+        except OSError:
+            lines.append(f"{prefix}[unreadable]")
+            return
+
+        total = len(children)
+        for index, child in enumerate(children):
+            if entry_count >= _TREE_MAX_ENTRIES:
+                truncated = True
+                lines.append(f"{prefix}... [tree truncated]")
+                return
+            connector = "└── " if index == total - 1 else "├── "
+            suffix = "/" if child.is_dir() else ""
+            lines.append(f"{prefix}{connector}{child.name}{suffix}")
+            entry_count += 1
+            if child.is_dir():
+                extension = "    " if index == total - 1 else "│   "
+                walk(child, prefix + extension, depth + 1)
+                if truncated:
+                    return
+
+    walk(root, "", 0)
+    return "\n".join(lines)
+
+
+def _read_readme_preview(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    preview = lines[:_README_MAX_LINES]
+    return "\n".join(preview).strip() or None
+
+
 def _build_env_details(workspace_root: Path) -> str:
     git_root = _find_git_root(workspace_root)
     git_status = f"Yes, at {git_root}" if git_root else "No"
@@ -54,9 +155,41 @@ def _build_env_details(workspace_root: Path) -> str:
         f"OS Version: {os_version}",
         f"Shell: {shell}",
         f"Workspace Path: {workspace_root}",
+        f"Current directory name: {workspace_root.name}",
         f"Is directory a git repo: {git_status}",
         f"Today's date: {today}",
     ]
+    lines.extend(
+        [
+            "Current directory tree:",
+            _build_directory_tree(workspace_root),
+        ]
+    )
+
+    if git_root is not None:
+        git_log = _run_git(
+            workspace_root,
+            "log",
+            "--all",
+            f"-n{_GIT_LOG_MAX_COMMITS}",
+            "--date=short",
+            "--pretty=format:%h %ad %d %s",
+        )
+        if git_log:
+            lines.extend(
+                [
+                    "Last 10 commits across local and remote refs:",
+                    git_log,
+                ]
+            )
+        readme_preview = _read_readme_preview(git_root / "README.md")
+        if readme_preview:
+            lines.extend(
+                [
+                    "README.md preview (first 50 lines):",
+                    readme_preview,
+                ]
+            )
     return "\n".join(lines)
 
 

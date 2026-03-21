@@ -14,6 +14,7 @@ subagent_mode_prompt: |
 
   Do not include chain-of-thought or unnecessary detail.
 
+task_message_prompt: |
   Here's your task:
   {task}{context_block}
 
@@ -28,4 +29,3 @@ revision_task_prompt: |
   {feedback}
 
   Produce an improved final result.
-

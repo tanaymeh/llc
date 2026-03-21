@@ -186,6 +186,8 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
         await websocket.accept()
         engine = await manager.get_or_create(session_id)
         send_lock = asyncio.Lock()
+        active_turn_task: asyncio.Task[None] | None = None
+        stream_tasks: set[asyncio.Task[None]] = set()
 
         async def send_event(event: Event) -> None:
             async with send_lock:
@@ -193,6 +195,31 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
 
         async def send_error(message: str) -> None:
             await send_event(ErrorOccurred(message=message))
+
+        async def stream_engine_events(source: Any) -> None:
+            try:
+                async for event in source:
+                    await send_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await send_error(str(exc))
+
+        def track_stream_task(task: asyncio.Task[None], *, marks_active_turn: bool) -> None:
+            nonlocal active_turn_task
+            stream_tasks.add(task)
+            if marks_active_turn:
+                active_turn_task = task
+
+            def _cleanup(done: asyncio.Task[None]) -> None:
+                nonlocal active_turn_task
+                stream_tasks.discard(done)
+                if active_turn_task is done:
+                    active_turn_task = None
+                with suppress(asyncio.CancelledError, Exception):
+                    done.result()
+
+            task.add_done_callback(_cleanup)
 
         async def stream_subagent_status() -> None:
             last_snapshot = ""
@@ -230,13 +257,16 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
                     if not text:
                         await send_error("Message text cannot be empty.")
                         continue
-                    async for event in engine.send_message(text):
-                        await send_event(event)
+                    if active_turn_task is not None and not active_turn_task.done():
+                        await send_error("A turn is already running.")
+                        continue
+                    task = asyncio.create_task(stream_engine_events(engine.send_message(text)))
+                    track_stream_task(task, marks_active_turn=True)
                     continue
 
                 if incoming.action == "interrupt":
-                    async for event in engine.interrupt():
-                        await send_event(event)
+                    task = asyncio.create_task(stream_engine_events(engine.interrupt()))
+                    track_stream_task(task, marks_active_turn=False)
                     continue
 
                 if incoming.action == "restore_session":
@@ -244,8 +274,13 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
                     if not target_session:
                         await send_error("`session_id` is required for restore_session.")
                         continue
-                    async for event in engine.restore_session(target_session):
-                        await send_event(event)
+                    if active_turn_task is not None and not active_turn_task.done():
+                        await send_error("A turn is already running.")
+                        continue
+                    task = asyncio.create_task(
+                        stream_engine_events(engine.restore_session(target_session))
+                    )
+                    track_stream_task(task, marks_active_turn=True)
                     continue
         except WebSocketDisconnect:
             return
@@ -253,6 +288,10 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
             poll_task.cancel()
             with suppress(asyncio.CancelledError):
                 await poll_task
+            for task in list(stream_tasks):
+                task.cancel()
+            for task in list(stream_tasks):
+                with suppress(asyncio.CancelledError):
+                    await task
 
     return app
-

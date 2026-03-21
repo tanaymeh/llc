@@ -193,13 +193,21 @@ Set values in `.env`:
 - `LLC_API_ALLOWED_ORIGINS` (comma-separated list; default includes Vite localhost origins)
 - `LLC_API_SUBAGENT_REPORT_INTERVAL_S` (default: `1.0`)
 
+At startup, LLC appends a project snapshot inside the system prompt `<env>` block: current directory name, a bounded workspace tree, git-repo status, the latest 10 commits across local and remote refs when applicable, and the first 50 lines of the repo `README.md` when present.
+
 Local Langfuse stack variables (used by `docker-compose.langfuse.yml`) are also in `.env.example`, including:
 
 - `LANGFUSE_INIT_*` bootstrap variables (org/project/user + API keys)
 - `NEXTAUTH_SECRET`, `SALT`, `ENCRYPTION_KEY`
 - `POSTGRES_*`, `CLICKHOUSE_*`, `MINIO_*`, `REDIS_AUTH`
 
-## TUI controls
+## UI controls
+
+Mission-control web UI:
+
+- `Esc` twice quickly interrupts the active turn and any running workers
+
+TUI:
 
 - `Enter` (or `Ctrl+Enter`) send message
 - `Esc` twice quickly interrupts active turn + active workers
