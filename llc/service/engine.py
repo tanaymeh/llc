@@ -16,6 +16,11 @@ from llc.agent.subagents import SubAgentRuntime
 from llc.commands import CommandRegistry, ReplContext
 from llc.config import Settings
 from llc.models import AvailableModel, fetch_models, get_model_pricing
+from llc.observability import (
+    merge_langchain_config,
+    start_api_turn_trace,
+    update_observation,
+)
 from llc.service.events import (
     CommandOutput,
     ErrorOccurred,
@@ -38,6 +43,14 @@ _MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
     "Keep this response open until all workers complete.\n"
     "Provide concise progress updates and then a final combined outcome."
 )
+_MAX_TRACE_TEXT_PREVIEW_CHARS = 500
+
+
+def _preview_text(text: str, limit: int = _MAX_TRACE_TEXT_PREVIEW_CHARS) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
 
 
 class SessionEngine:
@@ -48,6 +61,7 @@ class SessionEngine:
         *,
         session_id: str | None = None,
         store: Any | None = None,
+        enable_langfuse_tracing: bool = False,
     ) -> None:
         self._settings = settings
         self._registry = registry
@@ -62,6 +76,7 @@ class SessionEngine:
         self._available_models: list[AvailableModel] = []
         self._initialized = False
         self._turn_lock: asyncio.Lock | None = None
+        self._langfuse_enabled = enable_langfuse_tracing
 
     @property
     def session_id(self) -> str:
@@ -302,82 +317,107 @@ class SessionEngine:
         assistant_parts: list[str] = []
         saw_text = False
         last_subagent_snapshot = ""
+        with start_api_turn_trace(
+            enabled=self._langfuse_enabled,
+            session_id=self._session_id,
+            turn_id=turn_id,
+            thread_id=self._thread_id,
+            model_name=self._settings.model_name,
+            sub_agent_mode_enabled=self._settings.sub_agent_mode_enabled,
+            prompt_text=prompt_text,
+        ) as trace_scope:
+            stream_config = merge_langchain_config(
+                {"configurable": {"thread_id": self._thread_id}},
+                trace_scope.langchain_config,
+            )
+            try:
+                async for mode, chunk in self._agent.astream(
+                    {"messages": [HumanMessage(content=prompt_text)]},
+                    config=stream_config,
+                    stream_mode=["messages", "updates"],
+                ):
+                    events = adapter.parse(mode, chunk)
+                    for event in events:
+                        if isinstance(event, TextDelta):
+                            saw_text = True
+                            assistant_parts.append(event.text)
+                        await self._persist_event(event, turn_id=turn_id)
+                        yield event
 
-        try:
-            async for mode, chunk in self._agent.astream(
-                {"messages": [HumanMessage(content=prompt_text)]},
-                config={"configurable": {"thread_id": self._thread_id}},
-                stream_mode=["messages", "updates"],
-            ):
-                events = adapter.parse(mode, chunk)
-                for event in events:
-                    if isinstance(event, TextDelta):
-                        saw_text = True
-                        assistant_parts.append(event.text)
-                    await self._persist_event(event, turn_id=turn_id)
-                    yield event
+                    if adapter.consume_usage_updated():
+                        usage_update = self._build_usage_event(
+                            turn_input_tokens=adapter.turn_input_tokens,
+                            turn_output_tokens=adapter.turn_output_tokens,
+                            include_pending_turn=True,
+                        )
+                        await self._persist_event(usage_update, turn_id=turn_id)
+                        yield usage_update
 
-                if adapter.consume_usage_updated():
-                    usage_update = self._build_usage_event(
-                        turn_input_tokens=adapter.turn_input_tokens,
-                        turn_output_tokens=adapter.turn_output_tokens,
-                        include_pending_turn=True,
+                    subagent_event, snapshot_key = self._build_subagent_status_event(
+                        previous_snapshot=last_subagent_snapshot
                     )
-                    await self._persist_event(usage_update, turn_id=turn_id)
-                    yield usage_update
-
-                subagent_event, snapshot_key = self._build_subagent_status_event(
-                    previous_snapshot=last_subagent_snapshot
+                    if subagent_event is not None and snapshot_key is not None:
+                        last_subagent_snapshot = snapshot_key
+                        await self._persist_event(subagent_event, turn_id=turn_id)
+                        yield subagent_event
+            except Exception as exc:  # noqa: BLE001
+                update_observation(
+                    trace_scope.observation,
+                    output={"status": "error", "error": str(exc)},
                 )
-                if subagent_event is not None and snapshot_key is not None:
-                    last_subagent_snapshot = snapshot_key
-                    await self._persist_event(subagent_event, turn_id=turn_id)
-                    yield subagent_event
-        except Exception as exc:  # noqa: BLE001
-            error = ErrorOccurred(message=str(exc))
-            await self._persist_event(error, turn_id=turn_id)
-            yield error
-            return
+                error = ErrorOccurred(message=str(exc))
+                await self._persist_event(error, turn_id=turn_id)
+                yield error
+                return
 
-        fallback = adapter.fallback_text.strip()
-        if not saw_text and fallback:
-            text_event = TextDelta(text=fallback)
-            assistant_parts.append(fallback)
-            await self._persist_event(text_event, turn_id=turn_id)
-            yield text_event
+            fallback = adapter.fallback_text.strip()
+            if not saw_text and fallback:
+                text_event = TextDelta(text=fallback)
+                assistant_parts.append(fallback)
+                await self._persist_event(text_event, turn_id=turn_id)
+                yield text_event
 
-        turn_input = adapter.turn_input_tokens
-        turn_output = adapter.turn_output_tokens
-        if turn_input == 0 and turn_output == 0 and adapter.streamed_text_chars > 0:
-            turn_output = max(1, adapter.streamed_text_chars // 4)
+            turn_input = adapter.turn_input_tokens
+            turn_output = adapter.turn_output_tokens
+            if turn_input == 0 and turn_output == 0 and adapter.streamed_text_chars > 0:
+                turn_output = max(1, adapter.streamed_text_chars // 4)
 
-        hook_message = await self._run_hooks(
-            turn_input_tokens=turn_input,
-            turn_output_tokens=turn_output,
-        )
-        usage_final = self._build_usage_event(
-            turn_input_tokens=turn_input,
-            turn_output_tokens=turn_output,
-            include_pending_turn=False,
-        )
-        await self._persist_event(usage_final, turn_id=turn_id)
-        yield usage_final
+            hook_message = await self._run_hooks(
+                turn_input_tokens=turn_input,
+                turn_output_tokens=turn_output,
+            )
+            usage_final = self._build_usage_event(
+                turn_input_tokens=turn_input,
+                turn_output_tokens=turn_output,
+                include_pending_turn=False,
+            )
+            await self._persist_event(usage_final, turn_id=turn_id)
+            yield usage_final
 
-        final_text = "".join(assistant_parts).strip()
-        if final_text:
-            await self._persist_message(role="assistant", content=final_text)
+            final_text = "".join(assistant_parts).strip()
+            if final_text:
+                await self._persist_message(role="assistant", content=final_text)
 
-        await self._persist_usage(
-            input_tokens=turn_input,
-            output_tokens=turn_output,
-        )
-        completed = TurnCompleted(
-            input_tokens=turn_input,
-            output_tokens=turn_output,
-            compact_message=hook_message,
-        )
-        await self._persist_event(completed, turn_id=turn_id)
-        yield completed
+            await self._persist_usage(
+                input_tokens=turn_input,
+                output_tokens=turn_output,
+            )
+            completed = TurnCompleted(
+                input_tokens=turn_input,
+                output_tokens=turn_output,
+                compact_message=hook_message,
+            )
+            await self._persist_event(completed, turn_id=turn_id)
+            yield completed
+            update_observation(
+                trace_scope.observation,
+                output={
+                    "status": "ok",
+                    "output_preview": _preview_text(final_text),
+                    "turn_input_tokens": turn_input,
+                    "turn_output_tokens": turn_output,
+                },
+            )
 
     async def _run_hooks(
         self,

@@ -14,6 +14,13 @@ from llc.agent.llm import build_chat_model
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.types import ACTIVE_STATUSES, SubAgentRecord
 from llc.config import Settings
+from llc.observability import (
+    capture_parent_context,
+    merge_langchain_config,
+    start_child_span,
+    start_linked_subagent_trace,
+    update_observation,
+)
 from llc.service.prompt_registry import PromptRegistry
 
 SubAgentBuilder = Callable[[Settings], Any]
@@ -148,6 +155,7 @@ class SubAgentRuntime:
             subagent_id = _build_subagent_id(selected_name)
             while subagent_id in self._records:
                 subagent_id = _build_subagent_id(selected_name)
+            parent_context = capture_parent_context() or {}
             now = time.time()
             record = SubAgentRecord(
                 id=subagent_id,
@@ -157,6 +165,12 @@ class SubAgentRuntime:
                 context=context.strip(),
                 source=source,
                 thread_id=f"{subagent_id}-{uuid.uuid4().hex[:6]}",
+                parent_trace_id=str(parent_context.get("trace_id", "")).strip(),
+                parent_observation_id=str(
+                    parent_context.get("parent_observation_id", "")
+                ).strip(),
+                parent_session_id=str(parent_context.get("session_id", "")).strip(),
+                parent_turn_id=str(parent_context.get("turn_id", "")).strip(),
                 created_at=now,
                 updated_at=now,
                 latest_report="Queued.",
@@ -362,7 +376,16 @@ class SubAgentRuntime:
             task = record.task
             context = record.context
             thread_id = record.thread_id
+            subagent_name = record.name
             settings = self._settings
+            parent_context: dict[str, str] | None = None
+            if record.parent_trace_id and record.parent_observation_id:
+                parent_context = {
+                    "trace_id": record.parent_trace_id,
+                    "parent_observation_id": record.parent_observation_id,
+                    "session_id": record.parent_session_id,
+                    "turn_id": record.parent_turn_id,
+                }
 
         agent = self._build_subagent(settings)
         return asyncio.run(
@@ -373,7 +396,9 @@ class SubAgentRuntime:
                 task=task,
                 context=context,
                 thread_id=thread_id,
+                subagent_name=subagent_name,
                 settings=settings,
+                parent_context=parent_context,
             )
         )
 
@@ -386,7 +411,9 @@ class SubAgentRuntime:
         task: str,
         context: str,
         thread_id: str,
+        subagent_name: str,
         settings: Settings,
+        parent_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         started_monotonic = time.monotonic()
         report_interval = float(settings.sub_agent_report_interval_s)
@@ -400,157 +427,196 @@ class SubAgentRuntime:
         last_tool_name = ""
         current_activity = "Running"
         activity_detail = "Worker started."
-
-        try:
-            async for mode, chunk in agent.astream(
-                {
-                    "messages": [
-                        HumanMessage(
-                            content=_render_assignment(
-                                task,
-                                context,
-                                self._prompt_registry,
-                            )
-                        )
-                    ]
-                },
-                config={"configurable": {"thread_id": thread_id}},
-                stream_mode=["messages", "updates"],
-            ):
-                self._guard_stop(subagent_id, attempt)
-                elapsed = time.monotonic() - started_monotonic
-                if elapsed > max_runtime_s:
-                    raise _StopRequested("max_runtime_exceeded")
-
-                if mode == "messages":
-                    msg_chunk, meta = chunk
-                    if meta.get("langgraph_node") == "llm":
-                        text = message_text(msg_chunk.content)
-                        if text:
-                            final_parts.append(text)
-                            output_chars += len(text)
-
-                if mode == "updates" and isinstance(chunk, dict):
-                    for node_update in chunk.values():
-                        if not isinstance(node_update, dict):
-                            continue
-                        for message in node_update.get("messages", []):
-                            if not isinstance(message, AIMessage):
-                                continue
-                            tool_calls_batch = getattr(message, "tool_calls", None) or []
-                            tool_calls += len(tool_calls_batch)
-                            if tool_calls_batch:
-                                raw_tool_name = tool_calls_batch[-1].get("name", "")
-                                if isinstance(raw_tool_name, str) and raw_tool_name.strip():
-                                    last_tool_name = raw_tool_name.strip()
-                                    current_activity = _activity_from_tool_name(last_tool_name)
-                                    activity_detail = f"Using {last_tool_name}."
-                            usage_input, usage_output = _token_usage(message)
-                            _accumulate_usage_by_model(
-                                usage_by_model,
-                                settings.model_name,
-                                usage_input,
-                                usage_output,
-                            )
-                            maybe_text = message_text(message.content)
-                            if maybe_text:
-                                fallback_text = maybe_text
-                                if not tool_calls_batch:
-                                    current_activity = "Analyzing task"
-                                    activity_detail = _preview_text(
-                                        maybe_text,
-                                        _MAX_REPORT_PREVIEW_CHARS,
-                                    )
-
-                now_monotonic = time.monotonic()
-                if now_monotonic >= next_report_at:
-                    self._update_progress(
-                        subagent_id,
-                        attempt,
-                        tool_calls,
-                        output_chars,
-                        report=(
-                            f"Running attempt {attempt}: "
-                            f"tool_calls={tool_calls}, output_chars={output_chars}."
-                        ),
-                        activity=current_activity,
-                        activity_detail=activity_detail,
-                        last_tool_name=last_tool_name,
-                    )
-                    next_report_at = now_monotonic + report_interval
-                else:
-                    self._update_progress(
-                        subagent_id,
-                        attempt,
-                        tool_calls,
-                        output_chars,
-                        activity=current_activity,
-                        activity_detail=activity_detail,
-                        last_tool_name=last_tool_name,
-                    )
-        except _StopRequested as exc:
-            status = "stuck" if exc.reason == "max_runtime_exceeded" else "terminated"
-            return {
-                "status": status,
-                "stop_reason": exc.reason,
-                "tool_calls": tool_calls,
-                "output_chars": output_chars,
-                "usage_by_model": usage_by_model,
-            }
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "status": "failed",
-                "error": str(exc),
-                "tool_calls": tool_calls,
-                "output_chars": output_chars,
-                "usage_by_model": usage_by_model,
-            }
-
-        final_output = "".join(final_parts).strip()
-        if not final_output:
-            final_output = fallback_text.strip()
-        if len(final_output) > _MAX_STORED_FINAL_OUTPUT_CHARS:
-            final_output = (
-                final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
-            )
-        self._update_progress(
-            subagent_id,
-            attempt,
-            tool_calls,
-            output_chars,
-            report="Generating completion report.",
-            activity="Generating report",
-            activity_detail="Summarizing sub-agent output.",
-            last_tool_name=last_tool_name,
-        )
-        report_prompt = self._completion_report_prompt()
-        (
-            completion_report,
-            report_input_tokens,
-            report_output_tokens,
-            report_model_name,
-        ) = await _build_completion_report(
-            agent=agent,
+        with start_linked_subagent_trace(
+            parent_context=parent_context,
+            subagent_id=subagent_id,
+            subagent_name=subagent_name,
             thread_id=thread_id,
-            settings=settings,
-            goal=task,
-            final_output=final_output,
-            report_prompt=report_prompt,
-        )
-        _accumulate_usage_by_model(
-            usage_by_model,
-            report_model_name,
-            report_input_tokens,
-            report_output_tokens,
-        )
-        return {
-            "status": "completed",
-            "final_output": final_output,
-            "completion_report": completion_report,
-            "tool_calls": tool_calls,
-            "output_chars": output_chars,
-            "usage_by_model": usage_by_model,
-        }
+            task=task,
+            model_name=settings.model_name,
+        ) as trace_scope:
+            stream_config = merge_langchain_config(
+                {"configurable": {"thread_id": thread_id}},
+                trace_scope.langchain_config,
+            )
+            try:
+                async for mode, chunk in agent.astream(
+                    {
+                        "messages": [
+                            HumanMessage(
+                                content=_render_assignment(
+                                    task,
+                                    context,
+                                    self._prompt_registry,
+                                )
+                            )
+                        ]
+                    },
+                    config=stream_config,
+                    stream_mode=["messages", "updates"],
+                ):
+                    self._guard_stop(subagent_id, attempt)
+                    elapsed = time.monotonic() - started_monotonic
+                    if elapsed > max_runtime_s:
+                        raise _StopRequested("max_runtime_exceeded")
+
+                    if mode == "messages":
+                        msg_chunk, meta = chunk
+                        if meta.get("langgraph_node") == "llm":
+                            text = message_text(msg_chunk.content)
+                            if text:
+                                final_parts.append(text)
+                                output_chars += len(text)
+
+                    if mode == "updates" and isinstance(chunk, dict):
+                        for node_update in chunk.values():
+                            if not isinstance(node_update, dict):
+                                continue
+                            for message in node_update.get("messages", []):
+                                if not isinstance(message, AIMessage):
+                                    continue
+                                tool_calls_batch = (
+                                    getattr(message, "tool_calls", None) or []
+                                )
+                                tool_calls += len(tool_calls_batch)
+                                if tool_calls_batch:
+                                    raw_tool_name = tool_calls_batch[-1].get("name", "")
+                                    if (
+                                        isinstance(raw_tool_name, str)
+                                        and raw_tool_name.strip()
+                                    ):
+                                        last_tool_name = raw_tool_name.strip()
+                                        current_activity = _activity_from_tool_name(
+                                            last_tool_name
+                                        )
+                                        activity_detail = f"Using {last_tool_name}."
+                                usage_input, usage_output = _token_usage(message)
+                                _accumulate_usage_by_model(
+                                    usage_by_model,
+                                    settings.model_name,
+                                    usage_input,
+                                    usage_output,
+                                )
+                                maybe_text = message_text(message.content)
+                                if maybe_text:
+                                    fallback_text = maybe_text
+                                    if not tool_calls_batch:
+                                        current_activity = "Analyzing task"
+                                        activity_detail = _preview_text(
+                                            maybe_text,
+                                            _MAX_REPORT_PREVIEW_CHARS,
+                                        )
+
+                    now_monotonic = time.monotonic()
+                    if now_monotonic >= next_report_at:
+                        self._update_progress(
+                            subagent_id,
+                            attempt,
+                            tool_calls,
+                            output_chars,
+                            report=(
+                                f"Running attempt {attempt}: "
+                                f"tool_calls={tool_calls}, output_chars={output_chars}."
+                            ),
+                            activity=current_activity,
+                            activity_detail=activity_detail,
+                            last_tool_name=last_tool_name,
+                        )
+                        next_report_at = now_monotonic + report_interval
+                    else:
+                        self._update_progress(
+                            subagent_id,
+                            attempt,
+                            tool_calls,
+                            output_chars,
+                            activity=current_activity,
+                            activity_detail=activity_detail,
+                            last_tool_name=last_tool_name,
+                        )
+            except _StopRequested as exc:
+                status = "stuck" if exc.reason == "max_runtime_exceeded" else "terminated"
+                update_observation(
+                    trace_scope.observation,
+                    output={"status": status, "stop_reason": exc.reason},
+                )
+                return {
+                    "status": status,
+                    "stop_reason": exc.reason,
+                    "tool_calls": tool_calls,
+                    "output_chars": output_chars,
+                    "usage_by_model": usage_by_model,
+                }
+            except Exception as exc:  # noqa: BLE001
+                update_observation(
+                    trace_scope.observation,
+                    output={"status": "failed", "error": str(exc)},
+                )
+                return {
+                    "status": "failed",
+                    "error": str(exc),
+                    "tool_calls": tool_calls,
+                    "output_chars": output_chars,
+                    "usage_by_model": usage_by_model,
+                }
+
+            final_output = "".join(final_parts).strip()
+            if not final_output:
+                final_output = fallback_text.strip()
+            if len(final_output) > _MAX_STORED_FINAL_OUTPUT_CHARS:
+                final_output = (
+                    final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
+                )
+            self._update_progress(
+                subagent_id,
+                attempt,
+                tool_calls,
+                output_chars,
+                report="Generating completion report.",
+                activity="Generating report",
+                activity_detail="Summarizing sub-agent output.",
+                last_tool_name=last_tool_name,
+            )
+            report_prompt = self._completion_report_prompt()
+            (
+                completion_report,
+                report_input_tokens,
+                report_output_tokens,
+                report_model_name,
+            ) = await _build_completion_report(
+                agent=agent,
+                thread_id=thread_id,
+                settings=settings,
+                goal=task,
+                final_output=final_output,
+                report_prompt=report_prompt,
+                langchain_config=trace_scope.langchain_config,
+            )
+            _accumulate_usage_by_model(
+                usage_by_model,
+                report_model_name,
+                report_input_tokens,
+                report_output_tokens,
+            )
+            result = {
+                "status": "completed",
+                "final_output": final_output,
+                "completion_report": completion_report,
+                "tool_calls": tool_calls,
+                "output_chars": output_chars,
+                "usage_by_model": usage_by_model,
+            }
+            update_observation(
+                trace_scope.observation,
+                output={
+                    "status": "completed",
+                    "completion_report": completion_report,
+                    "final_output_preview": _preview_text(
+                        final_output,
+                        _MAX_FINAL_OUTPUT_PREVIEW_CHARS,
+                    ),
+                },
+            )
+            return result
 
     def _guard_stop(self, subagent_id: str, attempt: int) -> None:
         with self._lock:
@@ -913,6 +979,7 @@ async def _build_completion_report(
     goal: str,
     final_output: str,
     report_prompt: str,
+    langchain_config: dict[str, Any] | None = None,
 ) -> tuple[str, int, int, str]:
     report_model_name = settings.compact_model_name or settings.model_name
     fallback = _preview_text(final_output.strip(), _MAX_COMPLETION_REPORT_CHARS)
@@ -925,28 +992,50 @@ async def _build_completion_report(
             return fallback, 0, 0, report_model_name
 
         model = build_chat_model(settings, settings.compact_model_name)
-        response = await asyncio.wait_for(
-            model.ainvoke(
-                [
-                    SystemMessage(content=report_prompt),
-                    HumanMessage(
-                        content=(
-                            "Goal:\n"
-                            f"{_preview_text(goal.strip(), _MAX_TASK_PREVIEW_CHARS)}\n\n"
-                            "Final output:\n"
-                            f"{_preview_text(final_output.strip(), _MAX_REPORT_INPUT_FINAL_CHARS)}\n\n"
-                            "Worker transcript:\n"
-                            f"{transcript}"
-                        )
-                    ),
-                ]
+        request_messages = [
+            SystemMessage(content=report_prompt),
+            HumanMessage(
+                content=(
+                    "Goal:\n"
+                    f"{_preview_text(goal.strip(), _MAX_TASK_PREVIEW_CHARS)}\n\n"
+                    "Final output:\n"
+                    f"{_preview_text(final_output.strip(), _MAX_REPORT_INPUT_FINAL_CHARS)}\n\n"
+                    "Worker transcript:\n"
+                    f"{transcript}"
+                )
             ),
-            timeout=_REPORT_LLM_TIMEOUT_S,
-        )
+        ]
+        with start_child_span(
+            "llc.api.subagent.report_generation",
+            input_payload={"goal": _preview_text(goal, _MAX_TASK_PREVIEW_CHARS)},
+            tags=("llc", "api", "subagent", "report"),
+            metadata={"llc_model_name": report_model_name},
+        ) as report_span:
+            if langchain_config:
+                response = await asyncio.wait_for(
+                    model.ainvoke(request_messages, config=langchain_config),
+                    timeout=_REPORT_LLM_TIMEOUT_S,
+                )
+            else:
+                response = await asyncio.wait_for(
+                    model.ainvoke(request_messages),
+                    timeout=_REPORT_LLM_TIMEOUT_S,
+                )
         usage_input, usage_output = _token_usage(response)
         report = message_text(response.content, include_reasoning=False).strip()
         if not report:
+            update_observation(
+                report_span,
+                output={"status": "empty_report", "fallback": fallback},
+            )
             return fallback, usage_input, usage_output, report_model_name
+        update_observation(
+            report_span,
+            output={
+                "status": "ok",
+                "report_preview": _preview_text(report, _MAX_REPORT_PREVIEW_CHARS),
+            },
+        )
         return (
             _preview_text(report, _MAX_COMPLETION_REPORT_CHARS),
             usage_input,

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from llc.commands import CommandRegistry
 from llc.config import Settings
 from llc.models import AvailableModel
+from llc.observability import shutdown as shutdown_langfuse
 from llc.service.engine import SessionEngine
 from llc.service.events import ErrorOccurred, Event, SubagentStatusUpdate
 from llc.storage.store import SessionStore
@@ -80,6 +81,7 @@ class EngineManager:
                 self._registry,
                 session_id=requested or None,
                 store=SessionStore(self._settings.db_path),
+                enable_langfuse_tracing=True,
             )
             await engine.initialize()
             self._engines[engine.session_id] = engine
@@ -135,6 +137,7 @@ def create_api_app(settings: Settings, registry: CommandRegistry) -> FastAPI:
             yield
         finally:
             await manager.shutdown()
+            shutdown_langfuse()
 
     app = FastAPI(title="LLC API", version="0.1.0", lifespan=lifespan)
     app.add_middleware(

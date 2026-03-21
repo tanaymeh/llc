@@ -22,6 +22,7 @@ Notes:
   If you cloned without `--recurse-submodules`, initialize `llc-frontend/` first.
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
+  Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
 EOF
 }
 
@@ -97,15 +98,18 @@ fi
 
 TERM_VALUE="${TERM:-xterm-256color}"
 COLORTERM_VALUE="${COLORTERM:-truecolor}"
+LANGFUSE_BASE_URL_VALUE="${LLC_DOCKER_LANGFUSE_BASE_URL:-http://host.docker.internal:3000}"
 
 DOCKER_ARGS=(
   --rm
   -it
   --init
+  --add-host "host.docker.internal:host-gateway"
   -w /workspace
   --env-file "$REPO_ROOT/.env"
   -e "TERM=$TERM_VALUE"
   -e "COLORTERM=$COLORTERM_VALUE"
+  -e "LANGFUSE_BASE_URL=$LANGFUSE_BASE_URL_VALUE"
   --mount "type=bind,src=$TARGET_DIR,dst=/workspace"
 )
 

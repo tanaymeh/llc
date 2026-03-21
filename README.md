@@ -26,6 +26,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers)
+- Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 
 ## Implementation overview
@@ -75,6 +76,28 @@ uv run llc serve --host 0.0.0.0 --port 8000
 ```bash
 uv run llc tui
 ```
+
+## Run local Langfuse (separate service)
+
+Start local Langfuse in a separate stack:
+
+```bash
+make langfuse-up
+```
+
+Open `http://localhost:3000` and inspect traces while the LLC backend is running.
+
+Useful commands:
+
+```bash
+make langfuse-logs
+make langfuse-down
+```
+
+LLC backend target URL:
+
+- host-run backend: `LANGFUSE_BASE_URL=http://127.0.0.1:3000`
+- Dockerized backend: `LLC_DOCKER_LANGFUSE_BASE_URL=http://host.docker.internal:3000`
 
 ## Run frontend (separate service)
 
@@ -143,6 +166,11 @@ Set values in `.env`:
 - `OPENAI_API_KEY`
 - `OPENAI_BASE_URL` (OpenAI-compatible endpoint; OpenRouter works here)
 - `FIRECRAWL_API_KEY` (optional, for web tools)
+- `LLC_LANGFUSE_ENABLED` (`true`/`false`; defaults to enabled when keys are set)
+- `LANGFUSE_BASE_URL` (for host-run backend, e.g. `http://127.0.0.1:3000`)
+- `LANGFUSE_PUBLIC_KEY`
+- `LANGFUSE_SECRET_KEY`
+- `LLC_DOCKER_LANGFUSE_BASE_URL` (Docker backend override, default `http://host.docker.internal:3000`)
 - `SUB_AGENT_MODE_ENABLED` (`true` to boot in sub-agent mode)
 - `MAX_SUB_AGENTS` (hard-capped to `5`)
 - `SUB_AGENT_REPORT_INTERVAL_S`
@@ -154,6 +182,12 @@ Set values in `.env`:
 - `LLC_API_PORT` (default: `8000`)
 - `LLC_API_ALLOWED_ORIGINS` (comma-separated list; default includes Vite localhost origins)
 - `LLC_API_SUBAGENT_REPORT_INTERVAL_S` (default: `1.0`)
+
+Local Langfuse stack variables (used by `docker-compose.langfuse.yml`) are also in `.env.example`, including:
+
+- `LANGFUSE_INIT_*` bootstrap variables (org/project/user + API keys)
+- `NEXTAUTH_SECRET`, `SALT`, `ENCRYPTION_KEY`
+- `POSTGRES_*`, `CLICKHOUSE_*`, `MINIO_*`, `REDIS_AUTH`
 
 ## TUI controls
 
@@ -193,6 +227,24 @@ Tail logs:
 
 ```bash
 make logs
+```
+
+Run local Langfuse UI stack separately:
+
+```bash
+make langfuse-up
+```
+
+Stop local Langfuse stack:
+
+```bash
+make langfuse-down
+```
+
+Tail local Langfuse logs:
+
+```bash
+make langfuse-logs
 ```
 
 Backend-only helper (no frontend):

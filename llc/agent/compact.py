@@ -16,6 +16,7 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from llc.agent.llm import build_chat_model
 from llc.agent.message_utils import message_text
 from llc.config import Settings
+from llc.observability import build_langchain_config, start_child_span, update_observation
 
 _MIN_COMPACT_MESSAGES = 6
 _SUMMARY_PREFIX = "Summary of earlier conversation:\n\n"
@@ -100,16 +101,37 @@ def _clone_message(message: AnyMessage) -> AnyMessage:
 
 
 async def _summarize_messages(messages: list[AnyMessage], settings: Settings) -> str:
+    compact_model_name = settings.compact_model_name or settings.model_name
     model = build_chat_model(settings, settings.compact_model_name)
-    response = await model.ainvoke(
-        [
-            SystemMessage(content=settings.compact_prompt),
-            HumanMessage(content=_render_messages(messages)),
-        ]
+    run_config = build_langchain_config(
+        tags=("llc", "api", "compact"),
+        metadata={"llc_model_name": compact_model_name},
     )
+    request_messages = [
+        SystemMessage(content=settings.compact_prompt),
+        HumanMessage(content=_render_messages(messages)),
+    ]
+    with start_child_span(
+        "llc.api.compaction",
+        input_payload={"message_count": len(messages)},
+        tags=("llc", "api", "compact"),
+        metadata={"llc_model_name": compact_model_name},
+    ) as compaction_span:
+        if run_config:
+            response = await model.ainvoke(request_messages, config=run_config)
+        else:
+            response = await model.ainvoke(request_messages)
     summary = message_text(response.content, include_reasoning=True).strip()
     if not summary:
+        update_observation(
+            compaction_span,
+            output={"status": "empty_summary"},
+        )
         raise ValueError("Compaction summary model returned empty content")
+    update_observation(
+        compaction_span,
+        output={"status": "ok", "summary_preview": _preview_text(summary, 220)},
+    )
     return summary
 
 
@@ -156,5 +178,12 @@ def _tool_details(message: AnyMessage) -> str:
         if tool_call_id:
             return f"Tool call id: {tool_call_id}"
     return ""
+
+
+def _preview_text(text: str, limit: int) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
 
 

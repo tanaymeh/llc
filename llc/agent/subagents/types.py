@@ -28,6 +28,10 @@ class SubAgentRecord(BaseModel):
     context: str
     source: str
     thread_id: str
+    parent_trace_id: str = ""
+    parent_observation_id: str = ""
+    parent_session_id: str = ""
+    parent_turn_id: str = ""
     created_at: float
     updated_at: float
     status: SubAgentStatus = "running"
