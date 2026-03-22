@@ -6,9 +6,11 @@ from llc.agent.tools.filesystem import make_filesystem_tools
 from llc.agent.tools.glob import make_glob_tools
 from llc.agent.tools.grep import make_grep_tools
 from llc.agent.tools.shell import make_shell_tools
+from llc.agent.tools.subagent_coordination import make_subagent_coordination_tools
 from llc.agent.tools.subagents import make_subagent_tools
 from llc.agent.tools.todo import make_todo_tools
 from llc.agent.tools.web import make_web_tools
+from llc.agent.subagents.coordination import SubAgentCoordinationClient
 from llc.config import Settings
 
 
@@ -17,6 +19,7 @@ def collect_tools(
     *,
     role: str = "default",
     subagent_runtime: object | None = None,
+    subagent_coordination: SubAgentCoordinationClient | None = None,
 ) -> list[BaseTool]:
     tools: list[BaseTool] = [
         *make_filesystem_tools(settings.workspace_root),
@@ -34,4 +37,6 @@ def collect_tools(
         and subagent_runtime is not None
     ):
         tools.extend(make_subagent_tools(subagent_runtime))
+    if role == "subagent" and subagent_coordination is not None:
+        tools.extend(make_subagent_coordination_tools(subagent_coordination))
     return tools

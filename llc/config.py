@@ -261,6 +261,8 @@ class Settings(BaseModel, frozen=True):
     sub_agent_stop_grace_s: int = Field(default=15, ge=1, le=300)
     sub_agent_max_tool_calls: int = Field(default=80, ge=1, le=2000)
     sub_agent_wait_timeout_ms: int = Field(default=1200, ge=100, le=60000)
+    sub_agent_message_wait_timeout_ms: int = Field(default=1200, ge=50, le=60000)
+    sub_agent_scope_claim_ttl_s: int = Field(default=300, ge=30, le=86400)
     sub_agent_context_messages: int = Field(default=8, ge=1, le=20)
     shell_timeout: int = 120
     api_host: str = "127.0.0.1"
@@ -301,6 +303,14 @@ class Settings(BaseModel, frozen=True):
             sub_agent_stop_grace_s=_env_int("SUB_AGENT_STOP_GRACE_S", 15),
             sub_agent_max_tool_calls=_env_int("SUB_AGENT_MAX_TOOL_CALLS", 80),
             sub_agent_wait_timeout_ms=_env_int("SUB_AGENT_WAIT_TIMEOUT_MS", 1200),
+            sub_agent_message_wait_timeout_ms=_env_int(
+                "SUB_AGENT_MESSAGE_WAIT_TIMEOUT_MS",
+                1200,
+            ),
+            sub_agent_scope_claim_ttl_s=_env_int(
+                "SUB_AGENT_SCOPE_CLAIM_TTL_S",
+                300,
+            ),
             sub_agent_context_messages=_env_int("SUB_AGENT_CONTEXT_MESSAGES", 8),
             api_host=os.getenv("LLC_API_HOST", "127.0.0.1"),
             api_port=_env_int("LLC_API_PORT", 8000),

@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 
 from llc.agent.llm import build_chat_model
 from llc.agent.nodes import make_llm_node, make_tool_node, should_continue
+from llc.agent.subagents.coordination import SubAgentCoordinationClient
 from llc.agent.state import AgentState
 from llc.agent.tools import collect_tools
 from llc.config import Settings
@@ -139,11 +140,42 @@ def _auto_wait_args_provider(
     return provider
 
 
+def _subagent_inbox_provider(
+    role: AgentRole,
+    subagent_coordination: SubAgentCoordinationClient | None,
+):
+    if role != "subagent" or subagent_coordination is None:
+        return None
+
+    def provider() -> bool:
+        try:
+            state = subagent_coordination.has_unread_messages()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(state.get("ok") and state.get("has_unread"))
+
+    return provider
+
+
+def _subagent_inbox_args_provider(
+    role: AgentRole,
+    subagent_coordination: SubAgentCoordinationClient | None,
+):
+    if role != "subagent" or subagent_coordination is None:
+        return None
+
+    def provider() -> dict[str, Any]:
+        return {"limit": 10, "only_unread": True}
+
+    return provider
+
+
 def build_agent_graph(
     settings: Settings,
     *,
     role: AgentRole = "default",
     subagent_runtime: object | None = None,
+    subagent_coordination: SubAgentCoordinationClient | None = None,
     prompt_registry: PromptRegistry | None = None,
 ):
     model = build_chat_model(settings)
@@ -151,6 +183,7 @@ def build_agent_graph(
         settings,
         role=role,
         subagent_runtime=subagent_runtime,
+        subagent_coordination=subagent_coordination,
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
@@ -166,6 +199,15 @@ def build_agent_graph(
         subagent_runtime,
         settings.sub_agent_wait_timeout_ms,
     )
+    auto_tool_name = "WaitSubagents"
+    auto_wait_provider = active_workers_provider
+    if role == "subagent":
+        auto_tool_name = "ReadInbox"
+        auto_wait_provider = _subagent_inbox_provider(role, subagent_coordination)
+        auto_wait_args_provider = _subagent_inbox_args_provider(
+            role,
+            subagent_coordination,
+        )
 
     builder = StateGraph(AgentState)
     builder.add_node(
@@ -174,12 +216,23 @@ def build_agent_graph(
             model_with_tools,
             system_prompt,
             runtime_status_provider=runtime_status_provider,
-            auto_wait_provider=active_workers_provider,
-            auto_wait_tool_name="WaitSubagents",
+            auto_wait_provider=auto_wait_provider,
+            auto_wait_tool_name=auto_tool_name,
             auto_wait_args_provider=auto_wait_args_provider,
         ),
     )
-    builder.add_node("tools", make_tool_node(tools_by_name))
+    required_first_tool_name = (
+        "SubmitTaskPlan"
+        if role == "subagent" and subagent_coordination is not None
+        else ""
+    )
+    builder.add_node(
+        "tools",
+        make_tool_node(
+            tools_by_name,
+            required_first_tool_name=required_first_tool_name,
+        ),
+    )
     builder.add_edge(START, "llm")
     builder.add_conditional_edges("llm", should_continue, ["tools", END])
     builder.add_edge("tools", "llm")

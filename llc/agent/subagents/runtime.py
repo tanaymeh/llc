@@ -15,6 +15,7 @@ from llc.agent.subagents.reporting import (
     stuck_activity_detail,
     stuck_latest_report,
 )
+from llc.agent.subagents.coordination import SubAgentCoordinationHub
 from llc.agent.subagents.types import ACTIVE_STATUSES, SubAgentRecord
 from llc.agent.subagents.usage import normalize_usage_by_model
 from llc.agent.subagents.worker_runner import (
@@ -60,6 +61,7 @@ class SubAgentRuntime:
                 self._mp_context = mp.get_context("fork")
             except ValueError:
                 self._mp_context = mp.get_context("spawn")
+        self._coordination = SubAgentCoordinationHub(self._mp_context)
 
     def update_settings(self, settings: Settings) -> None:
         with self._lock:
@@ -80,6 +82,8 @@ class SubAgentRuntime:
                     self._request_worker_stop_locked(record)
                     self._terminate_worker_process_locked(record)
                     self._cleanup_worker_handles_locked(record)
+                    self._coordination.mark_worker_inactive(record.id)
+            self._coordination.shutdown()
 
     def launch_subagent(
         self,
@@ -144,6 +148,11 @@ class SubAgentRuntime:
                 latest_report="Queued.",
             )
             self._records[subagent_id] = record
+            self._coordination.register_worker(
+                subagent_id,
+                name=selected_name,
+                goal=clean_task,
+            )
             self._submit_locked(record)
             snapshot = self._record_snapshot_locked(record)
             snapshot["ok"] = True
@@ -316,12 +325,18 @@ class SubAgentRuntime:
                 record.updated_at = time.time()
                 self._terminate_worker_process_locked(record)
                 self._cleanup_worker_handles_locked(record)
+                self._coordination.mark_worker_inactive(record.id)
 
             snapshot = self._record_snapshot_locked(record)
             snapshot["ok"] = True
             return snapshot
 
     def _submit_locked(self, record: SubAgentRecord) -> None:
+        self._coordination.register_worker(
+            record.id,
+            name=record.name,
+            goal=record.task or record.base_task,
+        )
         record.stop_event = self._mp_context.Event()
         record.stop_reason = ""
         record.stop_requested_at = 0.0
@@ -345,6 +360,11 @@ class SubAgentRuntime:
             "context": record.context,
             "thread_id": record.thread_id,
             "subagent_name": record.name,
+            "coordination": self._coordination.worker_payload(
+                record.id,
+                default_wait_timeout_ms=self._settings.sub_agent_message_wait_timeout_ms,
+                default_claim_ttl_s=self._settings.sub_agent_scope_claim_ttl_s,
+            ),
             "parent_context": (
                 {
                     "trace_id": record.parent_trace_id,
@@ -379,6 +399,7 @@ class SubAgentRuntime:
             record.current_activity = "Agent de-spawned"
             record.finished_at = time.time()
             self._close_worker_queue_safely(worker_queue)
+            self._coordination.mark_worker_inactive(record.id)
             return
         record.worker_process = process
         record.worker_queue = worker_queue
@@ -462,6 +483,7 @@ class SubAgentRuntime:
         )
         self._merge_usage_locked(normalize_usage_by_model(result.get("usage_by_model")))
         self._cleanup_worker_handles_locked(record)
+        self._coordination.mark_worker_inactive(record.id)
 
         if record.pending_feedback and not record.terminate_requested:
             self._restart_with_feedback_locked(record)
@@ -693,7 +715,7 @@ class SubAgentRuntime:
             self._apply_worker_result_locked(record, forced)
 
     def _record_snapshot_locked(self, record: SubAgentRecord) -> dict[str, Any]:
-        return record_snapshot(
+        snapshot = record_snapshot(
             record,
             task_preview_chars=_MAX_TASK_PREVIEW_CHARS,
             activity_preview_chars=_MAX_ACTIVITY_PREVIEW_CHARS,
@@ -701,6 +723,30 @@ class SubAgentRuntime:
             error_preview_chars=_MAX_ERROR_PREVIEW_CHARS,
             final_output_preview_chars=_MAX_FINAL_OUTPUT_PREVIEW_CHARS,
         )
+        coordination = self._coordination.worker_state(record.id)
+        if coordination:
+            unread_count = int(coordination.get("unread_count", 0) or 0)
+            waiting_on = str(coordination.get("waiting_on", "") or "")
+            claims = coordination.get("claims", [])
+            snapshot["unread_count"] = max(unread_count, 0)
+            snapshot["inbox_dirty"] = bool(coordination.get("inbox_dirty", False))
+            snapshot["waiting_on"] = waiting_on
+            snapshot["plan_submitted"] = bool(coordination.get("plan_submitted", False))
+            snapshot["plan_step_count"] = int(coordination.get("plan_step_count", 0) or 0)
+            snapshot["active_step_index"] = int(
+                coordination.get("active_step_index", 0) or 0
+            )
+            snapshot["claims"] = claims if isinstance(claims, list) else []
+            snapshot["last_peer_contact_at"] = float(
+                coordination.get("last_peer_contact_at", 0.0) or 0.0
+            )
+            if record.status in ACTIVE_STATUSES and waiting_on:
+                snapshot["current_activity"] = "Waiting on peer dependency"
+                snapshot["activity_detail"] = preview_text(
+                    waiting_on,
+                    _MAX_REPORT_PREVIEW_CHARS,
+                )
+        return snapshot
 
     def _active_count_locked(self) -> int:
         return sum(1 for record in self._records.values() if record.status in ACTIVE_STATUSES)

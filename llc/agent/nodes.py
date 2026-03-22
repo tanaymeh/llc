@@ -108,11 +108,24 @@ def make_llm_node(
     return llm_node
 
 
-def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
+def make_tool_node(
+    tools_by_name: dict[str, Any],
+    *,
+    required_first_tool_name: str = "",
+) -> ToolNode:
     report_poll_streak = 0
+    required_tool_done = not bool(required_first_tool_name.strip())
+    required_first_tool_clean = required_first_tool_name.strip()
+    required_first_tool_hint = (
+        f"Tool usage is blocked until `{required_first_tool_clean}` succeeds "
+        "with a multi-step plan (at least 2 steps)."
+        if required_first_tool_clean
+        else ""
+    )
 
     def tool_node(state: AgentState) -> dict[str, Any]:
         nonlocal report_poll_streak
+        nonlocal required_tool_done
         last_message = state["messages"][-1]
         tool_messages: list[ToolMessage] = []
 
@@ -136,6 +149,23 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                     update_observation(
                         tool_span,
                         output={"status": "unknown_tool", "tool_name": tool_name},
+                    )
+                elif (
+                    not required_tool_done
+                    and required_first_tool_clean
+                    and tool_name != required_first_tool_clean
+                ):
+                    report_poll_streak = 0
+                    observation = (
+                        f"Tool '{tool_name}' blocked. {required_first_tool_hint}"
+                    )
+                    update_observation(
+                        tool_span,
+                        output={
+                            "status": "blocked_until_plan",
+                            "tool_name": tool_name,
+                            "required_tool": required_first_tool_clean,
+                        },
                     )
                 else:
                     metadata = getattr(tool, "metadata", {}) or {}
@@ -199,6 +229,29 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                             report_poll_streak = 0
                         else:
                             report_poll_streak = 0
+                        if (
+                            not required_tool_done
+                            and required_first_tool_clean
+                            and tool_name == required_first_tool_clean
+                        ):
+                            plan_payload = _parse_report_payload(observation)
+                            ok = bool(
+                                isinstance(plan_payload, dict)
+                                and plan_payload.get("ok")
+                            )
+                            step_count = 0
+                            if isinstance(plan_payload, dict):
+                                try:
+                                    step_count = int(plan_payload.get("step_count", 0) or 0)
+                                except Exception:  # noqa: BLE001
+                                    step_count = 0
+                            if ok and step_count >= 2:
+                                required_tool_done = True
+                            else:
+                                observation = (
+                                    f"{observation}\n\n"
+                                    f"{required_first_tool_hint}"
+                                )
                         update_observation(
                             tool_span,
                             output={

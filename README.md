@@ -26,6 +26,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Ordered post-turn hooks with explicit `blocking` opt-in (background by default)
 - Async `hook_update` runtime events plus expiring mission-control hook reminders
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers, process-isolated)
+- Sub-agent cooperative coordination primitives: peer inbox, shared board, and scope claims
 - Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 
@@ -185,6 +186,8 @@ Set values in `.env`:
 - `SUB_AGENT_STOP_GRACE_S` (watchdog grace after stop request before marked stuck)
 - `SUB_AGENT_MAX_TOOL_CALLS` (loop-budget cap per worker attempt)
 - `SUB_AGENT_WAIT_TIMEOUT_MS` (default timeout for `WaitSubagents`; use `0` for unbounded)
+- `SUB_AGENT_MESSAGE_WAIT_TIMEOUT_MS` (default timeout for worker `WaitForPeerMessage`)
+- `SUB_AGENT_SCOPE_CLAIM_TTL_S` (default claim lease TTL for cooperative worker scopes)
 - `SUB_AGENT_CONTEXT_MESSAGES`
 - `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`)
 - `LLC_PROMPTS_DIR` (default: `llc/prompts`)
@@ -226,6 +229,17 @@ TUI:
 - `/enable sub-agent-mode`
 - `/subagent {TASK}`
 - `exit` / `quit`
+
+## Sub-agent coordination (process workers)
+
+When `sub-agent-mode` is enabled, workers still run in isolated OS processes.
+Workers can now coordinate through:
+
+- direct peer inbox messaging (`SendPeerMessage`, `ReadInbox`, `WaitForPeerMessage`)
+- shared board notes (`PostSharedNote`, `ReadSharedNotes`)
+- exclusive scope claims for mutable work (`ClaimScope`, `ReleaseScope`)
+
+Each worker must submit a multi-step plan via `SubmitTaskPlan` before using other tools.
 
 ## Docker
 

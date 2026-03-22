@@ -23,8 +23,8 @@ Notes:
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
   Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
-  Sub-agent watchdog/timing knobs are read from `.env` (`SUB_AGENT_*`).
-  Sub-agents run as isolated worker processes.
+  Sub-agent watchdog/timing + coordination knobs are read from `.env` (`SUB_AGENT_*`).
+  Sub-agents run as isolated worker processes and can coordinate via inbox/board/claims.
   Post-turn hooks run in background by default (blocking only when explicitly configured).
   Backend service is modularized under `llc/service/api_*.py` and `llc/service/engine_*.py`.
 EOF

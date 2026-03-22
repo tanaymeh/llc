@@ -7,6 +7,7 @@ from typing import Any, Callable
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from llc.agent.message_utils import message_text
+from llc.agent.subagents.coordination import SubAgentCoordinationClient
 from llc.config import Settings
 from llc.observability import (
     merge_langchain_config,
@@ -46,6 +47,12 @@ def subagent_process_entry(
         context = str(payload.get("context", "")).strip()
         thread_id = str(payload.get("thread_id", "")).strip()
         subagent_name = str(payload.get("subagent_name", "")).strip()
+        coordination_payload = payload.get("coordination")
+        coordination_client = (
+            SubAgentCoordinationClient.from_payload(coordination_payload)
+            if isinstance(coordination_payload, dict)
+            else None
+        )
         parent_context_raw = payload.get("parent_context")
         parent_context = (
             parent_context_raw if isinstance(parent_context_raw, dict) else None
@@ -56,6 +63,7 @@ def subagent_process_entry(
         agent = build_agent_graph(
             settings,
             role="subagent",
+            subagent_coordination=coordination_client,
             prompt_registry=prompt_registry,
         )
         result = asyncio.run(
@@ -68,6 +76,7 @@ def subagent_process_entry(
                 subagent_name=subagent_name,
                 settings=settings,
                 prompt_registry=prompt_registry,
+                coordination_client=coordination_client,
                 parent_context=parent_context,
                 stop_requested=lambda: stop_event_is_set(stop_event),
                 progress_callback=lambda progress: emit_worker_event(
@@ -108,6 +117,7 @@ async def run_subagent_worker(
     subagent_name: str,
     settings: Settings,
     prompt_registry: PromptRegistry | None,
+    coordination_client: SubAgentCoordinationClient | None,
     parent_context: dict[str, Any] | None,
     stop_requested: Callable[[], bool],
     progress_callback: Callable[[dict[str, Any]], None],
@@ -128,6 +138,15 @@ async def run_subagent_worker(
     last_tool_name = ""
     current_activity = "Running"
     activity_detail = "Worker started."
+    task_message = render_subagent_task_message(
+        task,
+        context,
+        prompt_registry,
+    )
+    if coordination_client is not None:
+        coordination_client.set_waiting_on("")
+        coordination_state = coordination_client.state()
+        task_message = add_coordination_block(task_message, coordination_state)
     with start_linked_subagent_trace(
         parent_context=parent_context,
         subagent_id=subagent_id,
@@ -152,11 +171,7 @@ async def run_subagent_worker(
                         )
                     ),
                     HumanMessage(
-                        content=render_subagent_task_message(
-                            task,
-                            context,
-                            prompt_registry,
-                        )
+                        content=task_message
                     ),
                 ]
             },
@@ -217,7 +232,10 @@ async def run_subagent_worker(
                                         current_activity = activity_from_tool_name(
                                             last_tool_name
                                         )
-                                        activity_detail = f"Using {last_tool_name}."
+                                        if last_tool_name == "WaitForPeerMessage":
+                                            activity_detail = "Waiting for peer input."
+                                        else:
+                                            activity_detail = f"Using {last_tool_name}."
                                 usage_input, usage_output = token_usage(message)
                                 accumulate_usage_by_model(
                                     usage_by_model,
@@ -383,6 +401,40 @@ def render_subagent_task_message(
         except Exception:
             pass
     return f"Here's your task:\n{clean_task}{context_block}"
+
+
+def add_coordination_block(task_message: str, coordination_state: dict[str, Any]) -> str:
+    if not isinstance(coordination_state, dict) or not coordination_state:
+        return task_message
+    worker_id = str(coordination_state.get("worker_id", "")).strip()
+    unread_count = int(coordination_state.get("unread_count", 0) or 0)
+    plan_submitted = bool(coordination_state.get("plan_submitted", False))
+    team_directory_raw = coordination_state.get("team_directory")
+    lines = [
+        "Coordination context:",
+        f"- Worker ID: {worker_id or 'unknown'}",
+        f"- Inbox unread messages: {max(unread_count, 0)}",
+        f"- Plan submitted: {'yes' if plan_submitted else 'no'}",
+    ]
+    if isinstance(team_directory_raw, list):
+        lines.append("- Team directory:")
+        for item in team_directory_raw[:8]:
+            if not isinstance(item, dict):
+                continue
+            peer_id = str(item.get("id", "")).strip()
+            name = str(item.get("name", "")).strip()
+            goal = str(item.get("goal", "")).strip()
+            active = bool(item.get("active", False))
+            waiting_on = str(item.get("waiting_on", "")).strip()
+            label = f"{name} ({peer_id})" if name and peer_id else peer_id or name or "worker"
+            status = "active" if active else "inactive"
+            waiting_text = f"; waiting_on={waiting_on}" if waiting_on else ""
+            goal_text = goal if goal else "n/a"
+            lines.append(f"  - {label}: {status}{waiting_text}; goal={goal_text}")
+    block = "\n".join(lines).strip()
+    if not block:
+        return task_message
+    return f"{task_message}\n\n{block}"
 
 
 def task_with_feedback(
