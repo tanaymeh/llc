@@ -33,7 +33,11 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 
 - `llc/main.py`: backend API entrypoint (`serve` optional for backward compatibility)
 - `llc/agent/`: LangGraph graph, nodes, tool collection, compaction, sub-agent runtime
-- `llc/service/`: backend orchestration, stream adapter, API server, prompt registry
+- `llc/agent/subagents/`: runtime facade + worker runner + reporting/usage helpers
+- `llc/service/engine.py`: session orchestration facade
+- `llc/service/engine_*.py`: hook runtime, streaming runtime, and persistence helpers
+- `llc/service/api.py`: API app composition root
+- `llc/service/api_*.py`: engine manager, HTTP routes, websocket flow, and API models
 - `llc/storage/`: SQLite schema and async persistence layer
 - `llc/prompts/`: system/compact/runtime YAML prompts
 - `llc-frontend/`: React frontend shell wired to live backend events

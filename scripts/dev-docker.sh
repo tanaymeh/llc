@@ -26,6 +26,7 @@ Notes:
   Sub-agent watchdog/timing knobs are read from `.env` (`SUB_AGENT_*`).
   Sub-agents run as isolated worker processes.
   Post-turn hooks run in background by default (blocking only when explicitly configured).
+  Backend service is modularized under `llc/service/api_*.py` and `llc/service/engine_*.py`.
 EOF
 }
 

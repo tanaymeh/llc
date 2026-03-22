@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from langchain_core.messages import HumanMessage
 
 from llc.agent.compact import aget_history_messages
@@ -42,10 +44,12 @@ class SubagentCommand(Command):
 
         history = await aget_history_messages(ctx.agent, ctx.thread_id)
         context = _build_context(history, ctx.settings.sub_agent_context_messages)
+        worker_name = _manual_worker_name(task)
         result = ctx.subagent_runtime.launch_subagent(
             task,
             context=context,
             source="manual-command",
+            name=worker_name,
         )
         if not result.get("ok"):
             return CommandResult(message=str(result.get("error", "Failed to launch sub-agent.")))
@@ -56,7 +60,7 @@ class SubagentCommand(Command):
         max_workers = ctx.settings.max_sub_agents
         return CommandResult(
             message=(
-                f"Spawned `{subagent_id}` (`{status}`). "
+                f"Spawned `{subagent_id}` as `{worker_name}` (`{status}`). "
                 f"Active workers: {active}/{max_workers}."
             ),
             data={"spawned_subagent_id": subagent_id},
@@ -105,3 +109,11 @@ def _sanitize_context_text(text: str) -> str:
             continue
         kept_lines.append(line)
     return "\n".join(kept_lines).strip()
+
+
+def _manual_worker_name(task: str) -> str:
+    words = [part for part in task.strip().split() if part]
+    label = " ".join(words[:4]) if words else "task"
+    if len(label) > 40:
+        label = label[:40].rstrip()
+    return f"Manual {label} {uuid.uuid4().hex[:4]}"

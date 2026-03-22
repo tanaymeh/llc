@@ -37,10 +37,10 @@ def make_subagent_tools(runtime: SubAgentRuntime) -> list[BaseTool]:
     @tool
     def LaunchSubagent(
         task: str,
+        name: str,
         context: Optional[str] = None,
-        name: Optional[str] = None,
     ) -> str:
-        """Launch a worker sub-agent with an assigned task and optional context."""
+        """Launch a worker sub-agent with an assigned task, required name, and optional context."""
         return _render(
             runtime.launch_subagent(
                 task,

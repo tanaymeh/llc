@@ -25,6 +25,7 @@ _ORCHESTRATOR_MODE_APPEND = (
     "If active workers exist, keep this response open until they finish.\n"
     "Do not ask the user to poll for worker updates.\n"
     "Always use the live worker snapshot in the system prompt for worker status.\n"
+    "When calling LaunchSubagent, always set a short, descriptive `name`.\n"
     "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck."
 )
 
@@ -85,10 +86,12 @@ def _runtime_status_provider(
         for index, worker in enumerate(workers[:_MAX_SNAPSHOT_WORKERS], start=1):
             if not isinstance(worker, dict):
                 continue
+            worker_name = str(worker.get("name", "")).strip()
             wid = str(worker.get("id", f"agent-{index}")).removeprefix("subagent-")
             status = str(worker.get("status", "unknown"))
             task = str(worker.get("task", "")).strip() or "n/a"
-            lines.append(f"- Agent #{index} ({wid}) {status}: {task}")
+            name_prefix = f"{worker_name}; " if worker_name else ""
+            lines.append(f"- Agent #{index} ({name_prefix}{wid}) {status}: {task}")
 
         extra = len(workers) - _MAX_SNAPSHOT_WORKERS
         if extra > 0:
