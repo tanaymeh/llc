@@ -8,6 +8,7 @@ STUCK_STOP_REASONS = {
     "max_runtime_exceeded",
     "stall_timeout_exceeded",
     "max_tool_calls_exceeded",
+    "peer_wait_stalled",
 }
 
 
@@ -55,6 +56,8 @@ def stuck_latest_report(reason: str) -> str:
         return "No heartbeat detected within stall timeout. Stopping."
     if normalized == "max_runtime_exceeded":
         return "Runtime limit exceeded. Stopping."
+    if normalized == "peer_wait_stalled":
+        return "Peer wait budget exhausted. No reply received in time. Stopping."
     if normalized.endswith(":unresponsive_after_stop"):
         return "Stop requested but worker stayed unresponsive. Marked stuck."
     return "Worker marked stuck."
@@ -68,6 +71,8 @@ def stuck_activity_detail(reason: str) -> str:
         return "Stopped after no progress heartbeat."
     if normalized == "max_runtime_exceeded":
         return "Stopped after hitting runtime limit."
+    if normalized == "peer_wait_stalled":
+        return "Stopped after waiting too long for peer reply."
     if normalized.endswith(":unresponsive_after_stop"):
         return "No response after stop request."
     return "Stopped due to watchdog safety limits."
@@ -140,6 +145,9 @@ def record_snapshot(
             record.error or "unknown error",
             error_preview_chars,
         )
+        traceback_text = (record.error_traceback or "").strip()
+        if traceback_text:
+            snapshot["error_traceback"] = traceback_text
         return snapshot
 
     if record.stop_reason:

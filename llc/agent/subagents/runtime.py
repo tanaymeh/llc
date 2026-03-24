@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import sys
 import time
@@ -34,6 +35,8 @@ _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REPORT_WORKERS = 8
 _MAX_ACTIVITY_PREVIEW_CHARS = 80
 _WAIT_POLL_INTERVAL_S = 0.1
+
+logger = logging.getLogger(__name__)
 
 
 class SubAgentRuntime:
@@ -364,6 +367,7 @@ class SubAgentRuntime:
                 record.id,
                 default_wait_timeout_ms=self._settings.sub_agent_message_wait_timeout_ms,
                 default_claim_ttl_s=self._settings.sub_agent_scope_claim_ttl_s,
+                stall_timeout_s=self._settings.sub_agent_stall_timeout_s,
             ),
             "parent_context": (
                 {
@@ -389,6 +393,12 @@ class SubAgentRuntime:
         try:
             process.start()
         except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Failed to launch sub-agent worker: id=%s name=%s attempt=%s",
+                record.id,
+                record.name,
+                record.attempt,
+            )
             record.status = "failed"
             record.error = str(exc)
             record.latest_report = f"Failed: {record.error or 'unknown error'}"
@@ -414,12 +424,23 @@ class SubAgentRuntime:
             except Empty:
                 break
             except Exception:
+                logger.exception(
+                    "Failed to drain sub-agent worker queue: id=%s name=%s attempt=%s",
+                    record.id,
+                    record.name,
+                    record.attempt,
+                )
                 break
             if not isinstance(event, dict):
                 continue
             try:
                 event_attempt = int(event.get("attempt", -1) or -1)
             except Exception:
+                logger.exception(
+                    "Failed to parse sub-agent worker event metadata: id=%s name=%s",
+                    record.id,
+                    record.name,
+                )
                 event_attempt = -1
             if event_attempt != record.attempt:
                 continue
@@ -475,6 +496,7 @@ class SubAgentRuntime:
         record.stop_reason = stop_reason
         record.stop_requested_at = 0.0
         record.error = str(result.get("error", "") or "")
+        record.error_traceback = str(result.get("error_traceback", "") or "")
         record.final_output = str(result.get("final_output", "") or "")
         record.tool_calls = max(record.tool_calls, int(result.get("tool_calls", 0) or 0))
         record.output_chars = max(
@@ -493,6 +515,23 @@ class SubAgentRuntime:
             record.latest_report = "Completed."
             record.activity_detail = "Completed successfully."
         elif record.status == "failed":
+            if record.error_traceback.strip():
+                logger.error(
+                    "Sub-agent failed: id=%s name=%s attempt=%s error=%s\n%s",
+                    record.id,
+                    record.name,
+                    record.attempt,
+                    record.error or "unknown error",
+                    record.error_traceback.rstrip(),
+                )
+            else:
+                logger.error(
+                    "Sub-agent failed: id=%s name=%s attempt=%s error=%s",
+                    record.id,
+                    record.name,
+                    record.attempt,
+                    record.error or "unknown error",
+                )
             record.latest_report = f"Failed: {record.error or 'unknown error'}"
             record.activity_detail = preview_text(
                 record.error or "unknown error",
@@ -606,6 +645,7 @@ class SubAgentRuntime:
         )
         record.status = "restarting"
         record.error = ""
+        record.error_traceback = ""
         record.final_output = ""
         record.finished_at = 0.0
         record.latest_report = "Restarting with feedback."
@@ -619,6 +659,7 @@ class SubAgentRuntime:
         now = time.time()
         max_runtime = float(self._settings.sub_agent_max_runtime_s)
         stall_timeout = float(self._settings.sub_agent_stall_timeout_s)
+        peer_wait_budget = float(self._settings.sub_agent_peer_wait_budget_s)
         stop_grace = float(self._settings.sub_agent_stop_grace_s)
         for record in self._records.values():
             self._drain_worker_events_locked(record)
@@ -644,6 +685,7 @@ class SubAgentRuntime:
                     fallback = {
                         "status": "failed",
                         "error": "Worker process exited without a result payload.",
+                        "error_traceback": "",
                         "tool_calls": record.tool_calls,
                         "output_chars": record.output_chars,
                         "usage_by_model": {},
@@ -665,7 +707,14 @@ class SubAgentRuntime:
             if elapsed > max_runtime:
                 stop_reason = "max_runtime_exceeded"
             elif idle_for > stall_timeout:
-                stop_reason = "stall_timeout_exceeded"
+                coord_state = self._coordination.worker_state(record.id)
+                waiting_on = str(coord_state.get("waiting_on", "") or "").strip() if coord_state else ""
+                if waiting_on:
+                    peer_wait_start = float(coord_state.get("peer_wait_start", 0) or 0)
+                    if peer_wait_start > 0 and (now - peer_wait_start) > peer_wait_budget:
+                        stop_reason = "peer_wait_stalled"
+                else:
+                    stop_reason = "stall_timeout_exceeded"
 
             if stop_reason and not self._worker_stop_requested_locked(record):
                 record.status = "terminating"
@@ -740,10 +789,16 @@ class SubAgentRuntime:
             snapshot["last_peer_contact_at"] = float(
                 coordination.get("last_peer_contact_at", 0.0) or 0.0
             )
+            peer_wait_start = float(coordination.get("peer_wait_start", 0) or 0)
             if record.status in ACTIVE_STATUSES and waiting_on:
                 snapshot["current_activity"] = "Waiting on peer dependency"
+                wait_detail = waiting_on
+                if peer_wait_start > 0:
+                    elapsed_wait = time.time() - peer_wait_start
+                    snapshot["peer_wait_elapsed_s"] = round(elapsed_wait, 1)
+                    wait_detail = f"{waiting_on} ({int(elapsed_wait)}s)"
                 snapshot["activity_detail"] = preview_text(
-                    waiting_on,
+                    wait_detail,
                     _MAX_REPORT_PREVIEW_CHARS,
                 )
         return snapshot

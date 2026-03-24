@@ -8,6 +8,7 @@ from llc.commands.help import HelpCommand
 from llc.commands.model import ModelCommand
 from llc.commands.subagent import SubagentCommand
 from llc.config import Settings
+from llc.logging import configure_logging
 from llc.service.api import create_api_app
 
 
@@ -62,6 +63,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_logging()
     args = _parse_args()
     settings = Settings.from_env()
     if args.host or args.port:

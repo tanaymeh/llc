@@ -9,6 +9,7 @@ _WAIT_POLL_INTERVAL_S = 0.2
 _MAX_BOARD_ITEMS = 500
 _MAX_MESSAGE_ITEMS = 1200
 _MAX_PLAN_STEPS = 24
+_PEER_WAIT_SAFETY_MARGIN_MS = 5000
 
 
 def _now() -> float:
@@ -99,6 +100,7 @@ class SubAgentCoordinationStore:
             info.setdefault("inbox_dirty", False)
             info.setdefault("unread_count", 0)
             info.setdefault("waiting_on", "")
+            info.setdefault("peer_wait_start", 0.0)
             info.setdefault("last_peer_contact_at", 0.0)
             info.setdefault("last_inbox_checked_at", 0.0)
             self._workers[clean_id] = info
@@ -113,6 +115,7 @@ class SubAgentCoordinationStore:
                 return
             info["active"] = False
             info["waiting_on"] = ""
+            info["peer_wait_start"] = 0.0
             info["updated_at"] = _now()
             self._workers[clean_id] = info
             for scope in list(self._claims.keys()):
@@ -155,8 +158,15 @@ class SubAgentCoordinationStore:
             info = dict(self._workers.get(clean_id) or {})
             if not info:
                 return
-            info["waiting_on"] = waiting_on.strip()
-            info["updated_at"] = _now()
+            new_val = waiting_on.strip()
+            old_val = str(info.get("waiting_on", "") or "").strip()
+            info["waiting_on"] = new_val
+            now = _now()
+            if new_val and not old_val:
+                info["peer_wait_start"] = now
+            elif not new_val:
+                info["peer_wait_start"] = 0.0
+            info["updated_at"] = now
             self._workers[clean_id] = info
 
     def send_message(
@@ -280,6 +290,7 @@ class SubAgentCoordinationStore:
             info["updated_at"] = now
             if payloads:
                 info["waiting_on"] = ""
+                info["peer_wait_start"] = 0.0
             self._workers[clean_id] = info
             return {
                 "ok": True,
@@ -495,6 +506,7 @@ class SubAgentCoordinationStore:
                 "unread_count": unread,
                 "inbox_dirty": bool(info.get("inbox_dirty", False)),
                 "waiting_on": str(info.get("waiting_on", "")),
+                "peer_wait_start": float(info.get("peer_wait_start", 0.0) or 0.0),
                 "plan_submitted": bool(info.get("plan_submitted", False)),
                 "plan_step_count": int(info.get("plan_step_count", 0) or 0),
                 "plan_steps": list(info.get("plan_steps", []) or []),
@@ -605,11 +617,13 @@ class SubAgentCoordinationHub:
         *,
         default_wait_timeout_ms: int,
         default_claim_ttl_s: int,
+        stall_timeout_s: float,
     ) -> dict[str, Any]:
         return {
             "worker_id": worker_id,
             "default_wait_timeout_ms": max(int(default_wait_timeout_ms or 0), 0),
             "default_claim_ttl_s": max(int(default_claim_ttl_s or 0), 30),
+            "stall_timeout_ms": max(int(float(stall_timeout_s or 0) * 1000), 0),
             "lock": self._store.lock,
             "workers": self._store.workers,
             "messages": self._store.messages,
@@ -626,11 +640,13 @@ class SubAgentCoordinationClient:
         store: SubAgentCoordinationStore,
         default_wait_timeout_ms: int,
         default_claim_ttl_s: int,
+        stall_timeout_ms: int,
     ) -> None:
         self.worker_id = worker_id
         self._store = store
         self._default_wait_timeout_ms = max(int(default_wait_timeout_ms or 0), 0)
         self._default_claim_ttl_s = max(int(default_claim_ttl_s or 0), 30)
+        self._stall_timeout_ms = max(int(stall_timeout_ms or 0), 0)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> SubAgentCoordinationClient | None:
@@ -656,6 +672,7 @@ class SubAgentCoordinationClient:
             store=store,
             default_wait_timeout_ms=int(payload.get("default_wait_timeout_ms", 0) or 0),
             default_claim_ttl_s=int(payload.get("default_claim_ttl_s", 300) or 300),
+            stall_timeout_ms=int(payload.get("stall_timeout_ms", 0) or 0),
         )
 
     def submit_plan(self, steps: list[str] | str) -> dict[str, Any]:
@@ -704,7 +721,14 @@ class SubAgentCoordinationClient:
         timeout = self._default_wait_timeout_ms
         if timeout_ms is not None:
             timeout = max(int(timeout_ms or 0), 0)
-        return self._store.wait_for_message(self.worker_id, timeout_ms=timeout)
+        effective_timeout = timeout
+        if self._stall_timeout_ms > 0:
+            bounded_max = max(self._stall_timeout_ms - _PEER_WAIT_SAFETY_MARGIN_MS, 1000)
+            if effective_timeout <= 0:
+                effective_timeout = bounded_max
+            else:
+                effective_timeout = min(effective_timeout, bounded_max)
+        return self._store.wait_for_message(self.worker_id, timeout_ms=effective_timeout)
 
     def post_note(self, *, channel: str, content: str) -> dict[str, Any]:
         return self._store.post_note(self.worker_id, channel=channel, content=content)
@@ -729,6 +753,10 @@ class SubAgentCoordinationClient:
 
     def set_waiting_on(self, waiting_on: str = "") -> None:
         self._store.set_waiting_on(self.worker_id, waiting_on)
+
+    def get_waiting_on(self) -> str:
+        state = self._store.worker_state(self.worker_id)
+        return str(state.get("waiting_on", "") or "").strip() if state else ""
 
     def state(self) -> dict[str, Any]:
         return self._store.worker_state(self.worker_id)

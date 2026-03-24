@@ -25,6 +25,7 @@ Notes:
   Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
   Sub-agent watchdog/timing + coordination knobs are read from `.env` (`SUB_AGENT_*`).
   Sub-agents run as isolated worker processes and can coordinate via inbox/board/claims.
+  Uncaught sub-agent worker failures are emitted to backend logs with tracebacks.
   Post-turn hooks run in background by default (blocking only when explicitly configured).
   Backend service is modularized under `llc/service/api_*.py` and `llc/service/engine_*.py`.
 EOF

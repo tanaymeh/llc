@@ -15,6 +15,7 @@ LLC is a local coding agent runtime with:
 - and a React mission-control frontend (Git submodule at `llc-frontend/`).
 
 The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists sessions in SQLite.
+Sub-agent crashes and worker launch failures are also logged with Python tracebacks in backend logs, including under `make run`.
 
 ## What it includes
 
@@ -260,6 +261,8 @@ Tail logs:
 ```bash
 make logs
 ```
+
+Backend logs include uncaught sub-agent worker exceptions and worker launch failures with tracebacks.
 
 Run local Langfuse UI stack separately:
 

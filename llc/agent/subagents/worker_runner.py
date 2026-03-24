@@ -1,27 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+import traceback
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.coordination import SubAgentCoordinationClient
+from llc.agent.subagents.reporting import activity_from_tool_name, preview_text, stop_reason_is_stuck
+from llc.agent.subagents.usage import accumulate_usage_by_model, token_usage
 from llc.config import Settings
+from llc.logging import configure_logging
 from llc.observability import (
     merge_langchain_config,
     start_linked_subagent_trace,
     update_observation,
 )
 from llc.service.prompt_registry import PromptRegistry
-from llc.agent.subagents.reporting import activity_from_tool_name, preview_text, stop_reason_is_stuck
-from llc.agent.subagents.usage import accumulate_usage_by_model, token_usage
 
 _MAX_STORED_FINAL_OUTPUT_CHARS = 12000
 _MAX_REPORT_PREVIEW_CHARS = 220
 _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REVISION_PART_CHARS = 1800
+
+logger = logging.getLogger(__name__)
 
 
 class StopRequested(RuntimeError):
@@ -36,17 +41,18 @@ def subagent_process_entry(
     stop_event: Any,
     worker_queue: Any,
 ) -> None:
+    configure_logging()
     attempt = int(payload.get("attempt", 0) or 0)
+    subagent_id = str(payload.get("subagent_id", "")).strip()
+    subagent_name = str(payload.get("subagent_name", "")).strip()
     try:
         settings_payload = payload.get("settings")
         settings = Settings.model_validate(
             settings_payload if isinstance(settings_payload, dict) else {}
         )
-        subagent_id = str(payload.get("subagent_id", "")).strip()
         task = str(payload.get("task", "")).strip()
         context = str(payload.get("context", "")).strip()
         thread_id = str(payload.get("thread_id", "")).strip()
-        subagent_name = str(payload.get("subagent_name", "")).strip()
         coordination_payload = payload.get("coordination")
         coordination_client = (
             SubAgentCoordinationClient.from_payload(coordination_payload)
@@ -90,9 +96,17 @@ def subagent_process_entry(
             )
         )
     except Exception as exc:  # noqa: BLE001
+        error_traceback = traceback.format_exc()
+        logger.exception(
+            "Sub-agent worker crashed before returning a result: id=%s name=%s attempt=%s",
+            subagent_id or "unknown",
+            subagent_name or "unknown",
+            attempt,
+        )
         result = {
             "status": "failed",
             "error": str(exc),
+            "error_traceback": error_traceback,
             "tool_calls": 0,
             "output_chars": 0,
             "usage_by_model": {},
@@ -138,6 +152,30 @@ async def run_subagent_worker(
     last_tool_name = ""
     current_activity = "Running"
     activity_detail = "Worker started."
+
+    # Mutable state shared with the background heartbeat task so it can
+    # send up-to-date snapshots even when the stream loop is blocked.
+    _shared: dict[str, Any] = {
+        "tool_calls": 0,
+        "output_chars": 0,
+        "activity": current_activity,
+        "activity_detail": activity_detail,
+        "last_tool_name": "",
+    }
+
+    async def _background_heartbeat() -> None:
+        while True:
+            await asyncio.sleep(heartbeat_interval_s)
+            progress_callback({
+                "tool_calls": _shared["tool_calls"],
+                "output_chars": _shared["output_chars"],
+                "activity": _shared["activity"],
+                "activity_detail": _shared["activity_detail"],
+                "last_tool_name": _shared["last_tool_name"],
+            })
+
+    heartbeat_task: asyncio.Task[None] | None = None
+
     task_message = render_subagent_task_message(
         task,
         context,
@@ -178,6 +216,7 @@ async def run_subagent_worker(
             config=stream_config,
             stream_mode=["messages", "updates"],
         )
+        heartbeat_task = asyncio.create_task(_background_heartbeat())
         try:
             try:
                 while True:
@@ -186,10 +225,19 @@ async def run_subagent_worker(
                     elapsed = time.monotonic() - started_monotonic
                     if elapsed > max_runtime_s:
                         raise StopRequested("max_runtime_exceeded")
+
+                    is_waiting_on_peer = (
+                        coordination_client is not None
+                        and bool(coordination_client.get_waiting_on())
+                    )
+                    effective_stall = stall_timeout_s
+                    if is_waiting_on_peer:
+                        effective_stall = max_runtime_s - elapsed
+
                     next_chunk_timeout_s = next_stream_timeout_s(
                         elapsed=elapsed,
                         max_runtime_s=max_runtime_s,
-                        stall_timeout_s=stall_timeout_s,
+                        stall_timeout_s=effective_stall,
                     )
                     if next_chunk_timeout_s <= 0:
                         raise StopRequested("max_runtime_exceeded")
@@ -253,6 +301,12 @@ async def run_subagent_worker(
                                             _MAX_REPORT_PREVIEW_CHARS,
                                         )
 
+                    _shared["tool_calls"] = tool_calls
+                    _shared["output_chars"] = output_chars
+                    _shared["activity"] = current_activity
+                    _shared["activity_detail"] = activity_detail
+                    _shared["last_tool_name"] = last_tool_name
+
                     now_monotonic = time.monotonic()
                     if now_monotonic >= next_report_at:
                         progress_callback(
@@ -282,6 +336,12 @@ async def run_subagent_worker(
                         )
                         next_heartbeat_at = now_monotonic + heartbeat_interval_s
             finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                 aclose = getattr(stream, "aclose", None)
                 if callable(aclose):
                     try:
@@ -302,6 +362,12 @@ async def run_subagent_worker(
                 "usage_by_model": usage_by_model,
             }
         except Exception as exc:  # noqa: BLE001
+            error_traceback = traceback.format_exc()
+            logger.exception(
+                "Sub-agent worker failed during execution: id=%s name=%s",
+                subagent_id or "unknown",
+                subagent_name or "unknown",
+            )
             update_observation(
                 trace_scope.observation,
                 output={"status": "failed", "error": str(exc)},
@@ -309,6 +375,7 @@ async def run_subagent_worker(
             return {
                 "status": "failed",
                 "error": str(exc),
+                "error_traceback": error_traceback,
                 "tool_calls": tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,

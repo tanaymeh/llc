@@ -21,11 +21,13 @@ class SubAgentCoordinationTests(unittest.TestCase):
             "worker-a",
             default_wait_timeout_ms=300,
             default_claim_ttl_s=120,
+            stall_timeout_s=45,
         )
         payload_b = self.hub.worker_payload(
             "worker-b",
             default_wait_timeout_ms=300,
             default_claim_ttl_s=120,
+            stall_timeout_s=45,
         )
         self.client_a = SubAgentCoordinationClient.from_payload(payload_a)
         self.client_b = SubAgentCoordinationClient.from_payload(payload_b)
