@@ -27,7 +27,11 @@ _ORCHESTRATOR_MODE_APPEND = (
     "Do not ask the user to poll for worker updates.\n"
     "Always use the live worker snapshot in the system prompt for worker status.\n"
     "When calling LaunchSubagent, always set a short, descriptive `name`.\n"
-    "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck."
+    "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck.\n"
+    "CRITICAL — parallel launch: When you need multiple sub-agents, call LaunchSubagent "
+    "for ALL of them in a SINGLE response (multiple tool calls in one turn). "
+    "Do NOT launch one, wait, then launch the next. Sub-agents coordinate directly "
+    "via peer messaging, shared notes, and scope claims."
 )
 
 
@@ -144,6 +148,8 @@ def _subagent_inbox_provider(
     role: AgentRole,
     subagent_coordination: SubAgentCoordinationClient | None,
 ):
+    """Used by the LLM node auto-inject: only checks for genuinely unread
+    messages (NOT pending_responses) to avoid an inject→empty-read loop."""
     if role != "subagent" or subagent_coordination is None:
         return None
 
@@ -153,6 +159,51 @@ def _subagent_inbox_provider(
         except Exception:  # noqa: BLE001
             return False
         return bool(state.get("ok") and state.get("has_unread"))
+
+    return provider
+
+
+def _peer_linger_provider(
+    role: AgentRole,
+    subagent_coordination: SubAgentCoordinationClient | None,
+):
+    """Returns True when the worker has active peers that might still
+    need to contact it, even though there are no unread messages yet."""
+    if role != "subagent" or subagent_coordination is None:
+        return None
+
+    def provider() -> bool:
+        try:
+            state = subagent_coordination.state()
+        except Exception:  # noqa: BLE001
+            return False
+        worker_id = str(state.get("worker_id", "") or "")
+        directory = state.get("team_directory", [])
+        if not isinstance(directory, list):
+            return False
+        return any(
+            isinstance(p, dict)
+            and p.get("active")
+            and str(p.get("id", "")) != worker_id
+            for p in directory
+        )
+
+    return provider
+
+
+def _inbox_obligations_provider(
+    role: AgentRole,
+    subagent_coordination: SubAgentCoordinationClient | None,
+):
+    if role != "subagent" or subagent_coordination is None:
+        return None
+
+    def provider() -> bool:
+        try:
+            result = subagent_coordination.has_inbox_obligations()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(result.get("ok") and result.get("has_obligations"))
 
     return provider
 
@@ -219,6 +270,9 @@ def build_agent_graph(
             auto_wait_provider=auto_wait_provider,
             auto_wait_tool_name=auto_tool_name,
             auto_wait_args_provider=auto_wait_args_provider,
+            peer_linger_provider=_peer_linger_provider(
+                role, subagent_coordination,
+            ),
         ),
     )
     required_first_tool_name = (
@@ -231,6 +285,9 @@ def build_agent_graph(
         make_tool_node(
             tools_by_name,
             required_first_tool_name=required_first_tool_name,
+            inbox_obligations_provider=_inbox_obligations_provider(
+                role, subagent_coordination,
+            ),
         ),
     )
     builder.add_edge(START, "llm")

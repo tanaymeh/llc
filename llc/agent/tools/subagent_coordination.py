@@ -6,6 +6,13 @@ from langchain_core.tools import BaseTool
 
 from llc.agent.subagents.coordination import SubAgentCoordinationClient
 
+_INBOX_TOOL_NAMES = frozenset({
+    "ReadInbox",
+    "SendPeerMessage",
+    "HasInboxMessages",
+    "WaitForPeerMessage",
+})
+
 
 def _render(payload: dict) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, default=str)
@@ -59,9 +66,9 @@ def make_subagent_coordination_tools(
         )
 
     @tool
-    def WaitForPeerMessage(timeout_ms: Optional[int] = None, read_limit: Optional[int] = None) -> str:
+    async def WaitForPeerMessage(timeout_ms: Optional[int] = None, read_limit: Optional[int] = None) -> str:
         """Wait briefly for peer messages, then return inbox state."""
-        wait_payload = client.wait_for_message(timeout_ms=timeout_ms)
+        wait_payload = await client.async_wait_for_message(timeout_ms=timeout_ms)
         if not wait_payload.get("ok"):
             return _render(wait_payload)
         if not wait_payload.get("has_message"):
@@ -116,7 +123,7 @@ def make_subagent_coordination_tools(
         """Return current coordination state for this worker."""
         return _render(client.state())
 
-    return [
+    all_tools = [
         SubmitTaskPlan,
         SendPeerMessage,
         HasInboxMessages,
@@ -129,3 +136,7 @@ def make_subagent_coordination_tools(
         ListMyClaims,
         GetCoordinationState,
     ]
+    return all_tools
+
+
+INBOX_TOOL_NAMES = _INBOX_TOOL_NAMES

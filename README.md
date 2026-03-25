@@ -242,6 +242,11 @@ Workers can now coordinate through:
 
 Each worker must submit a multi-step plan via `SubmitTaskPlan` before using other tools.
 
+Runtime enforcements:
+- **Inbox obligations**: Workers must read and respond (`kind='response'`) to peer questions before other tools are unblocked.
+- **Peer-exit detection**: `WaitForPeerMessage` returns immediately with `all_peers_inactive: true` when no active peers remain.
+- **Async wait**: `WaitForPeerMessage` uses non-blocking `asyncio.sleep` to keep heartbeats flowing.
+
 ## Docker
 
 Full stack (backend + frontend) in Docker:

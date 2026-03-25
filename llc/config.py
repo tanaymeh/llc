@@ -262,7 +262,7 @@ class Settings(BaseModel, frozen=True):
     sub_agent_stop_grace_s: int = Field(default=15, ge=1, le=300)
     sub_agent_max_tool_calls: int = Field(default=80, ge=1, le=2000)
     sub_agent_wait_timeout_ms: int = Field(default=1200, ge=100, le=60000)
-    sub_agent_message_wait_timeout_ms: int = Field(default=1200, ge=50, le=60000)
+    sub_agent_message_wait_timeout_ms: int = Field(default=20000, ge=50, le=60000)
     sub_agent_scope_claim_ttl_s: int = Field(default=300, ge=30, le=86400)
     sub_agent_context_messages: int = Field(default=8, ge=1, le=20)
     shell_timeout: int = 120
@@ -307,7 +307,7 @@ class Settings(BaseModel, frozen=True):
             sub_agent_wait_timeout_ms=_env_int("SUB_AGENT_WAIT_TIMEOUT_MS", 1200),
             sub_agent_message_wait_timeout_ms=_env_int(
                 "SUB_AGENT_MESSAGE_WAIT_TIMEOUT_MS",
-                1200,
+                20000,
             ),
             sub_agent_scope_claim_ttl_s=_env_int(
                 "SUB_AGENT_SCOPE_CLAIM_TTL_S",

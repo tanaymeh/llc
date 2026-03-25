@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
 from typing import Any
 
-_WAIT_POLL_INTERVAL_S = 0.2
+_WAIT_POLL_INTERVAL_S = 0.5
 _MAX_BOARD_ITEMS = 500
 _MAX_MESSAGE_ITEMS = 1200
 _MAX_PLAN_STEPS = 24
@@ -103,6 +104,7 @@ class SubAgentCoordinationStore:
             info.setdefault("peer_wait_start", 0.0)
             info.setdefault("last_peer_contact_at", 0.0)
             info.setdefault("last_inbox_checked_at", 0.0)
+            info.setdefault("pending_responses", [])
             self._workers[clean_id] = info
 
     def mark_worker_inactive(self, worker_id: str) -> None:
@@ -192,6 +194,8 @@ class SubAgentCoordinationStore:
             return {"ok": False, "error": "message body cannot be empty."}
         with self._lock:
             self._prune_locked()
+            sender = self._resolve_worker_locked(sender)
+            recipient = self._resolve_worker_locked(recipient)
             sender_info = dict(self._workers.get(sender) or {})
             recipient_info = dict(self._workers.get(recipient) or {})
             if not sender_info:
@@ -226,6 +230,10 @@ class SubAgentCoordinationStore:
             recipient_info["updated_at"] = now
             sender_info["last_peer_contact_at"] = now
             recipient_info["last_peer_contact_at"] = now
+            pending = list(sender_info.get("pending_responses", []) or [])
+            if recipient in pending:
+                pending.remove(recipient)
+                sender_info["pending_responses"] = pending
             self._workers[sender] = sender_info
             self._workers[recipient] = recipient_info
             return {
@@ -291,12 +299,25 @@ class SubAgentCoordinationStore:
             if payloads:
                 info["waiting_on"] = ""
                 info["peer_wait_start"] = 0.0
+            pending = list(info.get("pending_responses", []) or [])
+            _NO_REPLY_KINDS = {"response", "reply", "ack", "info", "done"}
+            for msg in payloads:
+                if bool(msg.get("read", False)):
+                    continue
+                kind = str(msg.get("kind", "") or "").strip().lower()
+                if kind in _NO_REPLY_KINDS:
+                    continue
+                sender = str(msg.get("from_worker", "") or "").strip()
+                if sender and sender != clean_id and sender not in pending:
+                    pending.append(sender)
+            info["pending_responses"] = pending
             self._workers[clean_id] = info
             return {
                 "ok": True,
                 "messages": payloads,
                 "unread_count": unread_count,
                 "inbox_dirty": unread_count > 0,
+                "pending_responses": list(pending),
             }
 
     def has_unread_messages(self, worker_id: str) -> dict[str, Any]:
@@ -335,6 +356,16 @@ class SubAgentCoordinationStore:
                     "has_message": True,
                     "unread_count": int(unread.get("unread_count", 0) or 0),
                 }
+            with self._lock:
+                peers_alive = self._has_active_peers_locked(clean_id)
+            if not peers_alive:
+                self.set_waiting_on(clean_id, "")
+                return {
+                    "ok": True,
+                    "has_message": False,
+                    "all_peers_inactive": True,
+                    "unread_count": 0,
+                }
             if deadline is not None and time.monotonic() >= deadline:
                 self.set_waiting_on(clean_id, "")
                 return {
@@ -343,6 +374,47 @@ class SubAgentCoordinationStore:
                     "unread_count": int(unread.get("unread_count", 0) or 0),
                 }
             time.sleep(_WAIT_POLL_INTERVAL_S)
+
+    async def async_wait_for_message(
+        self, worker_id: str, *, timeout_ms: int,
+    ) -> dict[str, Any]:
+        clean_id = worker_id.strip()
+        if not clean_id:
+            return {"ok": False, "error": "worker_id is required."}
+        bounded_timeout_ms = max(int(timeout_ms or 0), 0)
+        deadline = (
+            time.monotonic() + (bounded_timeout_ms / 1000.0)
+            if bounded_timeout_ms > 0
+            else None
+        )
+        self.set_waiting_on(clean_id, "peer_message")
+        while True:
+            unread = self.has_unread_messages(clean_id)
+            if unread.get("ok") and unread.get("has_unread"):
+                self.set_waiting_on(clean_id, "")
+                return {
+                    "ok": True,
+                    "has_message": True,
+                    "unread_count": int(unread.get("unread_count", 0) or 0),
+                }
+            with self._lock:
+                peers_alive = self._has_active_peers_locked(clean_id)
+            if not peers_alive:
+                self.set_waiting_on(clean_id, "")
+                return {
+                    "ok": True,
+                    "has_message": False,
+                    "all_peers_inactive": True,
+                    "unread_count": 0,
+                }
+            if deadline is not None and time.monotonic() >= deadline:
+                self.set_waiting_on(clean_id, "")
+                return {
+                    "ok": True,
+                    "has_message": False,
+                    "unread_count": int(unread.get("unread_count", 0) or 0),
+                }
+            await asyncio.sleep(_WAIT_POLL_INTERVAL_S)
 
     def post_note(self, worker_id: str, *, channel: str, content: str) -> dict[str, Any]:
         clean_id = worker_id.strip()
@@ -579,6 +651,50 @@ class SubAgentCoordinationStore:
             total += 1
         return total
 
+    def _resolve_worker_locked(self, identifier: str) -> str:
+        """Resolve a worker identifier to its canonical ID.
+        Tries exact ID match first, then falls back to name match."""
+        if identifier in self._workers:
+            return identifier
+        for wid, raw in list(self._workers.items()):
+            if not isinstance(raw, dict):
+                continue
+            if str(raw.get("name", "")).strip() == identifier:
+                return str(wid)
+        return identifier
+
+    def _has_active_peers_locked(self, worker_id: str) -> bool:
+        for other_id, raw in list(self._workers.items()):
+            if other_id == worker_id:
+                continue
+            if isinstance(raw, dict) and raw.get("active"):
+                return True
+        return False
+
+    def has_inbox_obligations(self, worker_id: str) -> dict[str, Any]:
+        clean_id = worker_id.strip()
+        if not clean_id:
+            return {"ok": False, "error": "worker_id is required."}
+        with self._lock:
+            self._prune_locked()
+            info = dict(self._workers.get(clean_id) or {})
+            if not info:
+                return {"ok": False, "error": f"Unknown worker: {clean_id}"}
+            unread = self._count_unread_locked(clean_id)
+            pending = list(info.get("pending_responses", []) or [])
+            active_pending = [
+                pid for pid in pending
+                if isinstance(self._workers.get(pid), dict)
+                and self._workers.get(pid, {}).get("active")
+            ]
+            has_obligations = unread > 0 or len(active_pending) > 0
+            return {
+                "ok": True,
+                "has_obligations": has_obligations,
+                "unread_count": unread,
+                "pending_responses": active_pending,
+            }
+
 
 class SubAgentCoordinationHub:
     def __init__(self, mp_context: Any) -> None:
@@ -610,6 +726,9 @@ class SubAgentCoordinationHub:
 
     def worker_state(self, worker_id: str) -> dict[str, Any]:
         return self._store.worker_state(worker_id)
+
+    def has_inbox_obligations(self, worker_id: str) -> dict[str, Any]:
+        return self._store.has_inbox_obligations(worker_id)
 
     def worker_payload(
         self,
@@ -717,7 +836,7 @@ class SubAgentCoordinationClient:
     def has_unread_messages(self) -> dict[str, Any]:
         return self._store.has_unread_messages(self.worker_id)
 
-    def wait_for_message(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
+    def _effective_wait_timeout(self, timeout_ms: int | None) -> int:
         timeout = self._default_wait_timeout_ms
         if timeout_ms is not None:
             timeout = max(int(timeout_ms or 0), 0)
@@ -728,7 +847,20 @@ class SubAgentCoordinationClient:
                 effective_timeout = bounded_max
             else:
                 effective_timeout = min(effective_timeout, bounded_max)
-        return self._store.wait_for_message(self.worker_id, timeout_ms=effective_timeout)
+        return effective_timeout
+
+    def wait_for_message(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        return self._store.wait_for_message(
+            self.worker_id, timeout_ms=self._effective_wait_timeout(timeout_ms),
+        )
+
+    async def async_wait_for_message(self, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        return await self._store.async_wait_for_message(
+            self.worker_id, timeout_ms=self._effective_wait_timeout(timeout_ms),
+        )
+
+    def has_inbox_obligations(self) -> dict[str, Any]:
+        return self._store.has_inbox_obligations(self.worker_id)
 
     def post_note(self, *, channel: str, content: str) -> dict[str, Any]:
         return self._store.post_note(self.worker_id, channel=channel, content=content)
