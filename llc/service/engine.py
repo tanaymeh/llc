@@ -105,6 +105,30 @@ class SessionEngine:
     def available_models(self) -> list[AvailableModel]:
         return list(self._available_models)
 
+    def _subagent_launch_precheck(self) -> str | None:
+        selected_model = str(self._settings.model_name or "").strip()
+        if not selected_model:
+            return "No model is configured for sub-agent launches."
+
+        models = self._available_models
+        if not models:
+            return None
+
+        available_ids = {model.id for model in models if model.id}
+        if selected_model in available_ids:
+            return None
+
+        suggestions = ", ".join(f"`{model.id}`" for model in models[:5])
+        if suggestions:
+            return (
+                f"Configured model `{selected_model}` is unavailable on the current provider. "
+                f"Choose an available model via `/model` (examples: {suggestions})."
+            )
+        return (
+            f"Configured model `{selected_model}` is unavailable on the current provider. "
+            "Choose an available model via `/model`."
+        )
+
     def subscribe_async_events(self) -> asyncio.Queue[Event]:
         queue: asyncio.Queue[Event] = asyncio.Queue(maxsize=200)
         self._async_event_subscribers.add(queue)
@@ -137,6 +161,7 @@ class SessionEngine:
                 prompt_registry=self._prompt_registry,
             ),
             prompt_registry=self._prompt_registry,
+            launch_precheck=self._subagent_launch_precheck,
         )
         role = "orchestrator" if self._settings.sub_agent_mode_enabled else "default"
         self._agent = build_agent_graph(

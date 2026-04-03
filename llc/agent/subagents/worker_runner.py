@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import suppress
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from llc.agent.message_utils import message_text
+from llc.agent.subagents.coordination import AgentCoordinationLayer
 from llc.config import Settings
+from llc.logging_utils import configure_logging
 from llc.observability import (
     merge_langchain_config,
     start_linked_subagent_trace,
@@ -21,12 +24,92 @@ _MAX_STORED_FINAL_OUTPUT_CHARS = 12000
 _MAX_REPORT_PREVIEW_CHARS = 220
 _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REVISION_PART_CHARS = 1800
+_MAX_TOOL_SUMMARY_CHARS = 140
+_STREAM_POLL_INTERVAL_S = 1.0
+_INTERNAL_TOOL_NAMES = {
+    "SendMessage",
+    "ReadInbox",
+    "ReadTeamStatus",
+    "ReadSharedNotes",
+    "AppendSharedNote",
+    "RequestLock",
+    "ReleaseLock",
+    "ReviewHeldLocks",
+    "RespondLockReview",
+    "LaunchSubagent",
+    "GetSubagentReport",
+    "WaitSubagents",
+    "ReviseSubagent",
+    "InterruptSubagent",
+    "TerminateSubagent",
+}
 
 
 class StopRequested(RuntimeError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+def _compact_path(raw_path: str) -> str:
+    cleaned = raw_path.replace("\\", "/").strip()
+    if len(cleaned) <= 64:
+        return cleaned
+    parts = [part for part in cleaned.split("/") if part]
+    if len(parts) >= 2:
+        tail = "/".join(parts[-2:])
+        if len(tail) <= 48:
+            return f".../{tail}"
+    return cleaned[:61] + "..."
+
+
+def _tool_summary(tool_name: str, args: dict[str, Any]) -> str:
+    name = tool_name.strip()
+    if not name or not isinstance(args, dict):
+        return ""
+
+    if name in {"Read", "Write", "Edit", "MultiEdit"}:
+        path = str(args.get("file_path") or args.get("path") or "").strip()
+        if path:
+            return f"path={_compact_path(path)}"
+    if name == "LS":
+        path = str(args.get("path") or "").strip()
+        return f"path={_compact_path(path)}" if path else "workspace"
+    if name == "Bash":
+        cmd = str(args.get("command") or "").strip()
+        if cmd:
+            return preview_text(cmd, _MAX_TOOL_SUMMARY_CHARS)
+    if name == "TodoWrite":
+        todos = args.get("todos")
+        if isinstance(todos, list):
+            return f"todo_items={len(todos)}"
+    if name == "SendMessage":
+        recipient = str(args.get("recipient_subagent_id") or "").strip()
+        content = str(args.get("content") or "").strip()
+        recipient_part = f"to={recipient} " if recipient else ""
+        if content:
+            return f"{recipient_part}msg={preview_text(content, 70)}".strip()
+        return recipient_part.strip()
+    if name in {"RequestLock", "ReleaseLock"}:
+        path = str(args.get("file_path") or "").strip()
+        if path:
+            return f"path={_compact_path(path)}"
+    if name in {"ReadInbox", "ReadTeamStatus", "ReadSharedNotes", "ReviewHeldLocks"}:
+        return "coordination_check"
+    return ""
+
+
+def _counted_tool_call_delta(tool_calls_batch: list[Any]) -> int:
+    counted = 0
+    for item in tool_calls_batch:
+        if not isinstance(item, dict):
+            counted += 1
+            continue
+        tool_name = str(item.get("name", "")).strip()
+        if tool_name in _INTERNAL_TOOL_NAMES:
+            continue
+        counted += 1
+    return counted
 
 
 def subagent_process_entry(
@@ -41,6 +124,7 @@ def subagent_process_entry(
         settings = Settings.model_validate(
             settings_payload if isinstance(settings_payload, dict) else {}
         )
+        configure_logging(subagent_debug_logging=settings.sub_agent_debug_logging)
         subagent_id = str(payload.get("subagent_id", "")).strip()
         task = str(payload.get("task", "")).strip()
         context = str(payload.get("context", "")).strip()
@@ -50,6 +134,17 @@ def subagent_process_entry(
         parent_context = (
             parent_context_raw if isinstance(parent_context_raw, dict) else None
         )
+        coordination_handles_raw = payload.get("coordination_handles")
+        coordination_handles = (
+            coordination_handles_raw
+            if isinstance(coordination_handles_raw, dict)
+            else None
+        )
+        coordination_layer = (
+            AgentCoordinationLayer.from_handles(coordination_handles)
+            if coordination_handles is not None
+            else None
+        )
         prompt_registry = PromptRegistry(settings.prompts_dir)
         from llc.agent.graph import build_agent_graph
 
@@ -57,6 +152,8 @@ def subagent_process_entry(
             settings,
             role="subagent",
             prompt_registry=prompt_registry,
+            subagent_coordination=coordination_layer,
+            subagent_id=subagent_id,
         )
         result = asyncio.run(
             run_subagent_worker(
@@ -85,6 +182,7 @@ def subagent_process_entry(
             "status": "failed",
             "error": str(exc),
             "tool_calls": 0,
+            "total_tool_calls": 0,
             "output_chars": 0,
             "usage_by_model": {},
         }
@@ -120,12 +218,16 @@ async def run_subagent_worker(
     heartbeat_interval_s = min(max(report_interval / 4.0, 0.5), 2.0)
     next_report_at = started_monotonic + report_interval
     next_heartbeat_at = started_monotonic + heartbeat_interval_s
+    last_chunk_at = started_monotonic
     tool_calls = 0
+    total_tool_calls = 0
     output_chars = 0
     final_parts: list[str] = []
     fallback_text = ""
     usage_by_model: dict[str, dict[str, int]] = {}
     last_tool_name = ""
+    last_tool_summary = ""
+    saw_any_tool_call = False
     current_activity = "Running"
     activity_detail = "Worker started."
     with start_linked_subagent_trace(
@@ -163,30 +265,42 @@ async def run_subagent_worker(
             config=stream_config,
             stream_mode=["messages", "updates"],
         )
+        pending_chunk: asyncio.Task[Any] | None = None
         try:
             try:
                 while True:
                     if stop_requested():
                         raise StopRequested("stop_requested")
-                    elapsed = time.monotonic() - started_monotonic
+                    now_monotonic = time.monotonic()
+                    elapsed = now_monotonic - started_monotonic
                     if elapsed > max_runtime_s:
                         raise StopRequested("max_runtime_exceeded")
-                    next_chunk_timeout_s = next_stream_timeout_s(
+                    if (
+                        stall_timeout_s > 0
+                        and (now_monotonic - last_chunk_at) > stall_timeout_s
+                    ):
+                        raise StopRequested("stall_timeout_exceeded")
+                    next_chunk_timeout_s = next_stream_poll_timeout_s(
                         elapsed=elapsed,
                         max_runtime_s=max_runtime_s,
-                        stall_timeout_s=stall_timeout_s,
                     )
                     if next_chunk_timeout_s <= 0:
                         raise StopRequested("max_runtime_exceeded")
+                    if pending_chunk is None:
+                        pending_chunk = asyncio.create_task(anext(stream))
                     try:
                         mode, chunk = await asyncio.wait_for(
-                            anext(stream),
+                            asyncio.shield(pending_chunk),
                             timeout=next_chunk_timeout_s,
                         )
+                        pending_chunk = None
                     except StopAsyncIteration:
+                        pending_chunk = None
                         break
                     except asyncio.TimeoutError:
-                        raise StopRequested("stall_timeout_exceeded")
+                        continue
+
+                    last_chunk_at = time.monotonic()
 
                     if mode == "messages":
                         msg_chunk, meta = chunk
@@ -204,20 +318,38 @@ async def run_subagent_worker(
                                 if not isinstance(message, AIMessage):
                                     continue
                                 tool_calls_batch = getattr(message, "tool_calls", None) or []
-                                tool_calls += len(tool_calls_batch)
+                                if tool_calls_batch:
+                                    saw_any_tool_call = True
+                                total_tool_calls += len(tool_calls_batch)
+                                tool_calls += _counted_tool_call_delta(tool_calls_batch)
                                 if tool_calls > max_tool_calls:
                                     raise StopRequested("max_tool_calls_exceeded")
                                 if tool_calls_batch:
-                                    raw_tool_name = tool_calls_batch[-1].get("name", "")
+                                    last_tool_call = (
+                                        tool_calls_batch[-1]
+                                        if isinstance(tool_calls_batch[-1], dict)
+                                        else {}
+                                    )
+                                    raw_tool_name = last_tool_call.get("name", "")
                                     if (
                                         isinstance(raw_tool_name, str)
                                         and raw_tool_name.strip()
                                     ):
                                         last_tool_name = raw_tool_name.strip()
+                                        raw_args = last_tool_call.get("args", {})
+                                        last_tool_summary = _tool_summary(
+                                            last_tool_name,
+                                            raw_args if isinstance(raw_args, dict) else {},
+                                        )
                                         current_activity = activity_from_tool_name(
                                             last_tool_name
                                         )
-                                        activity_detail = f"Using {last_tool_name}."
+                                        if last_tool_summary:
+                                            activity_detail = (
+                                                f"Using {last_tool_name}: {last_tool_summary}"
+                                            )
+                                        else:
+                                            activity_detail = f"Using {last_tool_name}."
                                 usage_input, usage_output = token_usage(message)
                                 accumulate_usage_by_model(
                                     usage_by_model,
@@ -240,14 +372,18 @@ async def run_subagent_worker(
                         progress_callback(
                             {
                                 "tool_calls": tool_calls,
+                                "total_tool_calls": total_tool_calls,
                                 "output_chars": output_chars,
                                 "report": (
                                     "Running: "
-                                    f"tool_calls={tool_calls}, output_chars={output_chars}."
+                                    "tool_calls="
+                                    f"{tool_calls}, total_tool_calls={total_tool_calls}, "
+                                    f"output_chars={output_chars}."
                                 ),
                                 "activity": current_activity,
                                 "activity_detail": activity_detail,
                                 "last_tool_name": last_tool_name,
+                                "last_tool_summary": last_tool_summary,
                             }
                         )
                         next_report_at = now_monotonic + report_interval
@@ -256,14 +392,20 @@ async def run_subagent_worker(
                         progress_callback(
                             {
                                 "tool_calls": tool_calls,
+                                "total_tool_calls": total_tool_calls,
                                 "output_chars": output_chars,
                                 "activity": current_activity,
                                 "activity_detail": activity_detail,
                                 "last_tool_name": last_tool_name,
+                                "last_tool_summary": last_tool_summary,
                             }
                         )
                         next_heartbeat_at = now_monotonic + heartbeat_interval_s
             finally:
+                if pending_chunk is not None:
+                    pending_chunk.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await pending_chunk
                 aclose = getattr(stream, "aclose", None)
                 if callable(aclose):
                     try:
@@ -280,6 +422,7 @@ async def run_subagent_worker(
                 "status": status,
                 "stop_reason": exc.reason,
                 "tool_calls": tool_calls,
+                "total_tool_calls": total_tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,
             }
@@ -292,6 +435,7 @@ async def run_subagent_worker(
                 "status": "failed",
                 "error": str(exc),
                 "tool_calls": tool_calls,
+                "total_tool_calls": total_tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,
             }
@@ -301,10 +445,55 @@ async def run_subagent_worker(
             final_output = fallback_text.strip()
         if len(final_output) > _MAX_STORED_FINAL_OUTPUT_CHARS:
             final_output = final_output[: _MAX_STORED_FINAL_OUTPUT_CHARS - 3] + "..."
+        if not saw_any_tool_call:
+            if settings.sub_agent_require_tool_call:
+                error_message = (
+                    "Sub-agent finished without calling any tools. "
+                    "Treating this as a no-op worker result."
+                )
+                update_observation(
+                    trace_scope.observation,
+                    output={
+                        "status": "failed",
+                        "error": error_message,
+                        "final_output_preview": preview_text(
+                            final_output,
+                            _MAX_FINAL_OUTPUT_PREVIEW_CHARS,
+                        ),
+                    },
+                )
+                return {
+                    "status": "failed",
+                    "error": error_message,
+                    "tool_calls": tool_calls,
+                    "total_tool_calls": total_tool_calls,
+                    "output_chars": output_chars,
+                    "usage_by_model": usage_by_model,
+                }
+            if not final_output:
+                error_message = (
+                    "Sub-agent finished without calling tools and produced no final output."
+                )
+                update_observation(
+                    trace_scope.observation,
+                    output={
+                        "status": "failed",
+                        "error": error_message,
+                    },
+                )
+                return {
+                    "status": "failed",
+                    "error": error_message,
+                    "tool_calls": tool_calls,
+                    "total_tool_calls": total_tool_calls,
+                    "output_chars": output_chars,
+                    "usage_by_model": usage_by_model,
+                }
         result = {
             "status": "completed",
             "final_output": final_output,
             "tool_calls": tool_calls,
+            "total_tool_calls": total_tool_calls,
             "output_chars": output_chars,
             "usage_by_model": usage_by_model,
         }
@@ -422,13 +611,10 @@ def task_with_feedback(
     return "\n\n".join(parts)
 
 
-def next_stream_timeout_s(
+def next_stream_poll_timeout_s(
     *,
     elapsed: float,
     max_runtime_s: float,
-    stall_timeout_s: float,
 ) -> float:
     remaining_runtime = max(max_runtime_s - elapsed, 0.0)
-    if stall_timeout_s <= 0:
-        return remaining_runtime
-    return min(remaining_runtime, stall_timeout_s)
+    return min(remaining_runtime, _STREAM_POLL_INTERVAL_S)

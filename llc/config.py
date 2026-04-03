@@ -260,8 +260,17 @@ class Settings(BaseModel, frozen=True):
     sub_agent_stall_timeout_s: int = Field(default=45, ge=5, le=3600)
     sub_agent_stop_grace_s: int = Field(default=15, ge=1, le=300)
     sub_agent_max_tool_calls: int = Field(default=80, ge=1, le=2000)
+    sub_agent_require_tool_call: bool = False
     sub_agent_wait_timeout_ms: int = Field(default=1200, ge=100, le=60000)
     sub_agent_context_messages: int = Field(default=8, ge=1, le=20)
+    sub_agent_team_status_interval_cycles: int = Field(default=4, ge=1, le=500)
+    sub_agent_shared_notes_interval_cycles: int = Field(default=6, ge=1, le=500)
+    sub_agent_lock_default_lease_s: int = Field(default=120, ge=5, le=3600)
+    sub_agent_lock_renew_s: int = Field(default=30, ge=5, le=1200)
+    sub_agent_lock_near_expiry_s: int = Field(default=20, ge=1, le=600)
+    sub_agent_shared_notes_max_entries: int = Field(default=40, ge=1, le=500)
+    sub_agent_inbox_read_max: int = Field(default=8, ge=1, le=100)
+    sub_agent_debug_logging: bool = False
     shell_timeout: int = 120
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
@@ -300,8 +309,29 @@ class Settings(BaseModel, frozen=True):
             sub_agent_stall_timeout_s=_env_int("SUB_AGENT_STALL_TIMEOUT_S", 45),
             sub_agent_stop_grace_s=_env_int("SUB_AGENT_STOP_GRACE_S", 15),
             sub_agent_max_tool_calls=_env_int("SUB_AGENT_MAX_TOOL_CALLS", 80),
+            sub_agent_require_tool_call=_env_bool("SUB_AGENT_REQUIRE_TOOL_CALL", default=False),
             sub_agent_wait_timeout_ms=_env_int("SUB_AGENT_WAIT_TIMEOUT_MS", 1200),
             sub_agent_context_messages=_env_int("SUB_AGENT_CONTEXT_MESSAGES", 8),
+            sub_agent_team_status_interval_cycles=_env_int(
+                "SUB_AGENT_TEAM_STATUS_INTERVAL_CYCLES",
+                4,
+            ),
+            sub_agent_shared_notes_interval_cycles=_env_int(
+                "SUB_AGENT_SHARED_NOTES_INTERVAL_CYCLES",
+                6,
+            ),
+            sub_agent_lock_default_lease_s=_env_int(
+                "SUB_AGENT_LOCK_DEFAULT_LEASE_S",
+                120,
+            ),
+            sub_agent_lock_renew_s=_env_int("SUB_AGENT_LOCK_RENEW_S", 30),
+            sub_agent_lock_near_expiry_s=_env_int("SUB_AGENT_LOCK_NEAR_EXPIRY_S", 20),
+            sub_agent_shared_notes_max_entries=_env_int(
+                "SUB_AGENT_SHARED_NOTES_MAX_ENTRIES",
+                40,
+            ),
+            sub_agent_inbox_read_max=_env_int("SUB_AGENT_INBOX_READ_MAX", 8),
+            sub_agent_debug_logging=_env_bool("SUB_AGENT_DEBUG_LOGGING", default=False),
             api_host=os.getenv("LLC_API_HOST", "127.0.0.1"),
             api_port=_env_int("LLC_API_PORT", 8000),
             api_allowed_origins=_env_csv(

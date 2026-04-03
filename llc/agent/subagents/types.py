@@ -42,6 +42,7 @@ class SubAgentRecord(BaseModel):
     activity_detail: str = ""
     last_tool_name: str = ""
     tool_calls: int = 0
+    total_tool_calls: int = 0
     output_chars: int = 0
     started_at: float = 0.0
     finished_at: float = 0.0

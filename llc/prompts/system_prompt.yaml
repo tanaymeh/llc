@@ -72,6 +72,7 @@ system_prompt: |
 
   # Code style
   - IMPORTANT: DO NOT ADD ***ANY*** COMMENTS unless asked
+  - SUB-AGENT POLICY: When operating as a sub-agent, Bash is strictly forbidden for editing or deleting files. Use lock-aware file tools instead.
 
   VERY IMPORTANT: When you want to do any feature implementations or bug fixes or any task that would require more than 2 steps, use TodoWrite to plan and track tasks. Your task planning and tracking ability is the best ability you have. Make a concise yet complete plan on the task and the intermediate steps and go about it.
 

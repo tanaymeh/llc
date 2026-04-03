@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import sys
 import time
@@ -8,6 +9,7 @@ from queue import Empty
 from threading import RLock
 from typing import Any, Callable
 
+from llc.agent.subagents.coordination import AgentCoordinationLayer
 from llc.agent.subagents.reporting import (
     record_snapshot,
     preview_text,
@@ -22,6 +24,7 @@ from llc.agent.subagents.worker_runner import (
     task_with_feedback,
 )
 from llc.config import Settings
+from llc.logging_utils import render_kv
 from llc.observability import capture_parent_context
 from llc.service.prompt_registry import PromptRegistry
 
@@ -33,6 +36,36 @@ _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REPORT_WORKERS = 8
 _MAX_ACTIVITY_PREVIEW_CHARS = 80
 _WAIT_POLL_INTERVAL_S = 0.1
+_TOOL_LOOP_LOG_INTERVAL = 5
+_COORDINATION_TOOL_NAMES = {
+    "SendMessage",
+    "ReadInbox",
+    "ReadTeamStatus",
+    "ReadSharedNotes",
+    "AppendSharedNote",
+    "RequestLock",
+    "ReleaseLock",
+    "ReviewHeldLocks",
+    "RespondLockReview",
+}
+_LOGGER = logging.getLogger("llc.subagents.runtime")
+
+
+def _coordination_config(settings: Settings) -> dict[str, Any]:
+    return {
+        "debug_logging": bool(settings.sub_agent_debug_logging),
+        "team_status_interval_cycles": int(
+            settings.sub_agent_team_status_interval_cycles
+        ),
+        "shared_notes_interval_cycles": int(
+            settings.sub_agent_shared_notes_interval_cycles
+        ),
+        "lock_default_lease_s": int(settings.sub_agent_lock_default_lease_s),
+        "lock_renew_s": int(settings.sub_agent_lock_renew_s),
+        "lock_near_expiry_s": int(settings.sub_agent_lock_near_expiry_s),
+        "shared_notes_max_entries": int(settings.sub_agent_shared_notes_max_entries),
+        "inbox_read_max": int(settings.sub_agent_inbox_read_max),
+    }
 
 
 class SubAgentRuntime:
@@ -41,16 +74,21 @@ class SubAgentRuntime:
         settings: Settings,
         build_subagent: SubAgentBuilder,
         prompt_registry: PromptRegistry | None = None,
+        launch_precheck: Callable[[], str | None] | None = None,
     ) -> None:
         self._settings = settings
         self._build_subagent = build_subagent
         self._prompt_registry = prompt_registry
+        self._launch_precheck = launch_precheck
         self._records: dict[str, SubAgentRecord] = {}
         self._lock = RLock()
         self._closed = False
         self._usage_input_tokens = 0
         self._usage_output_tokens = 0
         self._usage_by_model: dict[str, dict[str, int]] = {}
+        self._last_logged_tool_calls: dict[str, int] = {}
+        self._last_logged_tool_name: dict[str, str] = {}
+        self._same_tool_streak: dict[str, int] = {}
         main_file = getattr(sys.modules.get("__main__"), "__file__", "") or ""
         prefer_spawn = bool(main_file and not str(main_file).startswith("<"))
         if prefer_spawn:
@@ -60,16 +98,44 @@ class SubAgentRuntime:
                 self._mp_context = mp.get_context("fork")
             except ValueError:
                 self._mp_context = mp.get_context("spawn")
+        try:
+            self._coordination: AgentCoordinationLayer | None = AgentCoordinationLayer.create(
+                self._mp_context,
+                config=_coordination_config(settings),
+            )
+        except Exception:
+            self._coordination = None
+
+    def _debug_enabled(self) -> bool:
+        return bool(self._settings.sub_agent_debug_logging)
+
+    def _debug_log(self, event: str, **fields: Any) -> None:
+        if not self._debug_enabled():
+            return
+        kv = render_kv(fields)
+        if kv:
+            _LOGGER.info("[subagent-debug] event=%s %s", event, kv)
+            return
+        _LOGGER.info("[subagent-debug] event=%s", event)
 
     def update_settings(self, settings: Settings) -> None:
         with self._lock:
             self._settings = settings
+            if self._coordination is not None:
+                self._coordination.update_config(_coordination_config(settings))
+            self._debug_log(
+                "runtime_settings_updated",
+                sub_agent_mode_enabled=settings.sub_agent_mode_enabled,
+                max_sub_agents=settings.max_sub_agents,
+                debug_logging=settings.sub_agent_debug_logging,
+            )
 
     def shutdown(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            self._debug_log("runtime_shutdown_start")
             now = time.time()
             for record in self._records.values():
                 if record.status in ACTIVE_STATUSES or self._is_worker_alive_locked(record):
@@ -80,6 +146,15 @@ class SubAgentRuntime:
                     self._request_worker_stop_locked(record)
                     self._terminate_worker_process_locked(record)
                     self._cleanup_worker_handles_locked(record)
+                    if self._coordination is not None:
+                        self._coordination.mark_agent_stopped(
+                            agent_id=record.id,
+                            status="terminated",
+                        )
+            if self._coordination is not None:
+                self._coordination.shutdown()
+                self._coordination = None
+            self._debug_log("runtime_shutdown_complete")
 
     def launch_subagent(
         self,
@@ -96,6 +171,18 @@ class SubAgentRuntime:
         with self._lock:
             if self._closed:
                 return {"ok": False, "error": "Sub-agent runtime is not available."}
+            if self._launch_precheck is not None:
+                try:
+                    launch_error = (self._launch_precheck() or "").strip()
+                except Exception:
+                    launch_error = "Sub-agent launch preflight failed."
+                if launch_error:
+                    self._debug_log(
+                        "launch_subagent_blocked",
+                        source=source,
+                        reason=launch_error,
+                    )
+                    return {"ok": False, "error": launch_error}
             self._refresh_stuck_locked()
             active_count = self._active_count_locked()
             capacity_count = self._capacity_count_locked()
@@ -144,7 +231,23 @@ class SubAgentRuntime:
                 latest_report="Queued.",
             )
             self._records[subagent_id] = record
+            if self._coordination is not None:
+                self._coordination.register_agent(
+                    agent_id=subagent_id,
+                    name=selected_name,
+                    task=clean_task,
+                    spawned_by=source,
+                    status="running",
+                )
             self._submit_locked(record)
+            self._debug_log(
+                "launch_subagent",
+                subagent_id=subagent_id,
+                name=selected_name,
+                source=source,
+                active_count=self._active_count_locked(),
+                max_sub_agents=self._settings.max_sub_agents,
+            )
             snapshot = self._record_snapshot_locked(record)
             snapshot["ok"] = True
             return snapshot
@@ -253,11 +356,24 @@ class SubAgentRuntime:
                 record.updated_at = time.time()
                 record.stop_requested_at = record.updated_at
                 self._request_worker_stop_locked(record)
+                if self._coordination is not None:
+                    self._coordination.update_agent(
+                        agent_id=subagent_id,
+                        status="restarting",
+                        task=record.task,
+                        heartbeat=True,
+                    )
             else:
                 self._restart_with_feedback_locked(record)
 
             snapshot = self._record_snapshot_locked(record)
             snapshot["ok"] = True
+            self._debug_log(
+                "revise_subagent",
+                subagent_id=subagent_id,
+                source=source,
+                status=record.status,
+            )
             return snapshot
 
     def interrupt_subagent(
@@ -304,6 +420,12 @@ class SubAgentRuntime:
                 record.updated_at = time.time()
                 record.stop_requested_at = record.updated_at
                 self._request_worker_stop_locked(record)
+                if self._coordination is not None:
+                    self._coordination.update_agent(
+                        agent_id=subagent_id,
+                        status=record.status,
+                        heartbeat=True,
+                    )
             else:
                 record.terminate_requested = True
                 record.status = "terminated"
@@ -316,9 +438,20 @@ class SubAgentRuntime:
                 record.updated_at = time.time()
                 self._terminate_worker_process_locked(record)
                 self._cleanup_worker_handles_locked(record)
+                if self._coordination is not None:
+                    self._coordination.mark_agent_stopped(
+                        agent_id=subagent_id,
+                        status="terminated",
+                    )
 
             snapshot = self._record_snapshot_locked(record)
             snapshot["ok"] = True
+            self._debug_log(
+                "terminate_subagent",
+                subagent_id=subagent_id,
+                status=record.status,
+                reason=reason.strip(),
+            )
             return snapshot
 
     def _submit_locked(self, record: SubAgentRecord) -> None:
@@ -355,6 +488,11 @@ class SubAgentRuntime:
                 if record.parent_trace_id and record.parent_observation_id
                 else None
             ),
+            "coordination_handles": (
+                self._coordination.export_handles()
+                if self._coordination is not None
+                else None
+            ),
         }
         process = self._mp_context.Process(
             target=subagent_process_entry,
@@ -379,9 +517,35 @@ class SubAgentRuntime:
             record.current_activity = "Agent de-spawned"
             record.finished_at = time.time()
             self._close_worker_queue_safely(worker_queue)
+            if self._coordination is not None:
+                self._coordination.mark_agent_stopped(
+                    agent_id=record.id,
+                    status="failed",
+                )
+            self._debug_log(
+                "worker_start_failed",
+                subagent_id=record.id,
+                error=str(exc),
+            )
             return
         record.worker_process = process
         record.worker_queue = worker_queue
+        self._last_logged_tool_calls[record.id] = 0
+        self._last_logged_tool_name[record.id] = ""
+        self._same_tool_streak[record.id] = 0
+        self._debug_log(
+            "worker_started",
+            subagent_id=record.id,
+            attempt=record.attempt,
+            thread_id=record.thread_id,
+        )
+        if self._coordination is not None:
+            self._coordination.update_agent(
+                agent_id=record.id,
+                status="running",
+                task=record.task,
+                heartbeat=True,
+            )
 
     def _drain_worker_events_locked(self, record: SubAgentRecord) -> None:
         queue = record.worker_queue
@@ -411,14 +575,20 @@ class SubAgentRuntime:
         now = time.time()
         if event_type == "progress":
             tool_calls = max(int(event.get("tool_calls", 0) or 0), 0)
+            total_tool_calls = max(
+                int(event.get("total_tool_calls", tool_calls) or 0),
+                0,
+            )
             output_chars = max(int(event.get("output_chars", 0) or 0), 0)
             report = str(event.get("report", "") or "")
             activity = str(event.get("activity", "") or "")
             activity_detail = str(event.get("activity_detail", "") or "")
             last_tool_name = str(event.get("last_tool_name", "") or "")
+            last_tool_summary = str(event.get("last_tool_summary", "") or "")
             record.updated_at = now
             record.last_activity_at = now
             record.tool_calls = max(record.tool_calls, tool_calls)
+            record.total_tool_calls = max(record.total_tool_calls, total_tool_calls)
             record.output_chars = max(record.output_chars, output_chars)
             if report:
                 record.latest_report = preview_text(report, _MAX_REPORT_PREVIEW_CHARS)
@@ -434,11 +604,59 @@ class SubAgentRuntime:
                     last_tool_name,
                     _MAX_ACTIVITY_PREVIEW_CHARS,
                 )
+            previous_tool_calls = int(self._last_logged_tool_calls.get(record.id, 0) or 0)
+            if tool_calls > previous_tool_calls:
+                self._last_logged_tool_calls[record.id] = tool_calls
+                current_tool_name = (last_tool_name or "").strip()
+                previous_tool_name = self._last_logged_tool_name.get(record.id, "")
+                if current_tool_name and current_tool_name == previous_tool_name:
+                    streak = int(self._same_tool_streak.get(record.id, 1) or 1) + 1
+                else:
+                    streak = 1
+                self._same_tool_streak[record.id] = streak
+                self._last_logged_tool_name[record.id] = current_tool_name
+                is_coordination_tool = current_tool_name in _COORDINATION_TOOL_NAMES
+                is_first_tool_log = previous_tool_name == ""
+                is_non_coordination_loop_tick = (
+                    not is_coordination_tool
+                    and current_tool_name == previous_tool_name
+                    and streak % _TOOL_LOOP_LOG_INTERVAL == 0
+                )
+                should_log = (
+                    is_coordination_tool
+                    or is_first_tool_log
+                    or is_non_coordination_loop_tick
+                )
+                if should_log:
+                    self._debug_log(
+                        "worker_tool_call",
+                        subagent_id=record.id,
+                        attempt=record.attempt,
+                        tool_name=current_tool_name or "unknown",
+                        tool_summary=last_tool_summary or None,
+                        same_tool_streak=streak if streak > 1 else None,
+                        tool_calls=tool_calls,
+                        total_tool_calls=total_tool_calls,
+                        activity=record.current_activity,
+                    )
+            if self._coordination is not None:
+                self._coordination.update_agent(
+                    agent_id=record.id,
+                    status=record.status,
+                    task=record.task,
+                    heartbeat=True,
+                )
             return
         if event_type == "result":
             payload = event.get("result")
             result = payload if isinstance(payload, dict) else {}
             record.worker_result_received = True
+            self._debug_log(
+                "worker_result_received",
+                subagent_id=record.id,
+                attempt=record.attempt,
+                status=str(result.get("status", "")).strip(),
+            )
             self._apply_worker_result_locked(record, result)
 
     def _apply_worker_result_locked(self, record: SubAgentRecord, result: dict[str, Any]) -> None:
@@ -456,6 +674,16 @@ class SubAgentRuntime:
         record.error = str(result.get("error", "") or "")
         record.final_output = str(result.get("final_output", "") or "")
         record.tool_calls = max(record.tool_calls, int(result.get("tool_calls", 0) or 0))
+        record.total_tool_calls = max(
+            record.total_tool_calls,
+            int(
+                result.get(
+                    "total_tool_calls",
+                    result.get("tool_calls", 0),
+                )
+                or 0
+            ),
+        )
         record.output_chars = max(
             record.output_chars,
             int(result.get("output_chars", 0) or 0),
@@ -483,6 +711,25 @@ class SubAgentRuntime:
             record.latest_report = "Stopped."
             record.activity_detail = "Stopped before completion."
         record.current_activity = "Agent de-spawned"
+        self._last_logged_tool_calls.pop(record.id, None)
+        self._last_logged_tool_name.pop(record.id, None)
+        self._same_tool_streak.pop(record.id, None)
+        self._debug_log(
+            "worker_finished",
+            subagent_id=record.id,
+            attempt=record.attempt,
+            status=record.status,
+            stop_reason=record.stop_reason,
+            error=record.error,
+            tool_calls=record.tool_calls,
+            total_tool_calls=record.total_tool_calls,
+        )
+        if self._coordination is not None:
+            terminal_status = record.status if record.status in {"completed", "failed"} else "terminated"
+            self._coordination.mark_agent_stopped(
+                agent_id=record.id,
+                status=terminal_status,
+            )
 
     def _request_worker_stop_locked(self, record: SubAgentRecord) -> None:
         stop_event = record.stop_event
@@ -591,10 +838,24 @@ class SubAgentRuntime:
         if feedback:
             record.activity_detail = preview_text(feedback, _MAX_REPORT_PREVIEW_CHARS)
         record.last_tool_name = ""
+        self._debug_log(
+            "worker_restarting",
+            subagent_id=record.id,
+            attempt=record.attempt,
+        )
+        if self._coordination is not None:
+            self._coordination.update_agent(
+                agent_id=record.id,
+                status="restarting",
+                task=record.task,
+                heartbeat=True,
+            )
         self._submit_locked(record)
 
     def _refresh_stuck_locked(self) -> None:
         now = time.time()
+        if self._coordination is not None:
+            self._coordination.sweep_expired_locks()
         max_runtime = float(self._settings.sub_agent_max_runtime_s)
         stall_timeout = float(self._settings.sub_agent_stall_timeout_s)
         stop_grace = float(self._settings.sub_agent_stop_grace_s)
@@ -615,6 +876,7 @@ class SubAgentRuntime:
                         "status": fallback_status,
                         "stop_reason": fallback_stop_reason,
                         "tool_calls": record.tool_calls,
+                        "total_tool_calls": record.total_tool_calls,
                         "output_chars": record.output_chars,
                         "usage_by_model": {},
                     }
@@ -623,6 +885,7 @@ class SubAgentRuntime:
                         "status": "failed",
                         "error": "Worker process exited without a result payload.",
                         "tool_calls": record.tool_calls,
+                        "total_tool_calls": record.total_tool_calls,
                         "output_chars": record.output_chars,
                         "usage_by_model": {},
                     }
@@ -654,6 +917,13 @@ class SubAgentRuntime:
                 record.updated_at = now
                 record.stop_requested_at = now
                 self._request_worker_stop_locked(record)
+                self._debug_log(
+                    "watchdog_stop_requested",
+                    subagent_id=record.id,
+                    reason=stop_reason,
+                    elapsed_s=round(elapsed, 2),
+                    idle_for_s=round(idle_for, 2),
+                )
                 continue
 
             if (
@@ -671,6 +941,7 @@ class SubAgentRuntime:
                     "status": "terminated",
                     "stop_reason": "revision_requested",
                     "tool_calls": record.tool_calls,
+                    "total_tool_calls": record.total_tool_calls,
                     "output_chars": record.output_chars,
                     "usage_by_model": {},
                 }
@@ -679,6 +950,7 @@ class SubAgentRuntime:
                     "status": "terminated",
                     "stop_reason": base_reason,
                     "tool_calls": record.tool_calls,
+                    "total_tool_calls": record.total_tool_calls,
                     "output_chars": record.output_chars,
                     "usage_by_model": {},
                 }
@@ -687,13 +959,19 @@ class SubAgentRuntime:
                     "status": "stuck",
                     "stop_reason": f"{base_reason}:unresponsive_after_stop",
                     "tool_calls": record.tool_calls,
+                    "total_tool_calls": record.total_tool_calls,
                     "output_chars": record.output_chars,
                     "usage_by_model": {},
                 }
             self._apply_worker_result_locked(record, forced)
+            self._debug_log(
+                "watchdog_forced_termination",
+                subagent_id=record.id,
+                reason=forced.get("stop_reason"),
+            )
 
     def _record_snapshot_locked(self, record: SubAgentRecord) -> dict[str, Any]:
-        return record_snapshot(
+        snapshot = record_snapshot(
             record,
             task_preview_chars=_MAX_TASK_PREVIEW_CHARS,
             activity_preview_chars=_MAX_ACTIVITY_PREVIEW_CHARS,
@@ -701,6 +979,9 @@ class SubAgentRuntime:
             error_preview_chars=_MAX_ERROR_PREVIEW_CHARS,
             final_output_preview_chars=_MAX_FINAL_OUTPUT_PREVIEW_CHARS,
         )
+        if self._coordination is not None:
+            snapshot.update(self._coordination.coordination_snapshot_for_agent(record.id))
+        return snapshot
 
     def _active_count_locked(self) -> int:
         return sum(1 for record in self._records.values() if record.status in ACTIVE_STATUSES)

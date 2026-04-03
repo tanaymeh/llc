@@ -86,8 +86,19 @@ def record_snapshot(
     current_task = preview_text(record.task, task_preview_chars)
     if record.status in ACTIVE_STATUSES:
         current_activity = record.current_activity or "Running"
+    elif record.status == "completed":
+        current_activity = "Completed"
+    elif record.status == "failed":
+        failure = preview_text(record.error or "unknown error", activity_preview_chars)
+        current_activity = f"Failed: {failure}" if failure else "Failed"
+    elif record.status == "stuck":
+        reason = preview_text(record.stop_reason or "watchdog stop", activity_preview_chars)
+        current_activity = f"Stuck: {reason}" if reason else "Stuck"
+    elif record.status == "terminated":
+        reason = preview_text(record.stop_reason or "terminated", activity_preview_chars)
+        current_activity = f"Terminated: {reason}" if reason else "Terminated"
     else:
-        current_activity = "Agent de-spawned"
+        current_activity = "Inactive"
     activity_detail = record.activity_detail or record.latest_report
     snapshot: dict[str, Any] = {
         "id": record.id,
@@ -111,6 +122,7 @@ def record_snapshot(
             activity_preview_chars,
         ),
         "tool_calls": max(int(record.tool_calls or 0), 0),
+        "total_tool_calls": max(int(record.total_tool_calls or 0), 0),
         "output_chars": max(int(record.output_chars or 0), 0),
         "created_at": float(record.created_at or 0),
         "updated_at": float(record.updated_at or 0),

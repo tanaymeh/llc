@@ -26,6 +26,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Ordered post-turn hooks with explicit `blocking` opt-in (background by default)
 - Async `hook_update` runtime events plus expiring mission-control hook reminders
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers, process-isolated)
+- Sub-agent coordination layer with inbox messaging, shared notes, team status reads, and file lock leases
 - Optional Langfuse tracing for backend API turns, tools, and sub-agents
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 
@@ -126,6 +127,7 @@ This starts both containers:
 
 - backend API at `http://localhost:8000`
 - frontend dev server at `http://localhost:5173`
+- backend defaults to `SUB_AGENT_DEBUG_LOGGING=true` in compose, so sub-agent coordination/tool logs are visible in `make run` output
 
 Use an external workspace mount if needed:
 
@@ -183,9 +185,18 @@ Set values in `.env`:
 - `SUB_AGENT_MAX_RUNTIME_S`
 - `SUB_AGENT_STALL_TIMEOUT_S` (watchdog: max seconds without progress heartbeat)
 - `SUB_AGENT_STOP_GRACE_S` (watchdog grace after stop request before marked stuck)
-- `SUB_AGENT_MAX_TOOL_CALLS` (loop-budget cap per worker attempt)
+- `SUB_AGENT_MAX_TOOL_CALLS` (loop-budget cap per worker attempt; internal coordination and sub-agent control tools do not consume this budget)
+- `SUB_AGENT_REQUIRE_TOOL_CALL` (default `false`; when `true`, marks worker result as failed if it tries to complete without any tool use)
 - `SUB_AGENT_WAIT_TIMEOUT_MS` (default timeout for `WaitSubagents`; use `0` for unbounded)
 - `SUB_AGENT_CONTEXT_MESSAGES`
+- `SUB_AGENT_TEAM_STATUS_INTERVAL_CYCLES` (reserved; no runtime-forced reads by default)
+- `SUB_AGENT_SHARED_NOTES_INTERVAL_CYCLES` (reserved; no runtime-forced reads by default)
+- `SUB_AGENT_LOCK_DEFAULT_LEASE_S` (default: `120`; lock lease duration in seconds)
+- `SUB_AGENT_LOCK_RENEW_S` (lease extension duration for `KEEP` lock-review actions)
+- `SUB_AGENT_LOCK_NEAR_EXPIRY_S` (threshold for near-expiry lock review signal)
+- `SUB_AGENT_SHARED_NOTES_MAX_ENTRIES` (bounded retained shared notes)
+- `SUB_AGENT_INBOX_READ_MAX` (max messages per coordination inbox read)
+- `SUB_AGENT_DEBUG_LOGGING` (prints detailed sub-agent runtime/coordination/tool activity logs when enabled)
 - `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`)
 - `LLC_PROMPTS_DIR` (default: `llc/prompts`)
 - `LLC_API_HOST` (default: `127.0.0.1`)
@@ -226,6 +237,18 @@ TUI:
 - `/enable sub-agent-mode`
 - `/subagent {TASK}`
 - `exit` / `quit`
+
+## Sub-agent coordination behavior
+
+- Sub-agents can coordinate with dedicated tools (`SendMessage`, `ReadInbox`, `ReadTeamStatus`, `ReadSharedNotes`, `AppendSharedNote`).
+- Runtime-forced coordination is limited to unread inbox pulls (`ReadInbox`) and lock review checks (`ReviewHeldLocks`).
+- Worker tool budgets count user-task tools only; internal coordination tools and sub-agent control tools are tracked separately and do not consume `SUB_AGENT_MAX_TOOL_CALLS`.
+- `SendMessage` has an anti-spam guard: after 5 consecutive messages to the same teammate within 2 minutes, further sends are blocked for 120s with a system-ping response showing remaining cooldown.
+- File lock leases are available via `RequestLock`, `ReleaseLock`, `ReviewHeldLocks`, and `RespondLockReview`.
+- Mutating file tools (`Write`, `Edit`, `MultiEdit`, rewrite-mode `code_grep`) are lock-aware in sub-agent mode.
+- Bash is still available to sub-agents, but prompt policy strictly forbids using Bash to edit or delete files.
+- Launches now run a model-availability preflight. If `MODEL_NAME` is not available on the current provider, `LaunchSubagent`/`/subagent` returns a clear error instead of spawning a worker that fails immediately.
+- With `SUB_AGENT_DEBUG_LOGGING=true`, backend logs include sub-agent lifecycle events, tool invocations, forced coordination reads, inter-agent messages, lock lease decisions, and successful file-mutation events (`file_mutation_applied`).
 
 ## Docker
 

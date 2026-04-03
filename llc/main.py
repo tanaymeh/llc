@@ -8,6 +8,7 @@ from llc.commands.help import HelpCommand
 from llc.commands.model import ModelCommand
 from llc.commands.subagent import SubagentCommand
 from llc.config import Settings
+from llc.logging_utils import configure_logging
 from llc.service.api import create_api_app
 
 
@@ -75,6 +76,7 @@ def main() -> None:
         }
         if updates:
             settings = settings.model_copy(update=updates)
+    configure_logging(subagent_debug_logging=settings.sub_agent_debug_logging)
     registry = _build_registry()
     _run_api(settings, registry)
 

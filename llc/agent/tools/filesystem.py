@@ -1,6 +1,6 @@
 import fnmatch
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
@@ -8,7 +8,11 @@ from langchain_core.tools import BaseTool
 from llc.agent.tools._paths import resolve_workspace_path
 
 
-def make_filesystem_tools(workspace_root: Path) -> list[BaseTool]:
+def make_filesystem_tools(
+    workspace_root: Path,
+    *,
+    mutation_guard: Callable[[str], str | None] | None = None,
+) -> list[BaseTool]:
     @tool
     def Read(file_path: str, offset: Optional[int] = None, limit: Optional[int] = None) -> str:
         """Reads a file from the local filesystem. You can access any file directly by using this tool.
@@ -61,6 +65,10 @@ Usage:
 - NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
 - Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked."""
         target = resolve_workspace_path(workspace_root, file_path)
+        if mutation_guard is not None:
+            denial = mutation_guard(str(target))
+            if denial:
+                return f"Write blocked: {denial}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} characters to {file_path}"
