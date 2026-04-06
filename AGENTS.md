@@ -7,7 +7,7 @@
 - Whenever there is a new implementation or feature in this project, make sure the README.md is updated (concisely, no slop) and the `scripts/dev-docker.sh` (for building properly).
 - Experimental parallel sub-agent mode is implemented with an orchestrator + up to 5 workers (`llc/agent/subagents/`).
 - Worker agents are isolated: no worker-to-worker communication and no sub-agent-control tools in worker graphs.
-- Role behavior must be derived from the main `llc/prompts/system_prompt.yaml` (no separate role prompt files).
+- Role behavior must be derived from the main `llc/prompts/system_prompt.jinja` (no separate role prompt files).
 - Manual worker spawn command is `/subagent {TASK}` and mode toggle command is `/enable sub-agent-mode`.
 - Keep sub-agent reporting payloads compact to protect context length; avoid adding verbose per-worker tool transcripts to orchestrator-visible history.
 - For an in-depth design and status reference, see `PARALLEL_SUBAGENT_IMPLEMENTATION_REPORT.md`.

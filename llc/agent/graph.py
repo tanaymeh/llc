@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import Any, Callable, Literal
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -17,9 +17,6 @@ from llc.agent.state import AgentState
 from llc.agent.tools import collect_tools
 from llc.config import Settings
 
-if TYPE_CHECKING:
-    from llc.service.prompt_registry import PromptRegistry
-
 AgentRole = Literal["default", "orchestrator", "subagent"]
 _MAX_SNAPSHOT_WORKERS = 5
 ForcedToolCallProvider = Callable[[AgentState], dict[str, Any] | None]
@@ -27,36 +24,8 @@ ToolInvocationObserver = Callable[[str], None]
 _LOGGER = logging.getLogger("llc.subagents.graph")
 _MUTATION_TOOL_NAMES = {"Write", "Edit", "MultiEdit", "code_grep"}
 
-_ORCHESTRATOR_MODE_APPEND = (
-    "Mode: orchestrator.\n"
-    "You may complete work yourself.\n"
-    "Prefer delegation only when work is complex and cleanly divisible.\n"
-    "Use running worker reports before intervening.\n"
-    "If active workers exist, keep this response open until they finish.\n"
-    "Do not ask the user to poll for worker updates.\n"
-    "Always use the live worker snapshot in the system prompt for worker status.\n"
-    "When calling LaunchSubagent, always set a short, descriptive `name`.\n"
-    "Interrupt or terminate only when work is clearly off-track, unsafe, or stuck."
-)
 
-
-def _prompt_for_role(
-    settings: Settings,
-    role: AgentRole,
-    prompt_registry: PromptRegistry | None = None,
-) -> str:
-    base_prompt = settings.system_prompt.rstrip()
-    if role == "orchestrator" and settings.sub_agent_mode_enabled:
-        append = _ORCHESTRATOR_MODE_APPEND
-        if prompt_registry is not None:
-            try:
-                append = prompt_registry.get(
-                    "orchestrator_mode",
-                    key="orchestrator_mode_prompt",
-                )
-            except Exception:
-                append = _ORCHESTRATOR_MODE_APPEND
-        return f"{base_prompt}\n\n{append.strip()}"
+def _prompt_for_role(settings: Settings, role: AgentRole) -> str:
     if role == "subagent":
         return ""
     return settings.system_prompt
@@ -287,7 +256,6 @@ def build_agent_graph(
     *,
     role: AgentRole = "default",
     subagent_runtime: object | None = None,
-    prompt_registry: PromptRegistry | None = None,
     subagent_coordination: object | None = None,
     subagent_id: str = "",
 ):
@@ -301,7 +269,7 @@ def build_agent_graph(
     )
     model_with_tools = model.bind_tools(tools)
     tools_by_name = {t.name: t for t in tools}
-    system_prompt = _prompt_for_role(settings, role, prompt_registry)
+    system_prompt = _prompt_for_role(settings, role)
     runtime_status_provider = _runtime_status_provider(
         role,
         subagent_runtime,

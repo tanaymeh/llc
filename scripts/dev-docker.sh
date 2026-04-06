@@ -23,6 +23,7 @@ Notes:
   Session history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
   Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
+  Custom prompt dirs (`LLC_PROMPTS_DIR`) must include `prompt_manifest.yaml` and `.jinja` templates.
   Sub-agent watchdog/timing + coordination/locking knobs are read from `.env` (`SUB_AGENT_*`).
   Sub-agents run as isolated worker processes with shared coordination (inbox, team status, notes, file lock leases).
   Sub-agent launches include a model-availability preflight; if `MODEL_NAME` is unavailable on provider, launch is rejected with a clear error.

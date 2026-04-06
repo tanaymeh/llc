@@ -40,7 +40,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - `llc/service/api.py`: API app composition root
 - `llc/service/api_*.py`: engine manager, HTTP routes, websocket flow, and API models
 - `llc/storage/`: SQLite schema and async persistence layer
-- `llc/prompts/`: system/compact/runtime YAML prompts
+- `llc/prompts/`: `prompt_manifest.yaml` plus Jinja prompt templates
 - `llc-frontend/`: React frontend shell wired to live backend events
 
 ## Requirements
@@ -204,7 +204,9 @@ Set values in `.env`:
 - `LLC_API_ALLOWED_ORIGINS` (comma-separated list; default includes Vite localhost origins)
 - `LLC_API_SUBAGENT_REPORT_INTERVAL_S` (default: `1.0`)
 
-At startup, LLC appends a project snapshot inside the system prompt `<env>` block: current directory name, a bounded workspace tree, git-repo status, the latest 10 commits across local and remote refs when applicable, and the first 50 lines of the repo `README.md` when present.
+Custom prompt directories must include a `prompt_manifest.yaml` file and the referenced `.jinja` templates.
+
+At startup, LLC appends a project snapshot inside the system prompt `<env>` block: current directory name, a bounded workspace tree, git-repo status, and the latest 10 commits across local and remote refs when applicable.
 
 Local Langfuse stack variables (used by `docker-compose.langfuse.yml`) are also in `.env.example`, including:
 

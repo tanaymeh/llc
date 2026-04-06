@@ -151,7 +151,6 @@ def subagent_process_entry(
         agent = build_agent_graph(
             settings,
             role="subagent",
-            prompt_registry=prompt_registry,
             subagent_coordination=coordination_layer,
             subagent_id=subagent_id,
         )
@@ -249,7 +248,6 @@ async def run_subagent_worker(
                 "messages": [
                     SystemMessage(
                         content=render_subagent_system_prompt(
-                            settings,
                             prompt_registry,
                         )
                     ),
@@ -527,22 +525,19 @@ def stop_event_is_set(stop_event: Any) -> bool:
 
 
 def render_subagent_system_prompt(
-    settings: Settings,
     prompt_registry: PromptRegistry | None = None,
 ) -> str:
-    base_prompt = settings.system_prompt.rstrip()
     if prompt_registry is not None:
         try:
-            rendered = prompt_registry.get_formatted(
+            rendered = prompt_registry.get(
                 "subagent_mode",
                 key="subagent_mode_prompt",
-                base_prompt=base_prompt,
             ).strip()
             if rendered:
                 return rendered
         except Exception:
             pass
-    return base_prompt
+    return ""
 
 
 def render_subagent_task_message(

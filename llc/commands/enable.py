@@ -32,7 +32,6 @@ class EnableCommand(Command):
                 new_settings,
                 role="orchestrator",
                 subagent_runtime=ctx.subagent_runtime,
-                prompt_registry=ctx.prompt_registry,
             )
             ctx.settings = new_settings
             return CommandResult(

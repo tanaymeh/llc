@@ -3,17 +3,17 @@ import platform
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Mapping
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
-import yaml
 
-SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "system_prompt.yaml"
-COMPACT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "compact_prompt.yaml"
+from llc.service.prompt_templates import PromptTemplates
+
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+_PROMPT_TEMPLATES: dict[Path, PromptTemplates] = {}
 _TREE_MAX_DEPTH = 3
 _TREE_MAX_ENTRIES = 200
-_README_MAX_LINES = 50
 _GIT_LOG_MAX_COMMITS = 10
 _TREE_IGNORED_NAMES = {
     ".git",
@@ -32,25 +32,39 @@ _TREE_IGNORED_NAMES = {
 }
 
 
-def _load_prompt(path: Path, key: str) -> str:
-    if not path.exists():
-        raise FileNotFoundError(f"Prompt required at {path}")
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    prompt = data.get(key)
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError(
-            f"{path.relative_to(Path(__file__).resolve().parent)} must contain "
-            f"a non-empty '{key}' key"
-        )
-    return prompt.strip()
+def _prompt_templates(prompts_dir: Path) -> PromptTemplates:
+    resolved = prompts_dir.resolve()
+    cached = _PROMPT_TEMPLATES.get(resolved)
+    if cached is not None:
+        return cached
+    templates = PromptTemplates(resolved)
+    _PROMPT_TEMPLATES[resolved] = templates
+    return templates
 
 
-def _load_system_prompt(path: Path = SYSTEM_PROMPT_PATH) -> str:
-    return _load_prompt(path, "system_prompt")
+def _render_prompt(
+    prompts_dir: Path,
+    name: str,
+    *,
+    context: Mapping[str, Any] | None = None,
+) -> str:
+    return _prompt_templates(prompts_dir).render(name, context=context)
 
 
-def _load_compact_prompt(path: Path = COMPACT_PROMPT_PATH) -> str:
-    return _load_prompt(path, "compact_prompt")
+def _load_system_prompt(
+    prompts_dir: Path = PROMPTS_DIR,
+    *,
+    env_block: str = "",
+) -> str:
+    return _render_prompt(
+        prompts_dir,
+        "system_prompt",
+        context={"env_block": env_block},
+    )
+
+
+def _load_compact_prompt(prompts_dir: Path = PROMPTS_DIR) -> str:
+    return _render_prompt(prompts_dir, "compact_prompt")
 
 
 def _find_git_root(path: Path) -> Path | None:
@@ -134,16 +148,6 @@ def _build_directory_tree(root: Path) -> str:
     return "\n".join(lines)
 
 
-def _read_readme_preview(path: Path) -> str | None:
-    if not path.exists() or not path.is_file():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-    preview = lines[:_README_MAX_LINES]
-    return "\n".join(preview).strip() or None
-
 
 def _build_env_details(workspace_root: Path) -> str:
     git_root = _find_git_root(workspace_root)
@@ -182,20 +186,12 @@ def _build_env_details(workspace_root: Path) -> str:
                     git_log,
                 ]
             )
-        readme_preview = _read_readme_preview(git_root / "README.md")
-        if readme_preview:
-            lines.extend(
-                [
-                    "README.md preview (first 50 lines):",
-                    readme_preview,
-                ]
-            )
     return "\n".join(lines)
 
 
-def _with_env_details(system_prompt: str, workspace_root: Path) -> str:
+def _build_env_block(workspace_root: Path) -> str:
     env_details = _build_env_details(workspace_root)
-    return f"{system_prompt.rstrip()}\n\n<env>\n{env_details}\n</env>"
+    return f"<env>\n{env_details}\n</env>"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -285,8 +281,11 @@ class Settings(BaseModel, frozen=True):
         load_dotenv()
         workspace_root = Path.cwd().resolve()
         prompts_dir = _env_path("LLC_PROMPTS_DIR") or PROMPTS_DIR
-        system_prompt = _load_prompt(prompts_dir / "system_prompt.yaml", "system_prompt")
-        compact_prompt = _load_prompt(prompts_dir / "compact_prompt.yaml", "compact_prompt")
+        system_prompt = _load_system_prompt(
+            prompts_dir,
+            env_block=_build_env_block(workspace_root),
+        )
+        compact_prompt = _load_compact_prompt(prompts_dir)
         db_path = _env_path("LLC_DB_PATH") or (workspace_root / ".llc" / "sessions.db")
         return cls(
             model_name=os.getenv("MODEL_NAME", "gpt-4o-mini"),
@@ -297,10 +296,7 @@ class Settings(BaseModel, frozen=True):
             workspace_root=workspace_root,
             prompts_dir=prompts_dir,
             db_path=db_path,
-            system_prompt=_with_env_details(
-                system_prompt,
-                workspace_root,
-            ),
+            system_prompt=system_prompt,
             compact_prompt=compact_prompt,
             sub_agent_mode_enabled=_env_bool("SUB_AGENT_MODE_ENABLED", default=False),
             max_sub_agents=_env_int("MAX_SUB_AGENTS", 5),

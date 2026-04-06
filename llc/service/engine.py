@@ -158,7 +158,6 @@ class SessionEngine:
             build_subagent=lambda settings: build_agent_graph(
                 settings,
                 role="subagent",
-                prompt_registry=self._prompt_registry,
             ),
             prompt_registry=self._prompt_registry,
             launch_precheck=self._subagent_launch_precheck,
@@ -168,7 +167,6 @@ class SessionEngine:
             self._settings,
             role=role,
             subagent_runtime=self._subagent_runtime,
-            prompt_registry=self._prompt_registry,
         )
 
         self._available_models = await fetch_models(
@@ -317,7 +315,6 @@ class SessionEngine:
             agent=self._agent,
             thread_id=self._thread_id,
             subagent_runtime=self._subagent_runtime,
-            prompt_registry=self._prompt_registry,
         )
         result = await command.execute(args, context)
         self._settings = context.settings
