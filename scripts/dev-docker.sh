@@ -20,9 +20,10 @@ Notes:
   This helper runs backend API only in Docker.
   For full backend + frontend stack, use: `make run`.
   If you cloned without `--recurse-submodules`, initialize `llc-frontend/` first.
-  Session history persists in SQLite at /workspace/.llc/sessions.db by default.
+  Conversation history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
-  Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
+  Backend image builds install `uv` from PyPI; GHCR is not required for the Docker build.
+  Local Langfuse defaults to http://host.docker.internal:3000 in Docker (use `make langfuse-up` first for the pinned local stack).
   Custom prompt dirs (`LLC_PROMPTS_DIR`) must include `prompt_manifest.yaml` and `.jinja` templates.
   Sub-agent watchdog/timing + coordination/locking knobs are read from `.env` (`SUB_AGENT_*`).
   Sub-agents run as isolated worker processes with shared coordination (inbox, team status, notes, file lock leases).

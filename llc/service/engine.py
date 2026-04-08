@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -51,6 +52,7 @@ class SessionEngine:
         settings: Settings,
         registry: CommandRegistry,
         *,
+        conversation_id: str | None = None,
         session_id: str | None = None,
         store: Any | None = None,
         enable_langfuse_tracing: bool = False,
@@ -58,7 +60,8 @@ class SessionEngine:
         self._settings = settings
         self._registry = registry
         self._store = store
-        self._session_id = session_id or f"session-{uuid.uuid4().hex[:12]}"
+        requested_conversation_id = (conversation_id or session_id or "").strip()
+        self._conversation_id = requested_conversation_id or str(uuid.uuid4())
         self._thread_id = f"service-{uuid.uuid4().hex[:12]}"
         self._prompt_registry = PromptRegistry(settings.prompts_dir)
         self._subagent_runtime: SubAgentRuntime | None = None
@@ -90,8 +93,12 @@ class SessionEngine:
         self._async_event_subscribers: set[asyncio.Queue[Event]] = set()
 
     @property
+    def conversation_id(self) -> str:
+        return self._conversation_id
+
+    @property
     def session_id(self) -> str:
-        return self._session_id
+        return self._conversation_id
 
     @property
     def model_name(self) -> str:
@@ -148,12 +155,8 @@ class SessionEngine:
             }
         return runtime.get_subagent_report(include_all=include_all)
 
-    async def initialize(self) -> None:
-        if self._initialized:
-            return
-
-        self._turn_lock = asyncio.Lock()
-        self._subagent_runtime = SubAgentRuntime(
+    def _create_subagent_runtime(self) -> SubAgentRuntime:
+        return SubAgentRuntime(
             self._settings,
             build_subagent=lambda settings: build_agent_graph(
                 settings,
@@ -161,13 +164,84 @@ class SessionEngine:
             ),
             prompt_registry=self._prompt_registry,
             launch_precheck=self._subagent_launch_precheck,
+            conversation_id=self._conversation_id,
+            event_sink=self._schedule_subagent_event_persist,
+            message_sink=self._schedule_subagent_message_persist,
+            usage_sink=self._schedule_subagent_usage_persist,
         )
+
+    def _create_agent_graph(self) -> Any:
         role = "orchestrator" if self._settings.sub_agent_mode_enabled else "default"
-        self._agent = build_agent_graph(
+        return build_agent_graph(
             self._settings,
             role=role,
             subagent_runtime=self._subagent_runtime,
         )
+
+    def _reset_runtime_and_agent(self) -> None:
+        if self._subagent_runtime is not None:
+            self._subagent_runtime.shutdown()
+        self._subagent_runtime = self._create_subagent_runtime()
+        self._bind_subagent_runtime()
+        self._agent = self._create_agent_graph()
+
+    def _reset_usage_accumulators(self) -> None:
+        self._token_hook.session_input = 0
+        self._token_hook.session_output = 0
+        self._token_hook.session_cost = 0.0
+        if self._subagent_runtime is not None:
+            self._subagent_runtime.load_usage_totals({})
+
+    async def _restore_usage_accumulators(self) -> None:
+        self._reset_usage_accumulators()
+        if self._store is None:
+            return
+        aggregates = await self._store.aggregate_conversation_usage(self._conversation_id)
+        orchestrator_usage = aggregates.get("orchestrator", {})
+        self._token_hook.session_input = max(
+            int(orchestrator_usage.get("input_tokens", 0) or 0),
+            0,
+        )
+        self._token_hook.session_output = max(
+            int(orchestrator_usage.get("output_tokens", 0) or 0),
+            0,
+        )
+        self._token_hook.session_cost = max(
+            float(orchestrator_usage.get("cost", 0.0) or 0.0),
+            0.0,
+        )
+        if self._subagent_runtime is not None:
+            subagent_usage = aggregates.get("subagent", {})
+            by_model = subagent_usage.get("by_model", {})
+            self._subagent_runtime.load_usage_totals(
+                by_model if isinstance(by_model, dict) else {}
+            )
+
+    async def _cancel_hook_tasks(self) -> None:
+        tasks: list[asyncio.Task[Any]] = []
+        if self._hook_apply_task is not None and not self._hook_apply_task.done():
+            tasks.append(self._hook_apply_task)
+        tasks.extend(
+            task
+            for task in self._hook_runner_tasks.values()
+            if not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._hook_runner_tasks.clear()
+        self._hook_pending_jobs.clear()
+        self._hook_ready_results.clear()
+        self._hook_apply_task = None
+
+    async def initialize(self) -> None:
+        if self._initialized:
+            return
+
+        self._turn_lock = asyncio.Lock()
+        self._reset_runtime_and_agent()
 
         self._available_models = await fetch_models(
             base_url=self._settings.openai_base_url,
@@ -175,21 +249,15 @@ class SessionEngine:
         )
 
         if self._store is not None:
-            from llc.storage.models import SessionRecord
-
             await self._store.initialize()
-            existing = await self._store.get_session(self._session_id)
             now = time.time()
-            if existing is None:
-                await self._store.create_session(
-                    SessionRecord(
-                        id=self._session_id,
-                        model_name=self._settings.model_name,
-                        sub_agent_mode=self._settings.sub_agent_mode_enabled,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
+            await self._store.ensure_conversation(
+                self._conversation_id,
+                model_name=self._settings.model_name,
+                sub_agent_mode=self._settings.sub_agent_mode_enabled,
+                created_at=now,
+                updated_at=now,
+            )
         self._initialized = True
 
     async def shutdown(self) -> None:
@@ -247,7 +315,12 @@ class SessionEngine:
                 started = TurnStarted(turn_id=turn_id)
                 await self._persist_event(started, turn_id=turn_id)
                 yield started
-                await self._persist_message(role="user", content=text)
+                await self._persist_message(
+                    role="user",
+                    content=text,
+                    turn_id=turn_id,
+                    visible_to_orchestrator=True,
+                )
 
                 match = self._registry.match(text)
                 if match is not None:
@@ -277,26 +350,81 @@ class SessionEngine:
 
     async def restore_session(self, session_id: str) -> AsyncIterator[Event]:
         await self.initialize()
-        await self._apply_ready_hook_results()
-        if self._store is None:
-            event = ErrorOccurred(message="Session store is not configured.")
+        if self._turn_lock is None:
+            raise RuntimeError("Session engine lock was not initialized")
+
+        async with self._turn_lock:
+            await self._apply_ready_hook_results(lock_held=True)
+            requested_conversation_id = session_id.strip()
+            if requested_conversation_id != self._conversation_id:
+                event = ErrorOccurred(
+                    message=(
+                        "Restore target does not match this engine conversation. "
+                        "Switch to the target conversation engine first."
+                    )
+                )
+                await self._persist_event(event, turn_id="")
+                yield event
+                return
+            if self._store is None:
+                event = ErrorOccurred(message="Session store is not configured.")
+                await self._persist_event(event, turn_id="")
+                yield event
+                return
+            runtime = self._subagent_runtime
+            if runtime is not None:
+                try:
+                    active_subagents = int(
+                        runtime.get_subagent_report().get("active_count", 0) or 0
+                    )
+                except Exception:
+                    active_subagents = 0
+                if active_subagents > 0:
+                    event = ErrorOccurred(
+                        message="Cannot restore while sub-agents are still active."
+                    )
+                    await self._persist_event(event, turn_id="")
+                    yield event
+                    return
+
+            snapshot = await self._store.get_state_snapshot(self._conversation_id)
+            visible_messages = await self._store.list_conversation_messages(
+                self._conversation_id,
+                visible_to_orchestrator=True,
+            )
+            legacy_messages: list[Any] | None = None
+            if snapshot is not None:
+                try:
+                    parsed_snapshot = json.loads(snapshot.payload_json)
+                except Exception:
+                    parsed_snapshot = []
+                count = len(parsed_snapshot) if isinstance(parsed_snapshot, list) else 0
+            else:
+                count = len(visible_messages)
+            if count == 0:
+                legacy_messages = await self._store.get_legacy_messages(
+                    self._conversation_id
+                )
+                count = len(legacy_messages)
+            if count == 0:
+                event = ErrorOccurred(
+                    message=f"No session data found for `{self._conversation_id}`."
+                )
+                await self._persist_event(event, turn_id="")
+                yield event
+                return
+
+            await self._cancel_hook_tasks()
+            self._reset_runtime_and_agent()
+            await self._restore_messages_to_agent(legacy_messages)
+            await self._restore_usage_accumulators()
+            event = SessionRestored(
+                conversation_id=self._conversation_id,
+                session_id=self._conversation_id,
+                message_count=count,
+            )
             await self._persist_event(event, turn_id="")
             yield event
-            return
-
-        messages = await self._store.get_messages(session_id)
-        count = len(messages)
-        if count == 0:
-            event = ErrorOccurred(message=f"No session data found for `{session_id}`.")
-            await self._persist_event(event, turn_id="")
-            yield event
-            return
-
-        await self._restore_messages_to_agent(messages)
-        self._session_id = session_id
-        event = SessionRestored(session_id=session_id, message_count=count)
-        await self._persist_event(event, turn_id="")
-        yield event
 
     async def _run_command(
         self,
@@ -320,10 +448,11 @@ class SessionEngine:
         self._settings = context.settings
         self._agent = context.agent
         self._subagent_runtime = context.subagent_runtime
+        self._bind_subagent_runtime()
 
         if self._store is not None:
             await self._store.update_session(
-                self._session_id,
+                self._conversation_id,
                 model_name=self._settings.model_name,
                 sub_agent_mode=self._settings.sub_agent_mode_enabled,
                 updated_at=time.time(),
@@ -338,7 +467,13 @@ class SessionEngine:
         yield event
 
         if result.message:
-            await self._persist_message(role="assistant", content=result.message)
+            await self._persist_message(
+                role="assistant",
+                content=result.message,
+                turn_id=turn_id,
+                message_kind="command",
+                visible_to_orchestrator=True,
+            )
 
         spawned_subagent_id = str(result.data.get("spawned_subagent_id", "")).strip()
         if (
@@ -368,6 +503,7 @@ class SessionEngine:
         completed = TurnCompleted(input_tokens=0, output_tokens=0)
         await self._persist_event(completed, turn_id=turn_id)
         yield completed
+        await self._persist_orchestrator_snapshot()
 
     async def _stream_agent_response(
         self,
@@ -482,6 +618,77 @@ class SessionEngine:
         task = asyncio.create_task(self._persist_event(event, turn_id=turn_id))
         self._track_background_task(task)
 
+    def _bind_subagent_runtime(self) -> None:
+        runtime = self._subagent_runtime
+        if runtime is None:
+            return
+        runtime.set_conversation_id(self._conversation_id)
+        runtime.set_artifact_sinks(
+            event_sink=self._schedule_subagent_event_persist,
+            message_sink=self._schedule_subagent_message_persist,
+            usage_sink=self._schedule_subagent_usage_persist,
+        )
+        runtime.update_settings(self._settings)
+
+    def _schedule_store_persist(self, coro: Any) -> None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            return
+        self._track_background_task(task)
+
+    def _schedule_subagent_event_persist(self, **payload: Any) -> None:
+        if self._store is None:
+            return
+        self._schedule_store_persist(
+            self._persist_event(
+                turn_id=str(payload.get("turn_id", "") or ""),
+                actor_kind=str(payload.get("actor_kind", "") or "subagent"),
+                actor_id=str(payload.get("actor_id", "") or ""),
+                event_type=str(payload.get("event_type", "") or ""),
+                payload=payload.get("payload")
+                if isinstance(payload.get("payload"), dict)
+                else {},
+                langfuse_trace_id=str(payload.get("langfuse_trace_id", "") or ""),
+            )
+        )
+
+    def _schedule_subagent_message_persist(self, **payload: Any) -> None:
+        if self._store is None:
+            return
+        raw_tool_calls = payload.get("tool_calls")
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else None
+        self._schedule_store_persist(
+            self._persist_message(
+                role=str(payload.get("role", "") or "assistant"),
+                content=str(payload.get("content", "") or ""),
+                tool_calls=tool_calls,
+                usage_input_tokens=int(payload.get("usage_input_tokens", 0) or 0),
+                usage_output_tokens=int(payload.get("usage_output_tokens", 0) or 0),
+                actor_kind=str(payload.get("actor_kind", "") or "subagent"),
+                actor_id=str(payload.get("actor_id", "") or ""),
+                turn_id=str(payload.get("turn_id", "") or ""),
+                message_kind=str(payload.get("message_kind", "") or "chat"),
+                tool_call_id=str(payload.get("tool_call_id", "") or ""),
+                visible_to_orchestrator=bool(
+                    payload.get("visible_to_orchestrator", False)
+                ),
+                langfuse_trace_id=str(payload.get("langfuse_trace_id", "") or ""),
+            )
+        )
+
+    def _schedule_subagent_usage_persist(self, **payload: Any) -> None:
+        if self._store is None:
+            return
+        self._schedule_store_persist(
+            self._persist_usage(
+                input_tokens=int(payload.get("input_tokens", 0) or 0),
+                output_tokens=int(payload.get("output_tokens", 0) or 0),
+                actor_kind=str(payload.get("actor_kind", "") or "subagent"),
+                actor_id=str(payload.get("actor_id", "") or ""),
+            )
+        )
+
     def _build_subagent_status_event(
         self,
         *,
@@ -526,6 +733,13 @@ class SessionEngine:
         tool_calls: list[dict[str, Any]] | None = None,
         usage_input_tokens: int = 0,
         usage_output_tokens: int = 0,
+        actor_kind: str = "orchestrator",
+        actor_id: str = "orchestrator",
+        turn_id: str = "",
+        message_kind: str = "chat",
+        tool_call_id: str = "",
+        visible_to_orchestrator: bool = False,
+        langfuse_trace_id: str = "",
     ) -> None:
         await engine_persistence.persist_message(
             self,
@@ -534,6 +748,13 @@ class SessionEngine:
             tool_calls=tool_calls,
             usage_input_tokens=usage_input_tokens,
             usage_output_tokens=usage_output_tokens,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            turn_id=turn_id,
+            message_kind=message_kind,
+            tool_call_id=tool_call_id,
+            visible_to_orchestrator=visible_to_orchestrator,
+            langfuse_trace_id=langfuse_trace_id,
         )
 
     async def _persist_usage(
@@ -541,15 +762,41 @@ class SessionEngine:
         *,
         input_tokens: int,
         output_tokens: int,
+        actor_kind: str = "orchestrator",
+        actor_id: str = "orchestrator",
     ) -> None:
         await engine_persistence.persist_usage(
             self,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
         )
 
-    async def _persist_event(self, event: Event, *, turn_id: str) -> None:
-        await engine_persistence.persist_event(self, event, turn_id=turn_id)
+    async def _persist_event(
+        self,
+        event: Event | None = None,
+        *,
+        turn_id: str,
+        actor_kind: str | None = None,
+        actor_id: str | None = None,
+        event_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+        langfuse_trace_id: str = "",
+    ) -> None:
+        await engine_persistence.persist_event(
+            self,
+            event,
+            turn_id=turn_id,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            event_type=event_type,
+            payload=payload,
+            langfuse_trace_id=langfuse_trace_id,
+        )
 
-    async def _restore_messages_to_agent(self, records: list[Any]) -> None:
+    async def _persist_orchestrator_snapshot(self) -> None:
+        await engine_persistence.persist_orchestrator_snapshot(self)
+
+    async def _restore_messages_to_agent(self, records: list[Any] | None = None) -> None:
         await engine_persistence.restore_messages_to_agent(self, records)

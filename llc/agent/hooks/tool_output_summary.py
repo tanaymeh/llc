@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, 
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from llc.agent.llm import build_chat_model
+from llc.agent.llm_retry import ainvoke_with_retry
 from llc.agent.message_utils import message_text
 from llc.config import Settings
 from llc.observability import build_langchain_config, start_child_span, update_observation
@@ -158,22 +159,14 @@ async def _summarize_tool_output(
             "llc_model_name": compact_model_name,
             "llc_tool_name": tool_name,
         },
+        as_type="generation",
+        model_name=compact_model_name,
     ) as summary_span:
-        if run_config:
-            response = await model.ainvoke(
-                [
-                    SystemMessage(content=_TOOL_SUMMARY_PROMPT),
-                    request,
-                ],
-                config=run_config,
-            )
-        else:
-            response = await model.ainvoke(
-                [
-                    SystemMessage(content=_TOOL_SUMMARY_PROMPT),
-                    request,
-                ]
-            )
+        response = await ainvoke_with_retry(
+            model,
+            [SystemMessage(content=_TOOL_SUMMARY_PROMPT), request],
+            config=run_config,
+        )
 
     summary = message_text(response.content, include_reasoning=True).strip()
     if len(summary) > _MAX_TOOL_SUMMARY_OUTPUT_CHARS:

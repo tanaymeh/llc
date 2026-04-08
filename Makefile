@@ -24,7 +24,16 @@ run-backend:
 	@"$(DOCKER_SCRIPT)" "$(WORKSPACE)"
 
 langfuse-up:
-	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" up -d
+	@set -a; \
+	if [ -f "$(ROOT_DIR)/.env" ]; then . "$(ROOT_DIR)/.env"; fi; \
+	if [ -z "$${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-}" ]; then \
+		LANGFUSE_INIT_PROJECT_PUBLIC_KEY="$${LANGFUSE_PUBLIC_KEY:-pk-lf-llc-local-public-key}"; \
+	fi; \
+	if [ -z "$${LANGFUSE_INIT_PROJECT_SECRET_KEY:-}" ]; then \
+		LANGFUSE_INIT_PROJECT_SECRET_KEY="$${LANGFUSE_SECRET_KEY:-sk-lf-llc-local-secret-key}"; \
+	fi; \
+	export LANGFUSE_INIT_PROJECT_PUBLIC_KEY LANGFUSE_INIT_PROJECT_SECRET_KEY; \
+	docker compose -f "$(LANGFUSE_COMPOSE_FILE)" up -d
 
 langfuse-down:
 	@docker compose -f "$(LANGFUSE_COMPOSE_FILE)" down

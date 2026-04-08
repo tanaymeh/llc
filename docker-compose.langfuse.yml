@@ -1,6 +1,6 @@
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
+    image: docker.io/langfuse/langfuse-worker:3.163.0
     restart: unless-stopped
     depends_on:
       postgres:
@@ -43,7 +43,7 @@ services:
       REDIS_AUTH: ${REDIS_AUTH:-myredissecret}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
+    image: docker.io/langfuse/langfuse:3.163.0
     restart: unless-stopped
     depends_on:
       postgres:

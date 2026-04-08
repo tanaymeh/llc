@@ -14,11 +14,11 @@ LLC is a local coding agent runtime with:
 - a backend API service (default runtime),
 - and a React mission-control frontend (Git submodule at `llc-frontend/`).
 
-The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists sessions in SQLite.
+The backend runs a LangGraph agent loop, streams typed events, tracks token usage/cost, and persists conversations in SQLite.
 
 ## What it includes
 
-- Backend API with WebSocket event streaming (`/api/ws/{session_id}`)
+- Backend API with WebSocket event streaming (`/api/ws/{conversation_id}`)
 - React mission-control web UI (`llc-frontend/`)
 - Markdown-rendered agent responses in mission-control UI (GFM tables, task lists, code blocks)
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
@@ -27,7 +27,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Async `hook_update` runtime events plus expiring mission-control hook reminders
 - Optional orchestrator + parallel worker sub-agent mode (max 5 workers, process-isolated)
 - Sub-agent coordination layer with inbox messaging, shared notes, team status reads, and file lock leases
-- Optional Langfuse tracing for backend API turns, tools, and sub-agents
+- Optional Langfuse tracing with one canonical UUID4 conversation id, live sub-agent traces, and persisted orchestrator/sub-agent transcripts
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
 
 ## Implementation overview
@@ -35,7 +35,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - `llc/main.py`: backend API entrypoint (`serve` optional for backward compatibility)
 - `llc/agent/`: LangGraph graph, nodes, tool collection, compaction, sub-agent runtime
 - `llc/agent/subagents/`: runtime facade + worker runner + reporting/usage helpers
-- `llc/service/engine.py`: session orchestration facade
+- `llc/service/engine.py`: conversation orchestration facade
 - `llc/service/engine_*.py`: hook runtime, streaming runtime, and persistence helpers
 - `llc/service/api.py`: API app composition root
 - `llc/service/api_*.py`: engine manager, HTTP routes, websocket flow, and API models
@@ -92,13 +92,21 @@ Start local Langfuse in a separate stack:
 make langfuse-up
 ```
 
-Open `http://localhost:3000` and inspect traces while the LLC backend is running.
+Open `http://localhost:3000` and inspect traces while the LLC backend is running. The local stack is pinned to Langfuse `3.163.0`; the Python SDK is pinned to `langfuse==4.0.6`.
+If `.env` omits `LANGFUSE_INIT_PROJECT_PUBLIC_KEY` / `LANGFUSE_INIT_PROJECT_SECRET_KEY`, `make langfuse-up` will automatically reuse `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` so the local bootstrap project matches the LLC backend client config.
 
 Useful commands:
 
 ```bash
 make langfuse-logs
 make langfuse-down
+```
+
+If the backend logs a Langfuse `401 Invalid credentials` warning, the base URL is reachable but the configured project keys do not match the running Langfuse stack. Update `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` in `.env`, or recreate the local stack and bootstrap project with:
+
+```bash
+docker compose -f docker-compose.langfuse.yml down -v
+make langfuse-up
 ```
 
 LLC backend target URL:
@@ -183,7 +191,9 @@ Set values in `.env`:
 - `MAX_SUB_AGENTS` (hard-capped to `5`)
 - `SUB_AGENT_REPORT_INTERVAL_S`
 - `SUB_AGENT_MAX_RUNTIME_S`
-- `SUB_AGENT_STALL_TIMEOUT_S` (watchdog: max seconds without progress heartbeat)
+- `SUB_AGENT_STALL_TIMEOUT_S` (legacy fallback; prefer the two below)
+- `SUB_AGENT_LLM_STALL_TIMEOUT_S` (watchdog: max seconds waiting for LLM response before marking stuck; default 45)
+- `SUB_AGENT_TOOL_STALL_TIMEOUT_S` (watchdog: max seconds waiting for tool execution before marking stuck; default 300)
 - `SUB_AGENT_STOP_GRACE_S` (watchdog grace after stop request before marked stuck)
 - `SUB_AGENT_MAX_TOOL_CALLS` (loop-budget cap per worker attempt; internal coordination and sub-agent control tools do not consume this budget)
 - `SUB_AGENT_REQUIRE_TOOL_CALL` (default `false`; when `true`, marks worker result as failed if it tries to complete without any tool use)
@@ -197,7 +207,7 @@ Set values in `.env`:
 - `SUB_AGENT_SHARED_NOTES_MAX_ENTRIES` (bounded retained shared notes)
 - `SUB_AGENT_INBOX_READ_MAX` (max messages per coordination inbox read)
 - `SUB_AGENT_DEBUG_LOGGING` (prints detailed sub-agent runtime/coordination/tool activity logs when enabled)
-- `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`)
+- `LLC_DB_PATH` (default: `<workspace>/.llc/sessions.db`; stores canonical conversations and legacy session aliases during migration)
 - `LLC_PROMPTS_DIR` (default: `llc/prompts`)
 - `LLC_API_HOST` (default: `127.0.0.1`)
 - `LLC_API_PORT` (default: `8000`)
@@ -259,6 +269,8 @@ Full stack (backend + frontend) in Docker:
 ```bash
 make run
 ```
+
+The backend Docker image installs `uv` from PyPI during the build, so it no longer depends on `ghcr.io/astral-sh/uv` being reachable.
 
 Stop stack:
 

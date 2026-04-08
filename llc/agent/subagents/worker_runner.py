@@ -1,24 +1,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import suppress
 from typing import Any, Callable
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from llc.agent.message_utils import message_text
 from llc.agent.subagents.coordination import AgentCoordinationLayer
 from llc.config import Settings
 from llc.logging_utils import configure_logging
 from llc.observability import (
+    flush,
     merge_langchain_config,
     start_linked_subagent_trace,
     update_observation,
 )
 from llc.service.prompt_registry import PromptRegistry
 from llc.agent.subagents.reporting import activity_from_tool_name, preview_text, stop_reason_is_stuck
-from llc.agent.subagents.usage import accumulate_usage_by_model, token_usage
+from llc.agent.subagents.usage import (
+    accumulate_usage_by_model,
+    normalize_usage_by_model,
+    token_usage,
+)
 
 _MAX_STORED_FINAL_OUTPUT_CHARS = 12000
 _MAX_REPORT_PREVIEW_CHARS = 220
@@ -26,6 +32,7 @@ _MAX_FINAL_OUTPUT_PREVIEW_CHARS = 600
 _MAX_REVISION_PART_CHARS = 1800
 _MAX_TOOL_SUMMARY_CHARS = 140
 _STREAM_POLL_INTERVAL_S = 1.0
+_STREAM_CLEANUP_TIMEOUT_S = 5.0
 _INTERNAL_TOOL_NAMES = {
     "SendMessage",
     "ReadInbox",
@@ -42,6 +49,17 @@ _INTERNAL_TOOL_NAMES = {
     "ReviseSubagent",
     "InterruptSubagent",
     "TerminateSubagent",
+}
+_COORDINATION_EVENT_TOOL_NAMES = {
+    "SendMessage",
+    "ReadInbox",
+    "ReadTeamStatus",
+    "ReadSharedNotes",
+    "AppendSharedNote",
+    "RequestLock",
+    "ReleaseLock",
+    "ReviewHeldLocks",
+    "RespondLockReview",
 }
 
 
@@ -99,19 +117,6 @@ def _tool_summary(tool_name: str, args: dict[str, Any]) -> str:
     return ""
 
 
-def _counted_tool_call_delta(tool_calls_batch: list[Any]) -> int:
-    counted = 0
-    for item in tool_calls_batch:
-        if not isinstance(item, dict):
-            counted += 1
-            continue
-        tool_name = str(item.get("name", "")).strip()
-        if tool_name in _INTERNAL_TOOL_NAMES:
-            continue
-        counted += 1
-    return counted
-
-
 def subagent_process_entry(
     *,
     payload: dict[str, Any],
@@ -166,12 +171,11 @@ def subagent_process_entry(
                 prompt_registry=prompt_registry,
                 parent_context=parent_context,
                 stop_requested=lambda: stop_event_is_set(stop_event),
-                progress_callback=lambda progress: emit_worker_event(
+                event_callback=lambda event: emit_worker_event(
                     worker_queue,
                     {
-                        "type": "progress",
                         "attempt": attempt,
-                        **progress,
+                        **event,
                     },
                 ),
             )
@@ -207,12 +211,17 @@ async def run_subagent_worker(
     prompt_registry: PromptRegistry | None,
     parent_context: dict[str, Any] | None,
     stop_requested: Callable[[], bool],
-    progress_callback: Callable[[dict[str, Any]], None],
+    event_callback: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
     started_monotonic = time.monotonic()
     report_interval = float(settings.sub_agent_report_interval_s)
     max_runtime_s = float(settings.sub_agent_max_runtime_s)
-    stall_timeout_s = float(settings.sub_agent_stall_timeout_s)
+    llm_stall_timeout_s = float(settings.sub_agent_llm_stall_timeout_s)
+    tool_stall_timeout_s = float(settings.sub_agent_tool_stall_timeout_s)
+    if llm_stall_timeout_s > 0 and llm_stall_timeout_s >= max_runtime_s:
+        llm_stall_timeout_s = max(max_runtime_s * 0.25, 30.0)
+    if tool_stall_timeout_s > 0 and tool_stall_timeout_s >= max_runtime_s:
+        tool_stall_timeout_s = max(max_runtime_s * 0.5, 30.0)
     max_tool_calls = int(settings.sub_agent_max_tool_calls)
     heartbeat_interval_s = min(max(report_interval / 4.0, 0.5), 2.0)
     next_report_at = started_monotonic + report_interval
@@ -224,11 +233,61 @@ async def run_subagent_worker(
     final_parts: list[str] = []
     fallback_text = ""
     usage_by_model: dict[str, dict[str, int]] = {}
+    emitted_usage_by_model: dict[str, dict[str, int]] = {}
     last_tool_name = ""
     last_tool_summary = ""
     saw_any_tool_call = False
+    last_completed_node = ""
     current_activity = "Running"
     activity_detail = "Worker started."
+    seen_tool_call_ids: set[str] = set()
+    seen_tool_result_ids: set[str] = set()
+    final_history: list[dict[str, Any]] = []
+
+    def emit(event_type: str, **payload: Any) -> None:
+        event_callback(
+            {
+                "type": event_type,
+                **payload,
+            }
+        )
+
+    def emit_status(*, include_report: bool) -> None:
+        payload = {
+            "tool_calls": tool_calls,
+            "total_tool_calls": total_tool_calls,
+            "output_chars": output_chars,
+            "activity": current_activity,
+            "activity_detail": activity_detail,
+            "last_tool_name": last_tool_name,
+            "last_tool_summary": last_tool_summary,
+        }
+        if include_report:
+            payload["report"] = (
+                "Running: "
+                f"tool_calls={tool_calls}, "
+                f"total_tool_calls={total_tool_calls}, "
+                f"output_chars={output_chars}."
+            )
+        emit("status", **payload)
+        flush()
+
+    def emit_usage_delta() -> None:
+        usage_delta = _usage_delta(
+            current_usage=usage_by_model,
+            emitted_usage=emitted_usage_by_model,
+        )
+        if not usage_delta:
+            return
+        emit("usage", usage_by_model=usage_delta)
+        for model_name, bucket in usage_delta.items():
+            emitted_bucket = emitted_usage_by_model.setdefault(
+                model_name,
+                {"input_tokens": 0, "output_tokens": 0},
+            )
+            emitted_bucket["input_tokens"] += int(bucket.get("input_tokens", 0) or 0)
+            emitted_bucket["output_tokens"] += int(bucket.get("output_tokens", 0) or 0)
+
     with start_linked_subagent_trace(
         parent_context=parent_context,
         subagent_id=subagent_id,
@@ -238,7 +297,6 @@ async def run_subagent_worker(
         model_name=settings.model_name,
     ) as trace_scope:
         trace_stream_config = dict(trace_scope.langchain_config)
-        trace_stream_config.pop("callbacks", None)
         stream_config = merge_langchain_config(
             {"configurable": {"thread_id": thread_id}},
             trace_stream_config,
@@ -273,9 +331,14 @@ async def run_subagent_worker(
                     elapsed = now_monotonic - started_monotonic
                     if elapsed > max_runtime_s:
                         raise StopRequested("max_runtime_exceeded")
+                    in_tool_phase = last_completed_node == "llm"
+                    active_stall_timeout = (
+                        tool_stall_timeout_s if in_tool_phase
+                        else llm_stall_timeout_s
+                    )
                     if (
-                        stall_timeout_s > 0
-                        and (now_monotonic - last_chunk_at) > stall_timeout_s
+                        active_stall_timeout > 0
+                        and (now_monotonic - last_chunk_at) > active_stall_timeout
                     ):
                         raise StopRequested("stall_timeout_exceeded")
                     next_chunk_timeout_s = next_stream_poll_timeout_s(
@@ -309,113 +372,166 @@ async def run_subagent_worker(
                                 output_chars += len(text)
 
                     if mode == "updates" and isinstance(chunk, dict):
-                        for node_update in chunk.values():
+                        for node_name, node_update in chunk.items():
+                            if isinstance(node_name, str) and node_name.strip():
+                                last_completed_node = node_name.strip()
                             if not isinstance(node_update, dict):
                                 continue
                             for message in node_update.get("messages", []):
-                                if not isinstance(message, AIMessage):
-                                    continue
-                                tool_calls_batch = getattr(message, "tool_calls", None) or []
-                                if tool_calls_batch:
-                                    saw_any_tool_call = True
-                                total_tool_calls += len(tool_calls_batch)
-                                tool_calls += _counted_tool_call_delta(tool_calls_batch)
-                                if tool_calls > max_tool_calls:
-                                    raise StopRequested("max_tool_calls_exceeded")
-                                if tool_calls_batch:
-                                    last_tool_call = (
-                                        tool_calls_batch[-1]
-                                        if isinstance(tool_calls_batch[-1], dict)
-                                        else {}
+                                if isinstance(message, AIMessage):
+                                    tool_calls_batch = (
+                                        getattr(message, "tool_calls", None) or []
                                     )
-                                    raw_tool_name = last_tool_call.get("name", "")
-                                    if (
-                                        isinstance(raw_tool_name, str)
-                                        and raw_tool_name.strip()
-                                    ):
-                                        last_tool_name = raw_tool_name.strip()
-                                        raw_args = last_tool_call.get("args", {})
-                                        last_tool_summary = _tool_summary(
-                                            last_tool_name,
-                                            raw_args if isinstance(raw_args, dict) else {},
-                                        )
-                                        current_activity = activity_from_tool_name(
-                                            last_tool_name
-                                        )
-                                        if last_tool_summary:
-                                            activity_detail = (
-                                                f"Using {last_tool_name}: {last_tool_summary}"
+                                    maybe_text = message_text(message.content)
+                                    if maybe_text:
+                                        fallback_text = maybe_text
+                                        if not tool_calls_batch:
+                                            current_activity = "Analyzing task"
+                                            activity_detail = preview_text(
+                                                maybe_text,
+                                                _MAX_REPORT_PREVIEW_CHARS,
                                             )
-                                        else:
-                                            activity_detail = f"Using {last_tool_name}."
-                                usage_input, usage_output = token_usage(message)
-                                accumulate_usage_by_model(
-                                    usage_by_model,
-                                    settings.model_name,
-                                    usage_input,
-                                    usage_output,
+
+                                    for raw_tool_call in tool_calls_batch:
+                                        if not isinstance(raw_tool_call, dict):
+                                            continue
+                                        tool_call_id = str(
+                                            raw_tool_call.get("id", "") or ""
+                                        ).strip()
+                                        if not tool_call_id or tool_call_id in seen_tool_call_ids:
+                                            continue
+                                        seen_tool_call_ids.add(tool_call_id)
+                                        saw_any_tool_call = True
+                                        total_tool_calls += 1
+                                        if (
+                                            str(raw_tool_call.get("name", "")).strip()
+                                            not in _INTERNAL_TOOL_NAMES
+                                        ):
+                                            tool_calls += 1
+                                        if tool_calls > max_tool_calls:
+                                            raise StopRequested("max_tool_calls_exceeded")
+                                        raw_tool_name = raw_tool_call.get("name", "")
+                                        if (
+                                            isinstance(raw_tool_name, str)
+                                            and raw_tool_name.strip()
+                                        ):
+                                            last_tool_name = raw_tool_name.strip()
+                                            raw_args = raw_tool_call.get("args", {})
+                                            args = raw_args if isinstance(raw_args, dict) else {}
+                                            last_tool_summary = _tool_summary(
+                                                last_tool_name,
+                                                args,
+                                            )
+                                            current_activity = activity_from_tool_name(
+                                                last_tool_name
+                                            )
+                                            if last_tool_summary:
+                                                activity_detail = (
+                                                    f"Using {last_tool_name}: {last_tool_summary}"
+                                                )
+                                            else:
+                                                activity_detail = (
+                                                    f"Using {last_tool_name}."
+                                                )
+                                            emit(
+                                                "tool_started",
+                                                tool_name=last_tool_name,
+                                                tool_call_id=tool_call_id,
+                                                args=args,
+                                                activity=current_activity,
+                                            )
+                                            if (
+                                                last_tool_name
+                                                in _COORDINATION_EVENT_TOOL_NAMES
+                                            ):
+                                                emit(
+                                                    "coordination_event",
+                                                    coordination_event_type=(
+                                                        "tool_started"
+                                                    ),
+                                                    tool_name=last_tool_name,
+                                                    tool_call_id=tool_call_id,
+                                                    args=args,
+                                                )
+                                            flush()
+
+                                    usage_input, usage_output = token_usage(message)
+                                    accumulate_usage_by_model(
+                                        usage_by_model,
+                                        settings.model_name,
+                                        usage_input,
+                                        usage_output,
+                                    )
+                                    emit_usage_delta()
+                                    continue
+
+                                if not isinstance(message, ToolMessage):
+                                    continue
+                                tool_call_id = str(
+                                    getattr(message, "tool_call_id", "") or ""
+                                ).strip()
+                                if (
+                                    not tool_call_id
+                                    or tool_call_id in seen_tool_result_ids
+                                ):
+                                    continue
+                                seen_tool_result_ids.add(tool_call_id)
+                                additional_kwargs = (
+                                    getattr(message, "additional_kwargs", {}) or {}
                                 )
-                                maybe_text = message_text(message.content)
-                                if maybe_text:
-                                    fallback_text = maybe_text
-                                    if not tool_calls_batch:
-                                        current_activity = "Analyzing task"
-                                        activity_detail = preview_text(
-                                            maybe_text,
-                                            _MAX_REPORT_PREVIEW_CHARS,
-                                        )
+                                tool_name = str(
+                                    additional_kwargs.get("tool_name", "tool") or "tool"
+                                ).strip()
+                                tool_content = message_text(message.content)
+                                emit(
+                                    "tool_completed",
+                                    tool_name=tool_name,
+                                    tool_call_id=tool_call_id,
+                                    content=tool_content,
+                                )
+                                coordination_event = _coordination_event_from_tool_result(
+                                    tool_name=tool_name,
+                                    tool_call_id=tool_call_id,
+                                    args={},
+                                    content=tool_content,
+                                )
+                                if coordination_event is not None:
+                                    emit("coordination_event", **coordination_event)
+                                flush()
 
                     now_monotonic = time.monotonic()
                     if now_monotonic >= next_report_at:
-                        progress_callback(
-                            {
-                                "tool_calls": tool_calls,
-                                "total_tool_calls": total_tool_calls,
-                                "output_chars": output_chars,
-                                "report": (
-                                    "Running: "
-                                    "tool_calls="
-                                    f"{tool_calls}, total_tool_calls={total_tool_calls}, "
-                                    f"output_chars={output_chars}."
-                                ),
-                                "activity": current_activity,
-                                "activity_detail": activity_detail,
-                                "last_tool_name": last_tool_name,
-                                "last_tool_summary": last_tool_summary,
-                            }
-                        )
+                        emit_status(include_report=True)
                         next_report_at = now_monotonic + report_interval
                         next_heartbeat_at = now_monotonic + heartbeat_interval_s
                     elif now_monotonic >= next_heartbeat_at:
-                        progress_callback(
-                            {
-                                "tool_calls": tool_calls,
-                                "total_tool_calls": total_tool_calls,
-                                "output_chars": output_chars,
-                                "activity": current_activity,
-                                "activity_detail": activity_detail,
-                                "last_tool_name": last_tool_name,
-                                "last_tool_summary": last_tool_summary,
-                            }
-                        )
+                        emit_status(include_report=False)
                         next_heartbeat_at = now_monotonic + heartbeat_interval_s
             finally:
                 if pending_chunk is not None:
                     pending_chunk.cancel()
                     with suppress(asyncio.CancelledError, Exception):
-                        await pending_chunk
+                        await asyncio.wait_for(
+                            asyncio.shield(pending_chunk),
+                            timeout=_STREAM_CLEANUP_TIMEOUT_S,
+                        )
                 aclose = getattr(stream, "aclose", None)
                 if callable(aclose):
                     try:
-                        await aclose()
-                    except Exception:
+                        await asyncio.wait_for(
+                            aclose(),
+                            timeout=_STREAM_CLEANUP_TIMEOUT_S,
+                        )
+                    except (asyncio.TimeoutError, Exception):
                         pass
         except StopRequested as exc:
             status = "stuck" if stop_reason_is_stuck(exc.reason) else "terminated"
+            final_history = await _serialize_worker_history(agent, thread_id)
             update_observation(
                 trace_scope.observation,
                 output={"status": status, "stop_reason": exc.reason},
             )
+            flush()
             return {
                 "status": status,
                 "stop_reason": exc.reason,
@@ -423,12 +539,15 @@ async def run_subagent_worker(
                 "total_tool_calls": total_tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,
+                "history": final_history,
             }
         except Exception as exc:  # noqa: BLE001
+            final_history = await _serialize_worker_history(agent, thread_id)
             update_observation(
                 trace_scope.observation,
                 output={"status": "failed", "error": str(exc)},
             )
+            flush()
             return {
                 "status": "failed",
                 "error": str(exc),
@@ -436,6 +555,7 @@ async def run_subagent_worker(
                 "total_tool_calls": total_tool_calls,
                 "output_chars": output_chars,
                 "usage_by_model": usage_by_model,
+                "history": final_history,
             }
 
         final_output = "".join(final_parts).strip()
@@ -460,6 +580,7 @@ async def run_subagent_worker(
                         ),
                     },
                 )
+                flush()
                 return {
                     "status": "failed",
                     "error": error_message,
@@ -467,6 +588,7 @@ async def run_subagent_worker(
                     "total_tool_calls": total_tool_calls,
                     "output_chars": output_chars,
                     "usage_by_model": usage_by_model,
+                    "history": await _serialize_worker_history(agent, thread_id),
                 }
             if not final_output:
                 error_message = (
@@ -479,6 +601,7 @@ async def run_subagent_worker(
                         "error": error_message,
                     },
                 )
+                flush()
                 return {
                     "status": "failed",
                     "error": error_message,
@@ -486,7 +609,9 @@ async def run_subagent_worker(
                     "total_tool_calls": total_tool_calls,
                     "output_chars": output_chars,
                     "usage_by_model": usage_by_model,
+                    "history": await _serialize_worker_history(agent, thread_id),
                 }
+        final_history = await _serialize_worker_history(agent, thread_id)
         result = {
             "status": "completed",
             "final_output": final_output,
@@ -494,6 +619,7 @@ async def run_subagent_worker(
             "total_tool_calls": total_tool_calls,
             "output_chars": output_chars,
             "usage_by_model": usage_by_model,
+            "history": final_history,
         }
         update_observation(
             trace_scope.observation,
@@ -505,6 +631,7 @@ async def run_subagent_worker(
                 ),
             },
         )
+        flush()
         return result
 
 
@@ -613,3 +740,125 @@ def next_stream_poll_timeout_s(
 ) -> float:
     remaining_runtime = max(max_runtime_s - elapsed, 0.0)
     return min(remaining_runtime, _STREAM_POLL_INTERVAL_S)
+
+
+async def _serialize_worker_history(agent: Any, thread_id: str) -> list[dict[str, Any]]:
+    try:
+        state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+    except Exception:
+        return []
+    values = getattr(state, "values", {})
+    messages = values.get("messages", [])
+    if not isinstance(messages, list):
+        return []
+    return _serialized_history_messages(messages)
+
+
+def _serialized_history_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    saw_agent_reply = False
+    for message in messages:
+        if isinstance(message, AIMessage):
+            saw_agent_reply = True
+        if not saw_agent_reply and isinstance(message, (SystemMessage, HumanMessage)):
+            continue
+        item = _serialize_history_message(message)
+        if item is not None:
+            serialized.append(item)
+    return serialized
+
+
+def _serialize_history_message(message: Any) -> dict[str, Any] | None:
+    if isinstance(message, HumanMessage):
+        return {
+            "role": "user",
+            "content": message_text(message.content),
+            "message_kind": "history_snapshot",
+        }
+    if isinstance(message, SystemMessage):
+        return {
+            "role": "system",
+            "content": message_text(message.content),
+            "message_kind": "history_snapshot",
+        }
+    if isinstance(message, AIMessage):
+        raw_tool_calls = getattr(message, "tool_calls", None) or []
+        tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
+        return {
+            "role": "assistant",
+            "content": message_text(message.content),
+            "tool_calls": tool_calls,
+            "message_kind": "history_snapshot",
+        }
+    if isinstance(message, ToolMessage):
+        tool_call_id = str(getattr(message, "tool_call_id", "") or "").strip()
+        additional_kwargs = getattr(message, "additional_kwargs", {}) or {}
+        return {
+            "role": "tool",
+            "content": message_text(message.content),
+            "tool_call_id": tool_call_id,
+            "tool_name": str(additional_kwargs.get("tool_name", "") or "").strip(),
+            "message_kind": "history_snapshot",
+        }
+    return None
+
+
+def _usage_delta(
+    *,
+    current_usage: dict[str, dict[str, int]],
+    emitted_usage: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    delta: dict[str, dict[str, int]] = {}
+    normalized_current = normalize_usage_by_model(current_usage)
+    normalized_emitted = normalize_usage_by_model(emitted_usage)
+    for model_name, bucket in normalized_current.items():
+        current_input = int(bucket.get("input_tokens", 0) or 0)
+        current_output = int(bucket.get("output_tokens", 0) or 0)
+        emitted_bucket = normalized_emitted.get(model_name, {})
+        emitted_input = int(emitted_bucket.get("input_tokens", 0) or 0)
+        emitted_output = int(emitted_bucket.get("output_tokens", 0) or 0)
+        delta_input = max(current_input - emitted_input, 0)
+        delta_output = max(current_output - emitted_output, 0)
+        if delta_input == 0 and delta_output == 0:
+            continue
+        delta[model_name] = {
+            "input_tokens": delta_input,
+            "output_tokens": delta_output,
+        }
+    return delta
+
+
+def _coordination_event_from_tool_result(
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    args: dict[str, Any],
+    content: str,
+) -> dict[str, Any] | None:
+    clean_tool_name = tool_name.strip()
+    if clean_tool_name not in _COORDINATION_EVENT_TOOL_NAMES:
+        return None
+    payload = _parse_json_payload(content)
+    event: dict[str, Any] = {
+        "coordination_event_type": clean_tool_name.lower(),
+        "tool_name": clean_tool_name,
+        "tool_call_id": tool_call_id,
+    }
+    if args:
+        event["args"] = args
+    if payload is not None:
+        event["payload"] = payload
+    return event
+
+
+def _parse_json_payload(content: str) -> dict[str, Any] | None:
+    clean_content = content.strip()
+    if not clean_content:
+        return None
+    try:
+        parsed = json.loads(clean_content)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed

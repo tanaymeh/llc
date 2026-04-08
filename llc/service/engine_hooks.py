@@ -227,7 +227,10 @@ async def apply_ready_hook_results_unlocked(engine: Any) -> None:
             if ready is None:
                 continue
             try:
-                maybe_message = await ready.hook.apply_prepared(ready.ctx, ready.prepared)
+                maybe_message = await ready.hook.apply_prepared(
+                    ready.ctx,
+                    ready.prepared,
+                )
             except Exception as exc:  # noqa: BLE001
                 emit_hook_update(
                     engine,
@@ -245,6 +248,7 @@ async def apply_ready_hook_results_unlocked(engine: Any) -> None:
                     turn_id=ready.turn_id,
                     message=maybe_message,
                 )
+                await engine._persist_orchestrator_snapshot()
             else:
                 emit_hook_update(
                     engine,

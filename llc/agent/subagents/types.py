@@ -20,6 +20,7 @@ class SubAgentRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: str
+    conversation_id: str = ""
     name: str
     base_task: str
     task: str
@@ -30,6 +31,9 @@ class SubAgentRecord(BaseModel):
     parent_observation_id: str = ""
     parent_session_id: str = ""
     parent_turn_id: str = ""
+    langfuse_trace_id: str = ""
+    langfuse_root_observation_id: str = ""
+    langfuse_observation: Any = None
     created_at: float
     updated_at: float
     status: SubAgentStatus = "running"

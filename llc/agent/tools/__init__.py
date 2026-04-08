@@ -20,8 +20,8 @@ def _effective_shell_timeout(settings: Settings, *, role: str) -> int:
     timeout = max(int(settings.shell_timeout), 1)
     if role != "subagent":
         return timeout
-    stall_timeout = max(int(settings.sub_agent_stall_timeout_s), 1)
-    max_subagent_timeout = max(stall_timeout - _SUBAGENT_SHELL_TIMEOUT_BUFFER_S, 1)
+    tool_stall = max(int(settings.sub_agent_tool_stall_timeout_s), 1)
+    max_subagent_timeout = max(tool_stall - _SUBAGENT_SHELL_TIMEOUT_BUFFER_S, 1)
     return min(timeout, max_subagent_timeout)
 
 

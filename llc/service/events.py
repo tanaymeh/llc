@@ -90,6 +90,7 @@ class ErrorOccurred(_EventBase):
 
 class SessionRestored(_EventBase):
     type: Literal["session_restored"] = "session_restored"
+    conversation_id: str = ""
     session_id: str
     message_count: int = 0
 

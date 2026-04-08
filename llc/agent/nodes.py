@@ -5,6 +5,7 @@ from typing import Any, Callable, Literal
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
+from llc.agent.llm_retry import invoke_with_retry
 from llc.observability import start_child_span, update_observation
 from llc.agent.state import AgentState
 
@@ -118,7 +119,7 @@ def make_llm_node(
         messages = list(state["messages"])
         if prompt.strip():
             messages = [SystemMessage(content=prompt), *messages]
-        response = model_with_tools.invoke(messages)
+        response = invoke_with_retry(model_with_tools, messages)
         if forced_tool_call_provider is not None:
             forced_call: dict[str, Any] | None = None
             try:
@@ -192,6 +193,7 @@ def make_tool_node(
                 },
                 tags=("llc", "api", "tool"),
                 metadata={"llc_tool_name": tool_name},
+                as_type="tool",
             ) as tool_span:
                 if tool is None:
                     report_poll_streak = 0

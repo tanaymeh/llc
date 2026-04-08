@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from llc.config import Settings
 from llc.service.api_engine_manager import EngineManager
 from llc.service.api_models import WebSocketMessage
-from llc.service.events import ErrorOccurred, Event, SubagentStatusUpdate
+from llc.service.events import ErrorOccurred, Event, SessionRestored, SubagentStatusUpdate
 
 
 def _worker_snapshot_key(report: dict[str, Any]) -> str:
@@ -28,10 +28,10 @@ def _worker_snapshot_key(report: dict[str, Any]) -> str:
 
 
 def register_ws_routes(app: FastAPI, manager: EngineManager, settings: Settings) -> None:
-    @app.websocket("/api/ws/{session_id}")
-    async def session_ws(websocket: WebSocket, session_id: str) -> None:
+    @app.websocket("/api/ws/{conversation_id}")
+    async def session_ws(websocket: WebSocket, conversation_id: str) -> None:
         await websocket.accept()
-        engine = await manager.get_or_create(session_id)
+        engine = await manager.get_or_create(conversation_id)
         async_event_queue = engine.subscribe_async_events()
         send_lock = asyncio.Lock()
         active_turn_task: asyncio.Task[None] | None = None
@@ -57,6 +57,22 @@ def register_ws_routes(app: FastAPI, manager: EngineManager, settings: Settings)
             while True:
                 event = await async_event_queue.get()
                 await send_event(event)
+
+        async def restart_engine_streams(target_conversation_id: str) -> None:
+            nonlocal engine, async_event_queue, poll_task, async_events_task
+            if target_conversation_id == engine.conversation_id:
+                return
+            engine.unsubscribe_async_events(async_event_queue)
+            poll_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await poll_task
+            async_events_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await async_events_task
+            engine = await manager.get_or_create(target_conversation_id)
+            async_event_queue = engine.subscribe_async_events()
+            poll_task = asyncio.create_task(stream_subagent_status())
+            async_events_task = asyncio.create_task(stream_async_engine_events())
 
         def track_stream_task(task: asyncio.Task[None], *, marks_active_turn: bool) -> None:
             nonlocal active_turn_task
@@ -124,15 +140,37 @@ def register_ws_routes(app: FastAPI, manager: EngineManager, settings: Settings)
                     continue
 
                 if incoming.action == "restore_session":
-                    target_session = (incoming.session_id or "").strip()
-                    if not target_session:
-                        await send_error("`session_id` is required for restore_session.")
+                    target_conversation = (
+                        incoming.requested_conversation_id or ""
+                    ).strip()
+                    if not target_conversation:
+                        await send_error(
+                            "`conversation_id` (or legacy `session_id`) is required for restore_session."
+                        )
                         continue
                     if active_turn_task is not None and not active_turn_task.done():
                         await send_error("A turn is already running.")
                         continue
+                    if target_conversation != engine.conversation_id:
+                        target_engine = await manager.get_or_create(target_conversation)
+                        restored_events = [
+                            event
+                            async for event in target_engine.restore_session(
+                                target_conversation
+                            )
+                        ]
+                        for event in restored_events:
+                            await send_event(event)
+                        if any(
+                            isinstance(event, SessionRestored)
+                            for event in restored_events
+                        ):
+                            await restart_engine_streams(target_conversation)
+                        continue
                     task = asyncio.create_task(
-                        stream_engine_events(engine.restore_session(target_session))
+                        stream_engine_events(
+                            engine.restore_session(target_conversation)
+                        )
                     )
                     track_stream_task(task, marks_active_turn=True)
                     continue
