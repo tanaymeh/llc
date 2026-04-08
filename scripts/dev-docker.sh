@@ -20,11 +20,18 @@ Notes:
   This helper runs backend API only in Docker.
   For full backend + frontend stack, use: `make run`.
   If you cloned without `--recurse-submodules`, initialize `llc-frontend/` first.
-  Session history persists in SQLite at /workspace/.llc/sessions.db by default.
+  Conversation history persists in SQLite at /workspace/.llc/sessions.db by default.
   Override DB location with `LLC_DB_PATH` in .env if needed.
-  Local Langfuse defaults to http://host.docker.internal:3000 in Docker.
-  Sub-agent watchdog/timing knobs are read from `.env` (`SUB_AGENT_*`).
-  Sub-agents run as isolated worker processes.
+  Backend image builds install `uv` from PyPI; GHCR is not required for the Docker build.
+  Local Langfuse defaults to http://host.docker.internal:3000 in Docker (use `make langfuse-up` first for the pinned local stack).
+  Custom prompt dirs (`LLC_PROMPTS_DIR`) must include `prompt_manifest.yaml` and `.jinja` templates.
+  Sub-agent watchdog/timing + coordination/locking knobs are read from `.env` (`SUB_AGENT_*`).
+  Sub-agents run as isolated worker processes with shared coordination (inbox, team status, notes, file lock leases).
+  Sub-agent launches include a model-availability preflight; if `MODEL_NAME` is unavailable on provider, launch is rejected with a clear error.
+  `SUB_AGENT_REQUIRE_TOOL_CALL=true` enables strict no-tool guard (workers that try to finish without any tool calls are marked failed). Default is `false`.
+  Set `SUB_AGENT_DEBUG_LOGGING=true` to print detailed sub-agent coordination/tool activity logs.
+  `SendMessage` applies a cooldown after 5 consecutive messages to the same teammate in 2 minutes (120s block with remaining-time ping).
+  Bash remains available to sub-agents, but editing/deleting files via Bash is policy-forbidden in prompts.
   Post-turn hooks run in background by default (blocking only when explicitly configured).
   Backend service is modularized under `llc/service/api_*.py` and `llc/service/engine_*.py`.
 EOF

@@ -1,0 +1,19 @@
+{% include "core/orchestrator_core.jinja" %}
+
+{% include "core/common_instructions.jinja" %}
+
+# Important Instructions regarding sub-agents:
+- Prefer delegation only when work is complex and cleanly divisible.
+- Use running worker reports before intervening.
+- If active workers exist, keep this response open until they finish.
+- Do not ask the user to poll for worker updates.
+- Always use the live worker snapshot in the system prompt for worker status.
+- When calling LaunchSubagent, always set a short, descriptive `name`.
+- Interrupt or terminate only when work is clearly off-track, unsafe, or stuck.
+
+
+Here are some useful facts about this project:
+{% if env_block %}
+
+{{ env_block }}
+{% endif %}

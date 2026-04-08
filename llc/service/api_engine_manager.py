@@ -17,8 +17,8 @@ class EngineManager:
         self._engines: dict[str, SessionEngine] = {}
         self._lock = asyncio.Lock()
 
-    async def get_or_create(self, session_id: str | None = None) -> SessionEngine:
-        requested = (session_id or "").strip()
+    async def get_or_create(self, conversation_id: str | None = None) -> SessionEngine:
+        requested = (conversation_id or "").strip()
         async with self._lock:
             if requested and requested in self._engines:
                 return self._engines[requested]
@@ -26,12 +26,12 @@ class EngineManager:
             engine = SessionEngine(
                 self._settings,
                 self._registry,
-                session_id=requested or None,
+                conversation_id=requested or None,
                 store=SessionStore(self._settings.db_path),
                 enable_langfuse_tracing=True,
             )
             await engine.initialize()
-            self._engines[engine.session_id] = engine
+            self._engines[engine.conversation_id] = engine
             return engine
 
     async def list_sessions(self) -> list[SessionRecordResponse]:
@@ -39,7 +39,19 @@ class EngineManager:
         await store.initialize()
         try:
             records = await store.list_sessions()
-            return [SessionRecordResponse.model_validate(record.model_dump()) for record in records]
+            return [
+                SessionRecordResponse(
+                    id=record.id,
+                    conversation_id=record.id,
+                    session_id=record.id,
+                    title=record.title,
+                    model_name=record.model_name,
+                    sub_agent_mode=record.sub_agent_mode,
+                    created_at=record.created_at,
+                    updated_at=record.updated_at,
+                )
+                for record in records
+            ]
         finally:
             await store.close()
 

@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
@@ -30,7 +30,11 @@ def _apply_edit(content: str, old_string: str, new_string: str, replace_all: boo
     return content.replace(old_string, new_string, 1)
 
 
-def make_edit_tools(workspace_root: Path) -> list[BaseTool]:
+def make_edit_tools(
+    workspace_root: Path,
+    *,
+    mutation_guard: Callable[[str], str | None] | None = None,
+) -> list[BaseTool]:
     @tool
     def Edit(file_path: str, old_string: str, new_string: str, replace_all: Optional[bool] = None) -> str:
         """Performs exact string replacements in files.
@@ -43,6 +47,10 @@ Usage:
 - The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.
 - Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance."""
         target = resolve_workspace_path(workspace_root, file_path)
+        if mutation_guard is not None:
+            denial = mutation_guard(str(target))
+            if denial:
+                return f"Edit blocked: {denial}"
 
         if not target.exists():
             if old_string == "":
@@ -87,6 +95,10 @@ CRITICAL REQUIREMENTS:
 2. The edits are atomic - either all succeed or none are applied
 3. Plan your edits carefully to avoid conflicts between sequential operations"""
         target = resolve_workspace_path(workspace_root, file_path)
+        if mutation_guard is not None:
+            denial = mutation_guard(str(target))
+            if denial:
+                return f"MultiEdit blocked: {denial}"
 
         if not target.exists():
             return f"File does not exist: {file_path}"

@@ -5,6 +5,7 @@ from typing import Any, Callable, Literal
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import END
 
+from llc.agent.llm_retry import invoke_with_retry
 from llc.observability import start_child_span, update_observation
 from llc.agent.state import AgentState
 
@@ -13,6 +14,15 @@ ToolNode = Callable[[AgentState], dict[str, Any]]
 RuntimeStatusProvider = Callable[[], str | None]
 AutoWaitProvider = Callable[[], bool]
 AutoWaitArgsProvider = Callable[[], dict[str, Any]]
+ForcedToolCallProvider = Callable[[AgentState], dict[str, Any] | None]
+ToolInvocationObserver = Callable[[str], None]
+ToolResultObserver = Callable[[str, dict[str, Any], Any], None]
+_FORCED_TOOL_CALL_ID_PREFIX = "forced-tool-"
+_AUTO_WAIT_TOOL_CALL_ID_PREFIX = "auto-wait-"
+_FORCED_COORDINATION_TOOL_MESSAGES = {
+    "ReadInbox": "you have unread teammate message(s); review and respond with priority.",
+    "ReviewHeldLocks": "you hold file lock lease(s); decide KEEP or RELEASE to avoid stale ownership.",
+}
 _MAX_REPORT_POLLS_BEFORE_AUTO_WAIT = 3
 _AUTO_WAIT_TIMEOUT_MS = 1200
 _DONE_REPORT_HINT = (
@@ -48,21 +58,47 @@ def _inject_auto_tool_call(
     *,
     tool_name: str,
     args: dict[str, Any],
+    call_id_prefix: str,
 ) -> Any:
     if not isinstance(response, AIMessage):
         return response
-    if getattr(response, "tool_calls", None):
-        return response
+    existing_calls = list(getattr(response, "tool_calls", None) or [])
+    if existing_calls:
+        first_call = existing_calls[0]
+        first_name = str(first_call.get("name", "")).strip() if isinstance(first_call, dict) else ""
+        if first_name == tool_name:
+            return response
     tool_call = {
-        "id": f"auto-wait-{uuid.uuid4().hex[:12]}",
+        "id": f"{call_id_prefix}-{uuid.uuid4().hex[:12]}",
         "type": "tool_call",
         "name": tool_name,
         "args": args,
     }
+    merged_calls = [tool_call, *existing_calls]
     model_copy = getattr(response, "model_copy", None)
     if callable(model_copy):
-        return model_copy(update={"tool_calls": [tool_call]})
-    return AIMessage(content=response.content, tool_calls=[tool_call])
+        return model_copy(update={"tool_calls": merged_calls})
+    return AIMessage(content=response.content, tool_calls=merged_calls)
+
+
+def _decorate_forced_coordination_output(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    observation: Any,
+) -> Any:
+    if not tool_call_id.startswith(_FORCED_TOOL_CALL_ID_PREFIX):
+        return observation
+    system_ping_message = _FORCED_COORDINATION_TOOL_MESSAGES.get(tool_name)
+    if not system_ping_message:
+        return observation
+    payload = _parse_report_payload(observation)
+    if not isinstance(payload, dict):
+        return observation
+    payload = dict(payload)
+    payload["message"] = f"[System Ping]: {system_ping_message}"
+    payload["system_ping"] = True
+    return json.dumps(payload, indent=2, sort_keys=True, default=str)
 
 
 def make_llm_node(
@@ -72,6 +108,7 @@ def make_llm_node(
     auto_wait_provider: AutoWaitProvider | None = None,
     auto_wait_tool_name: str = "",
     auto_wait_args_provider: AutoWaitArgsProvider | None = None,
+    forced_tool_call_provider: ForcedToolCallProvider | None = None,
 ) -> LlmNode:
     def llm_node(state: AgentState) -> dict[str, Any]:
         prompt = system_prompt
@@ -82,7 +119,24 @@ def make_llm_node(
         messages = list(state["messages"])
         if prompt.strip():
             messages = [SystemMessage(content=prompt), *messages]
-        response = model_with_tools.invoke(messages)
+        response = invoke_with_retry(model_with_tools, messages)
+        if forced_tool_call_provider is not None:
+            forced_call: dict[str, Any] | None = None
+            try:
+                forced_call = forced_tool_call_provider(state)
+            except Exception:  # noqa: BLE001
+                forced_call = None
+            if isinstance(forced_call, dict):
+                tool_name = str(forced_call.get("tool_name", "")).strip()
+                raw_args = forced_call.get("args", {})
+                args = raw_args if isinstance(raw_args, dict) else {}
+                if tool_name:
+                    response = _inject_auto_tool_call(
+                        response,
+                        tool_name=tool_name,
+                        args=args,
+                        call_id_prefix=_FORCED_TOOL_CALL_ID_PREFIX,
+                    )
         if auto_wait_provider is not None and auto_wait_tool_name:
             should_wait = False
             try:
@@ -98,17 +152,24 @@ def make_llm_node(
                         candidate_args = {}
                     if isinstance(candidate_args, dict):
                         auto_wait_args = candidate_args
-                response = _inject_auto_tool_call(
-                    response,
-                    tool_name=auto_wait_tool_name,
-                    args=auto_wait_args,
-                )
+                if not getattr(response, "tool_calls", None):
+                    response = _inject_auto_tool_call(
+                        response,
+                        tool_name=auto_wait_tool_name,
+                        args=auto_wait_args,
+                        call_id_prefix=_AUTO_WAIT_TOOL_CALL_ID_PREFIX,
+                    )
         return {"messages": [response]}
 
     return llm_node
 
 
-def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
+def make_tool_node(
+    tools_by_name: dict[str, Any],
+    *,
+    tool_invocation_observer: ToolInvocationObserver | None = None,
+    tool_result_observer: ToolResultObserver | None = None,
+) -> ToolNode:
     report_poll_streak = 0
 
     def tool_node(state: AgentState) -> dict[str, Any]:
@@ -118,6 +179,9 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
 
         for tool_call in getattr(last_message, "tool_calls", []):
             tool_name = tool_call["name"]
+            tool_call_id = str(tool_call.get("id", "")).strip()
+            if not tool_call_id:
+                tool_call_id = f"tool-{uuid.uuid4().hex[:12]}"
             tool = tools_by_name.get(tool_name)
             user_facing = False
             render_mode = ""
@@ -129,6 +193,7 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                 },
                 tags=("llc", "api", "tool"),
                 metadata={"llc_tool_name": tool_name},
+                as_type="tool",
             ) as tool_span:
                 if tool is None:
                     report_poll_streak = 0
@@ -155,6 +220,16 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                             },
                         )
                     else:
+                        if tool_result_observer is not None:
+                            raw_args = tool_call.get("args", {})
+                            try:
+                                tool_result_observer(
+                                    tool_name,
+                                    raw_args if isinstance(raw_args, dict) else {},
+                                    observation,
+                                )
+                            except Exception:
+                                pass
                         if tool_name == "GetSubagentReport":
                             report_poll_streak += 1
                             report_payload = _parse_report_payload(observation)
@@ -199,6 +274,11 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                             report_poll_streak = 0
                         else:
                             report_poll_streak = 0
+                        observation = _decorate_forced_coordination_output(
+                            tool_call_id=tool_call_id,
+                            tool_name=tool_name,
+                            observation=observation,
+                        )
                         update_observation(
                             tool_span,
                             output={
@@ -207,11 +287,16 @@ def make_tool_node(tools_by_name: dict[str, Any]) -> ToolNode:
                                 "result_preview": _tool_output_preview(observation),
                             },
                         )
+            if tool_invocation_observer is not None:
+                try:
+                    tool_invocation_observer(tool_name)
+                except Exception:
+                    pass
 
             tool_messages.append(
                 ToolMessage(
                     content=str(observation),
-                    tool_call_id=tool_call["id"],
+                    tool_call_id=tool_call_id,
                     additional_kwargs={
                         "tool_name": tool_name,
                         "user_facing": user_facing,

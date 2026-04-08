@@ -16,6 +16,7 @@ from langchain_core.messages import (
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from llc.agent.llm import build_chat_model
+from llc.agent.llm_retry import ainvoke_with_retry
 from llc.agent.message_utils import message_text
 from llc.config import Settings
 from llc.observability import build_langchain_config, start_child_span, update_observation
@@ -166,11 +167,12 @@ async def _summarize_messages(messages: list[AnyMessage], settings: Settings) ->
         input_payload={"message_count": len(messages)},
         tags=("llc", "api", "compact"),
         metadata={"llc_model_name": compact_model_name},
+        as_type="generation",
+        model_name=compact_model_name,
     ) as compaction_span:
-        if run_config:
-            response = await model.ainvoke(request_messages, config=run_config)
-        else:
-            response = await model.ainvoke(request_messages)
+        response = await ainvoke_with_retry(
+            model, request_messages, config=run_config,
+        )
     summary = message_text(response.content, include_reasoning=True).strip()
     if not summary:
         update_observation(
@@ -235,4 +237,3 @@ def _preview_text(text: str, limit: int) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
-

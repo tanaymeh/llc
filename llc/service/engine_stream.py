@@ -7,8 +7,20 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from llc.models import get_model_pricing
-from llc.observability import merge_langchain_config, start_api_turn_trace, update_observation
-from llc.service.events import ErrorOccurred, SubagentStatusUpdate, TextDelta, ToolResultEvent, TurnCompleted
+from llc.observability import (
+    merge_langchain_config,
+    set_trace_io,
+    start_api_turn_trace,
+    update_observation,
+)
+from llc.service.events import (
+    ErrorOccurred,
+    SubagentStatusUpdate,
+    TextDelta,
+    ToolCallStarted,
+    ToolResultEvent,
+    TurnCompleted,
+)
 from llc.service.stream_adapter import StreamAdapter
 
 _MAX_TRACE_TEXT_PREVIEW_CHARS = 500
@@ -35,7 +47,12 @@ async def stream_agent_response(
         return
 
     if persist_user:
-        await engine._persist_message(role="user", content=prompt_text)
+        await engine._persist_message(
+            role="user",
+            content=prompt_text,
+            turn_id=turn_id,
+            visible_to_orchestrator=True,
+        )
 
     adapter = StreamAdapter()
     assistant_parts: list[str] = []
@@ -44,18 +61,16 @@ async def stream_agent_response(
     tool_output_candidates: dict[str, tuple[str, str]] = {}
     with start_api_turn_trace(
         enabled=engine._langfuse_enabled,
-        session_id=engine._session_id,
+        conversation_id=engine.conversation_id,
         turn_id=turn_id,
         thread_id=engine._thread_id,
         model_name=engine._settings.model_name,
         sub_agent_mode_enabled=engine._settings.sub_agent_mode_enabled,
         prompt_text=prompt_text,
     ) as trace_scope:
-        trace_stream_config = dict(trace_scope.langchain_config)
-        trace_stream_config.pop("callbacks", None)
         stream_config = merge_langchain_config(
             {"configurable": {"thread_id": engine._thread_id}},
-            trace_stream_config,
+            trace_scope.langchain_config,
         )
         try:
             async for mode, chunk in engine._agent.astream(
@@ -68,6 +83,23 @@ async def stream_agent_response(
                     if isinstance(event, TextDelta):
                         saw_text = True
                         assistant_parts.append(event.text)
+                    elif isinstance(event, ToolCallStarted):
+                        await engine._persist_message(
+                            role="assistant",
+                            content="",
+                            tool_calls=[
+                                {
+                                    "id": event.tool_call_id,
+                                    "type": "tool_call",
+                                    "name": event.tool_name,
+                                    "args": event.args,
+                                }
+                            ],
+                            turn_id=turn_id,
+                            message_kind="tool_call",
+                            tool_call_id=event.tool_call_id,
+                            visible_to_orchestrator=True,
+                        )
                     elif isinstance(event, ToolResultEvent):
                         tool_call_id = event.tool_call_id.strip()
                         if tool_call_id:
@@ -75,6 +107,14 @@ async def stream_agent_response(
                                 event.tool_name.strip(),
                                 event.content,
                             )
+                        await engine._persist_message(
+                            role="tool",
+                            content=event.content,
+                            turn_id=turn_id,
+                            message_kind="tool_result",
+                            tool_call_id=event.tool_call_id,
+                            visible_to_orchestrator=True,
+                        )
                     await engine._persist_event(event, turn_id=turn_id)
                     yield event
 
@@ -145,7 +185,12 @@ async def stream_agent_response(
 
         final_text = "".join(assistant_parts).strip()
         if final_text:
-            await engine._persist_message(role="assistant", content=final_text)
+            await engine._persist_message(
+                role="assistant",
+                content=final_text,
+                turn_id=turn_id,
+                visible_to_orchestrator=True,
+            )
 
         await engine._persist_usage(
             input_tokens=turn_input,
@@ -158,6 +203,7 @@ async def stream_agent_response(
         )
         await engine._persist_event(completed, turn_id=turn_id)
         yield completed
+        await engine._persist_orchestrator_snapshot()
         update_observation(
             trace_scope.observation,
             output={
@@ -166,6 +212,11 @@ async def stream_agent_response(
                 "turn_input_tokens": turn_input,
                 "turn_output_tokens": turn_output,
             },
+        )
+        set_trace_io(
+            trace_scope.observation,
+            input={"user_message": prompt_text},
+            output={"assistant_message": final_text},
         )
 
 

@@ -1,13 +1,17 @@
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from langchain.tools import tool
 from langchain_core.tools import BaseTool
 
 
-def make_code_grep_tools(workspace_root: Path) -> list[BaseTool]:
+def make_code_grep_tools(
+    workspace_root: Path,
+    *,
+    mutation_guard: Callable[[str], str | None] | None = None,
+) -> list[BaseTool]:
     @tool
     def code_grep(
         pattern: str,
@@ -104,6 +108,22 @@ YAML rules with `fix` key can also perform rewrites:
             except ValueError:
                 return "Error: path is outside the workspace root."
             search_path = str(candidate)
+
+        if rewrite is not None and (apply_rewrite or False) and mutation_guard is not None:
+            if not path:
+                return (
+                    "Rewrite blocked: lock required. Provide a specific file path that you own a lock for."
+                )
+            guard_target = (workspace_root / path).resolve()
+            try:
+                guard_target.relative_to(workspace_root)
+            except ValueError:
+                return "Rewrite blocked: target path is outside workspace root."
+            if guard_target.is_dir():
+                return "Rewrite blocked: lock-aware rewrites require a single file path."
+            denial = mutation_guard(str(guard_target))
+            if denial:
+                return f"Rewrite blocked: {denial}"
 
         sg_bin = _find_sg_binary()
         if sg_bin is None:

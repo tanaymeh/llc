@@ -1,0 +1,28 @@
+prompts:
+  system_prompt:
+    file: system_prompt.jinja
+  compact_prompt:
+    file: compact_prompt.jinja
+  subagent_mode:subagent_mode_prompt:
+    file: subagent_mode_prompt.jinja
+  subagent_mode:task_message_prompt:
+    file: task_message_prompt.jinja
+  subagent_mode:revision_task_prompt:
+    file: revision_task_prompt.jinja
+  interrupt:session_interrupt_message:
+    file: session_interrupt_message.jinja
+  interrupt:manual_subagent_followup_prompt:
+    file: manual_subagent_followup_prompt.jinja
+variables:
+  env_block:
+    - system_prompt
+  task:
+    - subagent_mode:task_message_prompt
+  context_block:
+    - subagent_mode:task_message_prompt
+  base_task:
+    - subagent_mode:revision_task_prompt
+  prior_output:
+    - subagent_mode:revision_task_prompt
+  feedback:
+    - subagent_mode:revision_task_prompt

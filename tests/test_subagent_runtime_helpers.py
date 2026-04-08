@@ -89,6 +89,58 @@ class SubagentRuntimeHelperTests(unittest.TestCase):
         self.assertIn("Revision instructions", merged)
         self.assertIn("Produce an improved final result.", merged)
 
+    def test_history_persistence_skips_messages_already_captured_live(self) -> None:
+        emitted_messages: list[dict[str, object]] = []
+        runtime = SubAgentRuntime(
+            Settings(),
+            build_subagent=lambda settings: None,
+            conversation_id="conv-123",
+            message_sink=lambda **payload: emitted_messages.append(payload),
+        )
+        record = SubAgentRecord(
+            id="subagent-test-2",
+            conversation_id="conv-123",
+            name="planner",
+            base_task="Analyze project",
+            task="Analyze project",
+            context="",
+            source="orchestrator",
+            thread_id="thread-2",
+            parent_turn_id="turn-1",
+            created_at=1.0,
+            updated_at=2.0,
+        )
+        runtime._persist_worker_history_locked(  # type: ignore[attr-defined]
+            record,
+            [
+                {"role": "system", "content": "system prompt"},
+                {"role": "user", "content": "task prompt"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "tool-1", "name": "Read", "args": {}}],
+                },
+                {
+                    "role": "tool",
+                    "content": "tool result",
+                    "tool_call_id": "tool-1",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Need one more check before finishing.",
+                    "tool_calls": [{"id": "tool-2", "name": "LS", "args": {}}],
+                },
+                {"role": "assistant", "content": "Final answer"},
+            ],
+            final_output="Final answer",
+        )
+        self.assertEqual(len(emitted_messages), 1)
+        self.assertEqual(
+            emitted_messages[0]["content"],
+            "Need one more check before finishing.",
+        )
+        self.assertEqual(emitted_messages[0]["message_kind"], "history_snapshot")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,7 @@ class SubAgentRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: str
+    conversation_id: str = ""
     name: str
     base_task: str
     task: str
@@ -30,6 +31,9 @@ class SubAgentRecord(BaseModel):
     parent_observation_id: str = ""
     parent_session_id: str = ""
     parent_turn_id: str = ""
+    langfuse_trace_id: str = ""
+    langfuse_root_observation_id: str = ""
+    langfuse_observation: Any = None
     created_at: float
     updated_at: float
     status: SubAgentStatus = "running"
@@ -42,6 +46,7 @@ class SubAgentRecord(BaseModel):
     activity_detail: str = ""
     last_tool_name: str = ""
     tool_calls: int = 0
+    total_tool_calls: int = 0
     output_chars: int = 0
     started_at: float = 0.0
     finished_at: float = 0.0
