@@ -10,4 +10,5 @@
 - Role behavior must be derived from the main `llc/prompts/system_prompt.jinja` (no separate role prompt files).
 - Manual worker spawn command is `/subagent {TASK}` and mode toggle command is `/enable sub-agent-mode`.
 - Keep sub-agent reporting payloads compact to protect context length; avoid adding verbose per-worker tool transcripts to orchestrator-visible history.
+- Persistence uses a bounded async queue with a single writer task (`llc/service/engine.py`). Transient stream events (text deltas, tool calls, interim usage) are fire-and-forget; critical checkpoints (final message, turn completion, errors) await DB ack before proceeding.
 - For an in-depth design and status reference, see `PARALLEL_SUBAGENT_IMPLEMENTATION_REPORT.md`.

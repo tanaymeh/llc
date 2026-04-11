@@ -99,6 +99,7 @@ async def stream_agent_response(
                             message_kind="tool_call",
                             tool_call_id=event.tool_call_id,
                             visible_to_orchestrator=True,
+                            wait_for_ack=False,
                         )
                     elif isinstance(event, ToolResultEvent):
                         tool_call_id = event.tool_call_id.strip()
@@ -114,8 +115,19 @@ async def stream_agent_response(
                             message_kind="tool_result",
                             tool_call_id=event.tool_call_id,
                             visible_to_orchestrator=True,
+                            wait_for_ack=False,
                         )
-                    await engine._persist_event(event, turn_id=turn_id)
+                    wait_for_ack = event.type not in {
+                        "text_delta",
+                        "reasoning_delta",
+                        "tool_call_started",
+                        "tool_result",
+                    }
+                    await engine._persist_event(
+                        event,
+                        turn_id=turn_id,
+                        wait_for_ack=wait_for_ack,
+                    )
                     yield event
 
                 if adapter.consume_usage_updated():
@@ -124,7 +136,11 @@ async def stream_agent_response(
                         turn_output_tokens=adapter.turn_output_tokens,
                         include_pending_turn=True,
                     )
-                    await engine._persist_event(usage_update, turn_id=turn_id)
+                    await engine._persist_event(
+                        usage_update,
+                        turn_id=turn_id,
+                        wait_for_ack=False,
+                    )
                     yield usage_update
 
                 subagent_event, snapshot_key = engine._build_subagent_status_event(
@@ -132,7 +148,11 @@ async def stream_agent_response(
                 )
                 if subagent_event is not None and snapshot_key is not None:
                     last_subagent_snapshot = snapshot_key
-                    await engine._persist_event(subagent_event, turn_id=turn_id)
+                    await engine._persist_event(
+                        subagent_event,
+                        turn_id=turn_id,
+                        wait_for_ack=False,
+                    )
                     yield subagent_event
         except asyncio.CancelledError:
             if not engine._interrupt_requested:
@@ -156,7 +176,11 @@ async def stream_agent_response(
         if not saw_text and fallback:
             text_event = TextDelta(text=fallback)
             assistant_parts.append(fallback)
-            await engine._persist_event(text_event, turn_id=turn_id)
+            await engine._persist_event(
+                text_event,
+                turn_id=turn_id,
+                wait_for_ack=False,
+            )
             yield text_event
 
         turn_input = adapter.turn_input_tokens

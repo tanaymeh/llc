@@ -277,6 +277,9 @@ class Settings(BaseModel, frozen=True):
         "http://127.0.0.1:5173",
     )
     api_subagent_report_interval_s: float = Field(default=1.0, ge=0.2, le=30.0)
+    persistence_queue_maxsize: int = Field(default=2000)
+    persistence_queue_batch_size: int = Field(default=100)
+    persistence_queue_batch_wait_ms: int = Field(default=10)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -342,4 +345,7 @@ class Settings(BaseModel, frozen=True):
                 "LLC_API_SUBAGENT_REPORT_INTERVAL_S",
                 1.0,
             ),
+            persistence_queue_maxsize=_env_int("PERSISTENCE_QUEUE_MAXSIZE", 2000),
+            persistence_queue_batch_size=_env_int("PERSISTENCE_QUEUE_BATCH_SIZE", 100),
+            persistence_queue_batch_wait_ms=_env_int("PERSISTENCE_QUEUE_BATCH_WAIT_MS", 10),
         )

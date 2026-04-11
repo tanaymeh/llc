@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,19 @@ class ConversationStore:
 
         sql = f"UPDATE conversations SET {', '.join(parts)} WHERE id = ?"
         await conn.execute(sql, tuple(values))
+        await conn.commit()
+
+    async def update_conversation_title(
+        self,
+        conversation_id: str,
+        title: str,
+    ) -> None:
+        conn = await self._conn()
+        await conn.execute(
+            "UPDATE conversations SET title = ?, updated_at = ? "
+            "WHERE id = ? AND (title IS NULL OR title = '')",
+            (title, time.time(), conversation_id),
+        )
         await conn.commit()
 
     async def get_canonical_conversation(

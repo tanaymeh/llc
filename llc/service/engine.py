@@ -45,6 +45,16 @@ _MANUAL_SUBAGENT_FOLLOWUP_PROMPT = (
     "Provide concise progress updates and then a final combined outcome."
 )
 
+_SESSION_TITLE_MAX_LEN = 80
+
+
+def _derive_session_title(text: str) -> str:
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if len(first_line) <= _SESSION_TITLE_MAX_LEN:
+        return first_line
+    truncated = first_line[:_SESSION_TITLE_MAX_LEN].rsplit(" ", 1)[0]
+    return f"{truncated}..." if truncated else f"{first_line[:_SESSION_TITLE_MAX_LEN]}..."
+
 
 class SessionEngine:
     def __init__(
@@ -91,6 +101,11 @@ class SessionEngine:
         self._hook_ready_results: dict[str, engine_hooks.HookPreparedResult] = {}
         self._hook_apply_task: asyncio.Task[Any] | None = None
         self._async_event_subscribers: set[asyncio.Queue[Event]] = set()
+        self._db_persisted = False
+        self._persist_queue: asyncio.Queue[
+            engine_persistence.PersistenceJob
+        ] | None = None
+        self._persist_writer_task: asyncio.Task[Any] | None = None
 
     @property
     def conversation_id(self) -> str:
@@ -250,15 +265,34 @@ class SessionEngine:
 
         if self._store is not None:
             await self._store.initialize()
-            now = time.time()
-            await self._store.ensure_conversation(
+            await self._start_persistence_writer()
+            record = await self._store.get_canonical_conversation(
                 self._conversation_id,
-                model_name=self._settings.model_name,
-                sub_agent_mode=self._settings.sub_agent_mode_enabled,
-                created_at=now,
-                updated_at=now,
             )
+            if record is not None:
+                self._settings = self._settings.model_copy(
+                    update={
+                        "model_name": record.model_name,
+                        "sub_agent_mode_enabled": bool(record.sub_agent_mode),
+                    },
+                )
+                self._db_persisted = True
+                self._reset_runtime_and_agent()
         self._initialized = True
+
+    async def _ensure_db_persisted(self, title: str = "") -> None:
+        if self._db_persisted or self._store is None:
+            return
+        now = time.time()
+        await self._store.ensure_conversation(
+            self._conversation_id,
+            model_name=self._settings.model_name,
+            sub_agent_mode=self._settings.sub_agent_mode_enabled,
+            title=title,
+            created_at=now,
+            updated_at=now,
+        )
+        self._db_persisted = True
 
     async def shutdown(self) -> None:
         background_tasks = list(self._background_tasks)
@@ -276,11 +310,14 @@ class SessionEngine:
         if self._subagent_runtime is not None:
             self._subagent_runtime.shutdown()
         if self._store is not None:
+            await self._flush_persistence_queue()
+            await self._stop_persistence_writer()
             await self._store.close()
         self._initialized = False
 
     async def interrupt(self) -> AsyncIterator[Event]:
         await self.initialize()
+        await self._ensure_db_persisted()
         self._interrupt_requested = True
         active_turn = self._active_turn_task
         if active_turn is not None and not active_turn.done():
@@ -307,6 +344,9 @@ class SessionEngine:
 
         async with self._turn_lock:
             await self._apply_ready_hook_results(lock_held=True)
+            if not self._db_persisted:
+                title = _derive_session_title(text)
+                await self._ensure_db_persisted(title=title)
             turn_id = f"turn-{uuid.uuid4().hex[:10]}"
             self._active_turn_task = asyncio.current_task()
             self._active_turn_id = turn_id
@@ -355,6 +395,7 @@ class SessionEngine:
 
         async with self._turn_lock:
             await self._apply_ready_hook_results(lock_held=True)
+            await self._ensure_db_persisted()
             requested_conversation_id = session_id.strip()
             if requested_conversation_id != self._conversation_id:
                 event = ErrorOccurred(
@@ -725,6 +766,95 @@ class SessionEngine:
     def _safe_prompt(self, name: str, *, key: str, fallback: str) -> str:
         return engine_stream.safe_prompt(self, name, key=key, fallback=fallback)
 
+    def _new_persist_ack(self) -> asyncio.Future[None]:
+        return asyncio.get_running_loop().create_future()
+
+    async def _start_persistence_writer(self) -> None:
+        if self._store is None or self._persist_writer_task is not None:
+            return
+        self._persist_queue = asyncio.Queue(maxsize=self._settings.persistence_queue_maxsize)
+        self._persist_writer_task = asyncio.create_task(
+            self._run_persistence_writer()
+        )
+
+    async def _run_persistence_writer(self) -> None:
+        queue = self._persist_queue
+        if queue is None:
+            return
+        
+        while True:
+            job = await queue.get()
+            try:
+                if job.kind in {"flush", "stop"}:
+                    if job.ack is not None and not job.ack.done():
+                        job.ack.set_result(None)
+                    if job.kind == "stop":
+                        return
+                    continue
+                if job.kind == "message":
+                    await engine_persistence.persist_message(self, **job.kwargs)
+                elif job.kind == "event":
+                    await engine_persistence.persist_event(
+                        self,
+                        job.event,
+                        **job.kwargs
+                    )
+                elif job.kind == "usage":
+                    await engine_persistence.persist_usage(self, **job.kwargs)
+                else:
+                    raise RuntimeError(f"Unknown persistence job kind: {job.kind}")
+                
+
+                if job.ack is not None and not job.ack.done():
+                    job.ack.set_result(None)
+            
+            except Exception as exc:
+                if job.ack is not None and not job.ack.done():
+                    job.ack.set_exception(exc)
+
+            finally:
+                queue.task_done()
+
+    async def _enqueue_persistence_job(
+        self,
+        job: engine_persistence.PersistenceJob
+    ) -> None:
+        if self._store is None:
+            return
+        if self._persist_queue is None:
+            await self._start_persistence_writer()
+        queue = self._persist_queue
+        if queue is None:
+            raise RuntimeError("Persistence queue is unavailable")
+        await queue.put(job)
+        if job.ack is not None:
+            await job.ack
+
+    async def _flush_persistence_queue(self) -> None:
+        if self._store is None or self._persist_writer_task is None:
+            return
+        await self._enqueue_persistence_job(
+            engine_persistence.build_persistence_job(
+                "flush",
+                ack=self._new_persist_ack(),
+            )
+        )
+
+    async def _stop_persistence_writer(self) -> None:
+        task = self._persist_writer_task
+        if task is None:
+            return
+        await self._enqueue_persistence_job(
+            engine_persistence.build_persistence_job(
+                "stop",
+                ack=self._new_persist_ack()
+            )
+        )
+
+        await task
+        self._persist_writer_task = None
+        self._persist_queue = None
+
     async def _persist_message(
         self,
         *,
@@ -740,21 +870,26 @@ class SessionEngine:
         tool_call_id: str = "",
         visible_to_orchestrator: bool = False,
         langfuse_trace_id: str = "",
+        wait_for_ack: bool = True,
     ) -> None:
-        await engine_persistence.persist_message(
-            self,
-            role=role,
-            content=content,
-            tool_calls=tool_calls,
-            usage_input_tokens=usage_input_tokens,
-            usage_output_tokens=usage_output_tokens,
-            actor_kind=actor_kind,
-            actor_id=actor_id,
-            turn_id=turn_id,
-            message_kind=message_kind,
-            tool_call_id=tool_call_id,
-            visible_to_orchestrator=visible_to_orchestrator,
-            langfuse_trace_id=langfuse_trace_id,
+        ack = self._new_persist_ack() if wait_for_ack else None
+        await self._enqueue_persistence_job(
+            engine_persistence.build_persistence_job(
+                "message",
+                ack=ack,
+                role=role,
+                content=content,
+                tool_calls=tool_calls,
+                usage_input_tokens=usage_input_tokens,
+                usage_output_tokens=usage_output_tokens,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+                turn_id=turn_id,
+                message_kind=message_kind,
+                tool_call_id=tool_call_id,
+                visible_to_orchestrator=visible_to_orchestrator,
+                langfuse_trace_id=langfuse_trace_id,
+            )
         )
 
     async def _persist_usage(
@@ -764,13 +899,18 @@ class SessionEngine:
         output_tokens: int,
         actor_kind: str = "orchestrator",
         actor_id: str = "orchestrator",
+        wait_for_ack: bool = True,
     ) -> None:
-        await engine_persistence.persist_usage(
-            self,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            actor_kind=actor_kind,
-            actor_id=actor_id,
+        ack = self._new_persist_ack() if wait_for_ack else None
+        await self._enqueue_persistence_job(
+            engine_persistence.build_persistence_job(
+                "usage",
+                ack=ack,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+            )
         )
 
     async def _persist_event(
@@ -783,16 +923,21 @@ class SessionEngine:
         event_type: str | None = None,
         payload: dict[str, Any] | None = None,
         langfuse_trace_id: str = "",
+        wait_for_ack: bool = True,
     ) -> None:
-        await engine_persistence.persist_event(
-            self,
-            event,
-            turn_id=turn_id,
-            actor_kind=actor_kind,
-            actor_id=actor_id,
-            event_type=event_type,
-            payload=payload,
-            langfuse_trace_id=langfuse_trace_id,
+        ack = self._new_persist_ack() if wait_for_ack else None
+        await self._enqueue_persistence_job(
+            engine_persistence.build_persistence_job(
+                "event",
+                event=event,
+                ack=ack,
+                turn_id=turn_id,
+                actor_kind=actor_kind,
+                actor_id=actor_id,
+                event_type=event_type,
+                payload=payload,
+                langfuse_trace_id=langfuse_trace_id,
+            )
         )
 
     async def _persist_orchestrator_snapshot(self) -> None:

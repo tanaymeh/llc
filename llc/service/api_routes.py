@@ -173,6 +173,13 @@ def register_api_routes(app: FastAPI, manager: EngineManager) -> None:
                 )
                 return [record.model_dump(mode="json") for record in records]
 
+            records = await store.list_conversation_messages(
+                conversation_id,
+                visible_to_orchestrator=True,
+            )
+            if records:
+                return [record.model_dump(mode="json") for record in records]
+
             snapshot = await store.get_state_snapshot(conversation_id)
             if snapshot is not None:
                 snapshot_records = _snapshot_transcript_records(
@@ -183,10 +190,6 @@ def register_api_routes(app: FastAPI, manager: EngineManager) -> None:
                 if snapshot_records:
                     return snapshot_records
 
-            records = await store.list_conversation_messages(
-                conversation_id,
-                visible_to_orchestrator=True,
-            )
-            return [record.model_dump(mode="json") for record in records]
+            return []
         finally:
             await store.close()

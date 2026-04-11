@@ -21,6 +21,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Backend API with WebSocket event streaming (`/api/ws/{conversation_id}`)
 - React mission-control web UI (`llc-frontend/`)
 - Markdown-rendered agent responses in mission-control UI (GFM tables, task lists, code blocks)
+- Session history sidebar: browse, resume, and switch between past conversations; sessions auto-title from the first message and are persisted to DB only after the first message is sent
 - Slash commands (`/model`, `/compact`, `/enable sub-agent-mode`, `/subagent {TASK}`, `/help`)
 - Built-in tools for shell, file edits, search (`rg`/glob), and web search/fetch
 - Ordered post-turn hooks with explicit `blocking` opt-in (background by default)
@@ -29,6 +30,7 @@ The backend runs a LangGraph agent loop, streams typed events, tracks token usag
 - Sub-agent coordination layer with inbox messaging, shared notes, team status reads, and file lock leases
 - Optional Langfuse tracing with one canonical UUID4 conversation id, live sub-agent traces, and persisted orchestrator/sub-agent transcripts
 - Typed backend event contract (`llc/service/events.py`) consumed by the UI mapper
+- Async persistence queue: transient stream events persist without blocking token delivery; critical checkpoints (final message, turn completion) await DB ack
 
 ## Implementation overview
 
@@ -213,6 +215,9 @@ Set values in `.env`:
 - `LLC_API_PORT` (default: `8000`)
 - `LLC_API_ALLOWED_ORIGINS` (comma-separated list; default includes Vite localhost origins)
 - `LLC_API_SUBAGENT_REPORT_INTERVAL_S` (default: `1.0`)
+- `PERSISTENCE_QUEUE_MAXSIZE` (default: `2000`; bounded queue capacity for async DB writes)
+- `PERSISTENCE_QUEUE_BATCH_SIZE` (default: `100`; reserved for future batched commits)
+- `PERSISTENCE_QUEUE_BATCH_WAIT_MS` (default: `10`; reserved for future batched commits)
 
 Custom prompt directories must include a `prompt_manifest.yaml` file and the referenced `.jinja` templates.
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
+from pydantic import BaseModel, ConfigDict, Field
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -13,6 +15,30 @@ from llc.service.events import Event
 
 _ORCHESTRATOR_ACTOR_ID = "orchestrator"
 _ORCHESTRATOR_VISIBLE_STATE_KIND = "orchestrator_visible"
+
+
+PersistJobKind = Literal["message", "event", "usage", "flush", "stop"]
+class PersistenceJob(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    kind: PersistJobKind
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    event: Event | None = None
+    ack: asyncio.Future[None] | None = None
+
+
+def build_persistence_job(
+    kind: PersistJobKind,
+    *,
+    event: Event | None = None,
+    ack: asyncio.Future[None] | None = None,
+    **kwargs: Any,
+) -> PersistenceJob:
+    return PersistenceJob(
+        kind=kind,
+        kwargs=kwargs,
+        event=event,
+        ack=ack,
+    )
 
 
 async def persist_message(
